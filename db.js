@@ -33,6 +33,26 @@ const initializeDb = async () => {
     );
 
     ALTER TABLE qr_codes ADD COLUMN IF NOT EXISTS page_url TEXT;
+
+    CREATE TABLE IF NOT EXISTS whatsapp_chats (
+      id SERIAL PRIMARY KEY,
+      jid VARCHAR(255) UNIQUE NOT NULL,
+      name VARCHAR(255),
+      avatar TEXT,
+      is_monitored BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS whatsapp_messages (
+      id SERIAL PRIMARY KEY,
+      chat_jid VARCHAR(255) NOT NULL,
+      sender VARCHAR(255),
+      timestamp VARCHAR(255),
+      message TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT unique_message UNIQUE (chat_jid, sender, timestamp, message)
+    );
+  
   `;
   try {
     const client = await pool.connect();

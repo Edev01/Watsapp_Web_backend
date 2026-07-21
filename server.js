@@ -206,6 +206,105 @@ app.get('/api/qr/latest', async (req, res) => {
   }
 });
 
+// 7. Post Scraped Contacts List
+app.post('/api/scraped-chats/contacts', async (req, res) => {
+  const { contacts } = req.body;
+  if (!Array.isArray(contacts)) {
+    return sendResponse(res, 400, true, null, 'Contacts array is required');
+  }
+  try {
+    for (const contact of contacts) {
+      await db.query(
+        `INSERT INTO whatsapp_chats (jid, name, avatar) 
+         VALUES ($1, $2, $3) 
+         ON CONFLICT (jid) DO UPDATE SET name = EXCLUDED.name, avatar = EXCLUDED.avatar`,
+        [contact.id, contact.name, contact.avatar || null]
+      );
+    }
+    return sendResponse(res, 200, false, null, 'Contacts updated successfully');
+  } catch (err) {
+    console.error('Contacts update error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
+// 8. Get Monitored Chats list
+app.get('/api/scraped-chats/monitored', async (req, res) => {
+  try {
+    const result = await db.query(
+      'SELECT jid, name FROM whatsapp_chats WHERE is_monitored = TRUE'
+    );
+    return sendResponse(res, 200, false, result.rows, 'Monitored chats retrieved successfully');
+  } catch (err) {
+    console.error('Get monitored error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
+// 9. Post Scraped Chat Messages (history & real-time)
+app.post('/api/scraped-chats/messages', async (req, res) => {
+  const { chatId, messages } = req.body;
+  if (!chatId || !Array.isArray(messages)) {
+    return sendResponse(res, 400, true, null, 'chatId and messages array are required');
+  }
+  try {
+    let addedCount = 0;
+    for (const msg of messages) {
+      try {
+        await db.query(
+          `INSERT INTO whatsapp_messages (chat_jid, sender, timestamp, message) 
+           VALUES ($1, $2, $3, $4) 
+           ON CONFLICT (chat_jid, sender, timestamp, message) DO NOTHING`,
+          [chatId, msg.sender, msg.timestamp, msg.message]
+        );
+        addedCount++;
+      } catch (insertErr) {
+        // Handled unique constraint conflicts gracefully
+      }
+    }
+    return sendResponse(res, 201, false, { addedCount }, 'Messages saved successfully');
+  } catch (err) {
+    console.error('Post messages error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
+// 10. Toggle Monitored Status for Chats
+app.post('/api/scraped-chats/monitor', async (req, res) => {
+  const { jids } = req.body;
+  if (!Array.isArray(jids)) {
+    return sendResponse(res, 400, true, null, 'jids array is required');
+  }
+  try {
+    // Reset all to FALSE first
+    await db.query('UPDATE whatsapp_chats SET is_monitored = FALSE');
+    if (jids.length > 0) {
+      // Set is_monitored to TRUE for selected JIDs
+      await db.query(
+        'UPDATE whatsapp_chats SET is_monitored = TRUE WHERE jid = ANY($1)',
+        [jids]
+      );
+    }
+    return sendResponse(res, 200, false, null, 'Monitored status updated successfully');
+  } catch (err) {
+    console.error('Update monitored error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
+// 11. Get All Chats (both monitored and unmonitored)
+app.get('/api/scraped-chats', async (req, res) => {
+  try {
+    const result = await db.query(
+      'SELECT jid, name, avatar, is_monitored, created_at FROM whatsapp_chats ORDER BY name ASC'
+    );
+    return sendResponse(res, 200, false, result.rows, 'All chats retrieved successfully');
+  } catch (err) {
+    console.error('Get all chats error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
 // Root Route
 app.get('/', (req, res) => {
   return sendResponse(res, 200, false, { service: 'whatsapp-scraper-backend' }, 'API service running');
