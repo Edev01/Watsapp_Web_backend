@@ -305,6 +305,24 @@ app.get('/api/scraped-chats', async (req, res) => {
   }
 });
 
+// 12. Get Messages for a Specific Chat
+app.get('/api/scraped-chats/messages', async (req, res) => {
+  const { chatId } = req.query;
+  if (!chatId) {
+    return sendResponse(res, 400, true, null, 'chatId query parameter is required');
+  }
+  try {
+    const result = await db.query(
+      'SELECT id, chat_jid, sender, timestamp, message, created_at FROM whatsapp_messages WHERE chat_jid = $1 ORDER BY timestamp ASC',
+      [chatId]
+    );
+    return sendResponse(res, 200, false, result.rows, 'Messages retrieved successfully');
+  } catch (err) {
+    console.error('Get messages error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
 // Root Route
 app.get('/', (req, res) => {
   return sendResponse(res, 200, false, { service: 'whatsapp-scraper-backend' }, 'API service running');
