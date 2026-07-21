@@ -232,7 +232,7 @@ app.post('/api/scraped-chats/contacts', async (req, res) => {
 app.get('/api/scraped-chats/monitored', async (req, res) => {
   try {
     const result = await db.query(
-      'SELECT jid, name FROM whatsapp_chats WHERE is_monitored = TRUE'
+      'SELECT jid, name, avatar, is_monitored, created_at FROM whatsapp_chats WHERE is_monitored = TRUE ORDER BY name ASC'
     );
     return sendResponse(res, 200, false, result.rows, 'Monitored chats retrieved successfully');
   } catch (err) {
