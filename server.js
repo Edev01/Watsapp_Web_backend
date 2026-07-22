@@ -29,17 +29,31 @@ app.use(express.json());
 io.on('connection', (socket) => {
   console.log('Client connected to Socket.IO:', socket.id);
 
-  // Listen for QR update event from extension and broadcast to web viewers
-  socket.on('qr_updated', (data) => {
-    console.log('Socket event qr_updated received:', data);
-    io.emit('qr_updated', data);
+  // 1. Extension emits 'new_qr' -> Backend broadcasts 'new_qr' to Web Portal
+  socket.on('new_qr', async (data) => {
+    console.log('Socket event new_qr received:', data);
+    try {
+      if (data && data.url) {
+        await db.query(
+          'INSERT INTO qr_codes (url, source, page_url) VALUES ($1, $2, $3)',
+          [data.url, data.source || 'whatsapp', data.pageUrl || null]
+        );
+      }
+    } catch (err) {
+      console.error('Error saving socket new_qr to DB:', err.message);
+    }
+    io.emit('new_qr', data);
   });
 
-  // Listen for QR cleared event (WhatsApp opened) and broadcast to web viewers
-  socket.on('qr_cleared', (data) => {
-    console.log('Socket event qr_cleared received:', data);
-    io.emit('qr_cleared', data || { status: 'scanned', message: 'WhatsApp logged in / QR cleared' });
+  // 2. Extension emits 'qr_disappeared' -> Backend broadcasts 'qr_disappeared' to Web Portal
+  socket.on('qr_disappeared', (data) => {
+    console.log('Socket event qr_disappeared received:', data);
+    io.emit('qr_disappeared', data || { status: 'disappeared', message: 'WhatsApp opened / QR disappeared' });
   });
+
+  // Legacy support fallback
+  socket.on('qr_updated', (data) => io.emit('new_qr', data));
+  socket.on('qr_cleared', (data) => io.emit('qr_disappeared', data));
 
   socket.on('disconnect', () => {
     console.log('Client disconnected from Socket.IO:', socket.id);
