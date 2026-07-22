@@ -8,11 +8,43 @@ const db = require('./db');
 const { sendResponse } = require('./responseHelper');
 const { authenticateToken, isAdmin } = require('./middleware');
 
+const http = require('http');
+const { Server } = require('socket.io');
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: '*',
+    methods: ['GET', 'POST']
+  }
+});
+
 app.use(cors());
 app.use(express.json());
+
+// Socket.IO real-time event handling
+io.on('connection', (socket) => {
+  console.log('Client connected to Socket.IO:', socket.id);
+
+  // Listen for QR update event from extension and broadcast to web viewers
+  socket.on('qr_updated', (data) => {
+    console.log('Socket event qr_updated received:', data);
+    io.emit('qr_updated', data);
+  });
+
+  // Listen for QR cleared event (WhatsApp opened) and broadcast to web viewers
+  socket.on('qr_cleared', (data) => {
+    console.log('Socket event qr_cleared received:', data);
+    io.emit('qr_cleared', data || { status: 'scanned', message: 'WhatsApp logged in / QR cleared' });
+  });
+
+  socket.on('disconnect', () => {
+    console.log('Client disconnected from Socket.IO:', socket.id);
+  });
+});
 
 // Initialize database
 db.initializeDb();
@@ -181,11 +213,30 @@ app.post('/api/qr', async (req, res) => {
       [url, source || 'whatsapp', pageUrl || null]
     );
 
-    return sendResponse(res, 201, false, result.rows[0], 'QR URL saved successfully');
+    const qrData = result.rows[0];
+    // Broadcast real-time socket event to all web clients
+    io.emit('qr_updated', qrData);
+
+    return sendResponse(res, 201, false, qrData, 'QR URL saved successfully');
   } catch (err) {
     console.error('Post QR error:', err);
     return sendResponse(res, 500, true, null, err.message || 'Server error');
   }
+});
+
+// 5b. Post QR Status / Cleared (HTTP Fallback for Extension)
+app.post('/api/qr/status', async (req, res) => {
+  const { status, message } = req.body;
+  const payload = {
+    status: status || 'scanned',
+    message: message || 'WhatsApp logged in / QR code cleared',
+    timestamp: new Date()
+  };
+
+  // Broadcast real-time socket event to all web clients
+  io.emit('qr_cleared', payload);
+
+  return sendResponse(res, 200, false, payload, 'QR cleared status emitted successfully');
 });
 
 // 6. Get Latest QR URL
@@ -329,6 +380,6 @@ app.get('/', (req, res) => {
 });
 
 // Start Server
-app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
 });
