@@ -271,7 +271,7 @@ app.get('/api/qr/latest', async (req, res) => {
   }
 });
 
-// 7. Post Scraped Contacts List
+// 7. Post Scraped Contacts List (Deduplicated by name & JID)
 app.post('/api/scraped-chats/contacts', async (req, res) => {
   const { contacts } = req.body;
   if (!Array.isArray(contacts)) {
@@ -279,12 +279,34 @@ app.post('/api/scraped-chats/contacts', async (req, res) => {
   }
   try {
     for (const contact of contacts) {
-      await db.query(
-        `INSERT INTO whatsapp_chats (jid, name, avatar) 
-         VALUES ($1, $2, $3) 
-         ON CONFLICT (jid) DO UPDATE SET name = EXCLUDED.name, avatar = EXCLUDED.avatar`,
-        [contact.id, contact.name, contact.avatar || null]
+      const cleanName = (contact.name || '').trim();
+      if (!cleanName) continue;
+
+      // Check if contact already exists by JID or name
+      const existing = await db.query(
+        `SELECT id, jid, name FROM whatsapp_chats 
+         WHERE jid = $1 OR LOWER(TRIM(name)) = LOWER(TRIM($2)) LIMIT 1`,
+        [contact.id, cleanName]
       );
+
+      if (existing.rows.length > 0) {
+        const existingRow = existing.rows[0];
+        const oldJid = existingRow.jid;
+        const newJid = contact.id;
+
+        // If old JID was a fallback (e.g. name@c.us) and new JID is a phone number (@c.us with digits), update JID in chats & messages
+        if (oldJid !== newJid && /^\d+@c\.us$/.test(newJid)) {
+          await db.query(`UPDATE whatsapp_chats SET jid = $1, avatar = COALESCE($2, avatar) WHERE id = $3`, [newJid, contact.avatar || null, existingRow.id]);
+          await db.query(`UPDATE whatsapp_messages SET chat_jid = $1 WHERE chat_jid = $2`, [newJid, oldJid]);
+        } else {
+          await db.query(`UPDATE whatsapp_chats SET avatar = COALESCE($1, avatar) WHERE id = $2`, [contact.avatar || null, existingRow.id]);
+        }
+      } else {
+        await db.query(
+          `INSERT INTO whatsapp_chats (jid, name, avatar) VALUES ($1, $2, $3)`,
+          [contact.id, cleanName, contact.avatar || null]
+        );
+      }
     }
     return sendResponse(res, 200, false, null, 'Contacts updated successfully');
   } catch (err) {
@@ -293,11 +315,15 @@ app.post('/api/scraped-chats/contacts', async (req, res) => {
   }
 });
 
-// 8. Get Monitored Chats list
+// 8. Get Monitored Chats list (Includes last_scraped_timestamp for incremental sync)
 app.get('/api/scraped-chats/monitored', async (req, res) => {
   try {
     const result = await db.query(
-      'SELECT jid, name, avatar, is_monitored, created_at FROM whatsapp_chats WHERE is_monitored = TRUE ORDER BY name ASC'
+      `SELECT c.jid, c.name, c.avatar, c.is_monitored, c.created_at,
+         (SELECT timestamp FROM whatsapp_messages m WHERE m.chat_jid = c.jid ORDER BY m.id DESC LIMIT 1) as last_scraped_timestamp
+       FROM whatsapp_chats c 
+       WHERE c.is_monitored = TRUE 
+       ORDER BY c.name ASC`
     );
     return sendResponse(res, 200, false, result.rows, 'Monitored chats retrieved successfully');
   } catch (err) {
@@ -306,13 +332,26 @@ app.get('/api/scraped-chats/monitored', async (req, res) => {
   }
 });
 
-// 9. Post Scraped Chat Messages (history & real-time)
+// 9. Post Scraped Chat Messages (Canonical JID matching to prevent duplicate recipient creation)
 app.post('/api/scraped-chats/messages', async (req, res) => {
-  const { chatId, messages } = req.body;
-  if (!chatId || !Array.isArray(messages)) {
-    return sendResponse(res, 400, true, null, 'chatId and messages array are required');
+  const { chatId, chatName, messages } = req.body;
+  if ((!chatId && !chatName) || !Array.isArray(messages)) {
+    return sendResponse(res, 400, true, null, 'chatId or chatName and messages array are required');
   }
   try {
+    // Resolve canonical JID from database
+    let targetJid = chatId;
+    if (chatName || chatId) {
+      const match = await db.query(
+        `SELECT jid FROM whatsapp_chats 
+         WHERE jid = $1 OR LOWER(TRIM(name)) = LOWER(TRIM($2)) LIMIT 1`,
+        [chatId || '', (chatName || '').trim()]
+      );
+      if (match.rows.length > 0) {
+        targetJid = match.rows[0].jid;
+      }
+    }
+
     let addedCount = 0;
     for (const msg of messages) {
       try {
@@ -320,14 +359,14 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
           `INSERT INTO whatsapp_messages (chat_jid, sender, timestamp, message) 
            VALUES ($1, $2, $3, $4) 
            ON CONFLICT (chat_jid, sender, timestamp, message) DO NOTHING`,
-          [chatId, msg.sender, msg.timestamp, msg.message]
+          [targetJid, msg.sender, msg.timestamp, msg.message]
         );
         addedCount++;
       } catch (insertErr) {
         // Handled unique constraint conflicts gracefully
       }
     }
-    return sendResponse(res, 201, false, { addedCount }, 'Messages saved successfully');
+    return sendResponse(res, 201, false, { addedCount, targetJid }, 'Messages saved successfully');
   } catch (err) {
     console.error('Post messages error:', err);
     return sendResponse(res, 500, true, null, err.message || 'Server error');
