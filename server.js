@@ -427,6 +427,50 @@ app.get('/api/scraped-chats/messages', async (req, res) => {
   }
 });
 
+// 13. ML Dataset Endpoint (Fetch all scraped realtor messages with chat names & pagination)
+app.get('/api/ml/dataset', async (req, res) => {
+  const { limit = 1000, offset = 0, chatId } = req.query;
+  try {
+    let queryText = `
+      SELECT m.id, m.chat_jid, c.name as chat_name, m.sender, m.timestamp, m.message, m.created_at
+      FROM whatsapp_messages m
+      LEFT JOIN whatsapp_chats c ON m.chat_jid = c.jid
+    `;
+    const params = [];
+
+    if (chatId) {
+      params.push(chatId);
+      queryText += ` WHERE m.chat_jid = $${params.length}`;
+    }
+
+    params.push(parseInt(limit, 10));
+    queryText += ` ORDER BY m.id ASC LIMIT $${params.length}`;
+
+    params.push(parseInt(offset, 10));
+    queryText += ` OFFSET $${params.length}`;
+
+    const result = await db.query(queryText, params);
+
+    let countQuery = 'SELECT COUNT(*) FROM whatsapp_messages';
+    const countParams = [];
+    if (chatId) {
+      countParams.push(chatId);
+      countQuery += ' WHERE chat_jid = $1';
+    }
+    const countRes = await db.query(countQuery, countParams);
+
+    return sendResponse(res, 200, false, {
+      total: parseInt(countRes.rows[0].count, 10),
+      limit: parseInt(limit, 10),
+      offset: parseInt(offset, 10),
+      messages: result.rows
+    }, 'ML dataset retrieved successfully');
+  } catch (err) {
+    console.error('Get ML dataset error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
 // Root Route
 app.get('/', (req, res) => {
   return sendResponse(res, 200, false, { service: 'whatsapp-scraper-backend' }, 'API service running');
