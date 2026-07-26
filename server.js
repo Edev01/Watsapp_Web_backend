@@ -409,17 +409,55 @@ app.get('/api/scraped-chats', async (req, res) => {
   }
 });
 
-// 12. Get Messages for a Specific Chat
-app.get('/api/scraped-chats/messages', async (req, res) => {
-  const { chatId } = req.query;
-  if (!chatId) {
-    return sendResponse(res, 400, true, null, 'chatId query parameter is required');
-  }
+// 11b. Get All Realtors List (Includes total message counts & identifiers)
+app.get('/api/realtors', async (req, res) => {
   try {
     const result = await db.query(
-      'SELECT id, chat_jid, sender, timestamp, message, created_at FROM whatsapp_messages WHERE chat_jid = $1 ORDER BY timestamp ASC',
-      [chatId]
+      `SELECT c.id, c.jid, c.name, c.avatar, c.is_monitored, c.created_at,
+              COUNT(m.id) as total_messages
+       FROM whatsapp_chats c
+       LEFT JOIN whatsapp_messages m ON m.chat_jid = c.jid
+       GROUP BY c.id, c.jid, c.name, c.avatar, c.is_monitored, c.created_at
+       ORDER BY c.id ASC`
     );
+    return sendResponse(res, 200, false, result.rows, 'Realtors list retrieved successfully');
+  } catch (err) {
+    console.error('Get realtors error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
+// 12. Get Messages for a Specific Chat / Realtor (Supports chatId, jid, or name query params)
+app.get('/api/scraped-chats/messages', async (req, res) => {
+  const { chatId, jid, name } = req.query;
+  const targetId = chatId || jid;
+
+  if (!targetId && !name) {
+    return sendResponse(res, 400, true, null, 'chatId, jid, or name query parameter is required');
+  }
+
+  try {
+    let result;
+    if (targetId) {
+      result = await db.query(
+        `SELECT m.id, m.chat_jid, c.name as chat_name, m.sender, m.timestamp, m.message, m.created_at 
+         FROM whatsapp_messages m
+         LEFT JOIN whatsapp_chats c ON m.chat_jid = c.jid
+         WHERE m.chat_jid = $1 OR LOWER(c.name) LIKE LOWER($2)
+         ORDER BY m.id ASC`,
+        [targetId, `%${targetId}%`]
+      );
+    } else {
+      result = await db.query(
+        `SELECT m.id, m.chat_jid, c.name as chat_name, m.sender, m.timestamp, m.message, m.created_at 
+         FROM whatsapp_messages m
+         LEFT JOIN whatsapp_chats c ON m.chat_jid = c.jid
+         WHERE LOWER(c.name) LIKE LOWER($1)
+         ORDER BY m.id ASC`,
+        [`%${name}%`]
+      );
+    }
+
     return sendResponse(res, 200, false, result.rows, 'Messages retrieved successfully');
   } catch (err) {
     console.error('Get messages error:', err);
@@ -427,9 +465,11 @@ app.get('/api/scraped-chats/messages', async (req, res) => {
   }
 });
 
-// 13. ML Dataset Endpoint (Fetch all scraped realtor messages with chat names & pagination)
+// 13. ML Dataset Endpoint (Fetch all scraped realtor messages with chat names, search & pagination)
 app.get('/api/ml/dataset', async (req, res) => {
-  const { limit = 1000, offset = 0, chatId } = req.query;
+  const { limit = 1000, offset = 0, chatId, jid, name } = req.query;
+  const targetId = chatId || jid;
+
   try {
     let queryText = `
       SELECT m.id, m.chat_jid, c.name as chat_name, m.sender, m.timestamp, m.message, m.created_at
@@ -437,10 +477,19 @@ app.get('/api/ml/dataset', async (req, res) => {
       LEFT JOIN whatsapp_chats c ON m.chat_jid = c.jid
     `;
     const params = [];
+    const whereClauses = [];
 
-    if (chatId) {
-      params.push(chatId);
-      queryText += ` WHERE m.chat_jid = $${params.length}`;
+    if (targetId) {
+      params.push(targetId);
+      params.push(`%${targetId}%`);
+      whereClauses.push(`(m.chat_jid = $${params.length - 1} OR LOWER(c.name) LIKE LOWER($${params.length}))`);
+    } else if (name) {
+      params.push(`%${name}%`);
+      whereClauses.push(`LOWER(c.name) LIKE LOWER($${params.length})`);
+    }
+
+    if (whereClauses.length > 0) {
+      queryText += ` WHERE ` + whereClauses.join(' AND ');
     }
 
     params.push(parseInt(limit, 10));
@@ -451,11 +500,19 @@ app.get('/api/ml/dataset', async (req, res) => {
 
     const result = await db.query(queryText, params);
 
-    let countQuery = 'SELECT COUNT(*) FROM whatsapp_messages';
+    let countQuery = `
+      SELECT COUNT(*) 
+      FROM whatsapp_messages m
+      LEFT JOIN whatsapp_chats c ON m.chat_jid = c.jid
+    `;
     const countParams = [];
-    if (chatId) {
-      countParams.push(chatId);
-      countQuery += ' WHERE chat_jid = $1';
+    if (targetId) {
+      countParams.push(targetId);
+      countParams.push(`%${targetId}%`);
+      countQuery += ` WHERE (m.chat_jid = $1 OR LOWER(c.name) LIKE LOWER($2))`;
+    } else if (name) {
+      countParams.push(`%${name}%`);
+      countQuery += ` WHERE LOWER(c.name) LIKE LOWER($1)`;
     }
     const countRes = await db.query(countQuery, countParams);
 
