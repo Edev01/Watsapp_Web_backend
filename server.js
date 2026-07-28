@@ -7,6 +7,7 @@ require('dotenv').config();
 const db = require('./db');
 const { sendResponse } = require('./responseHelper');
 const { authenticateToken, isAdmin } = require('./middleware');
+const { filterAndSortProperties } = require('./propertyHelper');
 
 const http = require('http');
 const { Server } = require('socket.io');
@@ -527,6 +528,98 @@ app.get('/api/ml/dataset', async (req, res) => {
     return sendResponse(res, 500, true, null, err.message || 'Server error');
   }
 });
+
+// 14. Property Filter Endpoint (Supports POST/GET /api/properties/filter and /api/properties)
+const handlePropertyFilter = async (req, res) => {
+  try {
+    const rawFilters = req.body?.filters || req.body || {};
+    const queryFilters = req.query || {};
+
+    const filters = {
+      purpose: rawFilters.purpose || queryFilters.purpose || '',
+      city: rawFilters.city || queryFilters.city || '',
+      location: rawFilters.location || queryFilters.location || rawFilters.vicinity || queryFilters.vicinity || rawFilters.area || queryFilters.area || '',
+      propertyType: rawFilters.propertyType || queryFilters.propertyType || rawFilters.property_type || queryFilters.property_type || '',
+      propertySubType: rawFilters.propertySubType || queryFilters.propertySubType || rawFilters.property_sub_type || queryFilters.property_sub_type || '',
+      sortBy: rawFilters.sortBy || queryFilters.sortBy || rawFilters.sort_by || queryFilters.sort_by || 'Newest First',
+      priceMin: rawFilters.priceMin ?? queryFilters.priceMin ?? '',
+      priceMax: rawFilters.priceMax ?? queryFilters.priceMax ?? '',
+      areaUnit: rawFilters.areaUnit || queryFilters.areaUnit || rawFilters.area_unit || queryFilters.area_unit || 'Marla',
+      areaMin: rawFilters.areaMin ?? queryFilters.areaMin ?? '',
+      areaMax: rawFilters.areaMax ?? queryFilters.areaMax ?? ''
+    };
+
+    let queryText = `
+      SELECT n.*, m.message as raw_message, m.timestamp as message_timestamp, c.name as chat_name
+      FROM normalized_messages n
+      LEFT JOIN whatsapp_messages m ON n.whatsapp_message_id = m.id
+      LEFT JOIN whatsapp_chats c ON n.chat_jid = c.jid
+      WHERE (n.is_property = true OR n.purpose IS NOT NULL OR n.property_type IS NOT NULL)
+    `;
+    const params = [];
+    const whereClauses = [];
+
+    if (filters.purpose && String(filters.purpose).trim() !== '') {
+      const p = String(filters.purpose).trim().toLowerCase();
+      params.push(`%${p}%`);
+      const idx = `$${params.length}`;
+      if (p === 'buy' || p === 'sale' || p === 'sell') {
+        whereClauses.push(`(LOWER(n.purpose) IN ('buy', 'sale', 'sell') OR LOWER(m.message) LIKE ${idx} OR LOWER(n.summary) LIKE ${idx})`);
+      } else if (p === 'rent') {
+        whereClauses.push(`(LOWER(n.purpose) = 'rent' OR LOWER(m.message) LIKE ${idx} OR LOWER(n.summary) LIKE ${idx})`);
+      } else {
+        whereClauses.push(`(LOWER(n.purpose) LIKE ${idx} OR LOWER(m.message) LIKE ${idx} OR LOWER(n.summary) LIKE ${idx})`);
+      }
+    }
+
+    if (filters.city && String(filters.city).trim() !== '') {
+      params.push(`%${String(filters.city).trim().toLowerCase()}%`);
+      const idx = `$${params.length}`;
+      whereClauses.push(`(LOWER(n.city) LIKE ${idx} OR LOWER(n.vicinity) LIKE ${idx} OR LOWER(n.area) LIKE ${idx} OR LOWER(m.message) LIKE ${idx})`);
+    }
+
+    if (filters.location && String(filters.location).trim() !== '') {
+      params.push(`%${String(filters.location).trim().toLowerCase()}%`);
+      const idx = `$${params.length}`;
+      whereClauses.push(`(LOWER(n.vicinity) LIKE ${idx} OR LOWER(n.area) LIKE ${idx} OR LOWER(n.summary) LIKE ${idx} OR LOWER(m.message) LIKE ${idx})`);
+    }
+
+    if (filters.propertyType && String(filters.propertyType).trim() !== '') {
+      params.push(`%${String(filters.propertyType).trim().toLowerCase()}%`);
+      const idx = `$${params.length}`;
+      whereClauses.push(`(LOWER(n.property_type) LIKE ${idx} OR LOWER(n.summary) LIKE ${idx} OR LOWER(m.message) LIKE ${idx})`);
+    }
+
+    if (filters.propertySubType && String(filters.propertySubType).trim() !== '') {
+      params.push(`%${String(filters.propertySubType).trim().toLowerCase()}%`);
+      const idx = `$${params.length}`;
+      whereClauses.push(`(LOWER(n.property_type) LIKE ${idx} OR LOWER(n.summary) LIKE ${idx} OR LOWER(m.message) LIKE ${idx})`);
+    }
+
+    if (whereClauses.length > 0) {
+      queryText += ' AND ' + whereClauses.join(' AND ');
+    }
+
+    queryText += ' ORDER BY n.id DESC';
+
+    const dbResult = await db.query(queryText, params);
+    const properties = filterAndSortProperties(dbResult.rows, filters);
+
+    return sendResponse(res, 200, false, {
+      total: properties.length,
+      filters: filters,
+      properties: properties
+    }, 'Properties retrieved successfully');
+  } catch (err) {
+    console.error('Property filter error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+};
+
+app.post('/api/properties/filter', handlePropertyFilter);
+app.get('/api/properties/filter', handlePropertyFilter);
+app.post('/api/properties', handlePropertyFilter);
+app.get('/api/properties', handlePropertyFilter);
 
 // Root Route
 app.get('/', (req, res) => {
