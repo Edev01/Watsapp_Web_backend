@@ -80,15 +80,15 @@ async function batchInsertMessages(chatJid, messages) {
     let paramIndex = 1;
 
     for (const msg of batch) {
-      valuePlaceholders.push(`($${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3}, $${paramIndex + 4})`);
-      values.push(chatJid, msg.sender || 'Unknown', msg.timestamp || '', msg.message || '', msg.fromMe || msg.from_me || false);
-      paramIndex += 5;
+      valuePlaceholders.push(`($${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3}, $${paramIndex + 4}, $${paramIndex + 5})`);
+      values.push(1, chatJid, msg.sender || 'Unknown', msg.timestamp || '', msg.message || '', msg.fromMe || msg.from_me || false);
+      paramIndex += 6;
     }
 
     const query = `
-      INSERT INTO whatsapp_messages (chat_jid, sender, timestamp, message, from_me)
+      INSERT INTO whatsapp_messages (user_id, chat_jid, sender, timestamp, message, from_me)
       VALUES ${valuePlaceholders.join(', ')}
-      ON CONFLICT (chat_jid, sender, timestamp, message) DO UPDATE SET from_me = EXCLUDED.from_me
+      ON CONFLICT (user_id, chat_jid, sender, timestamp, message) DO UPDATE SET from_me = EXCLUDED.from_me
     `;
 
     try {
@@ -99,10 +99,10 @@ async function batchInsertMessages(chatJid, messages) {
       for (const msg of batch) {
         try {
           const res = await db.query(
-            `INSERT INTO whatsapp_messages (chat_jid, sender, timestamp, message, from_me)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (chat_jid, sender, timestamp, message) DO UPDATE SET from_me = EXCLUDED.from_me`,
-            [chatJid, msg.sender || 'Unknown', msg.timestamp || '', msg.message || '', msg.fromMe || msg.from_me || false]
+            `INSERT INTO whatsapp_messages (user_id, chat_jid, sender, timestamp, message, from_me)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (user_id, chat_jid, sender, timestamp, message) DO UPDATE SET from_me = EXCLUDED.from_me`,
+            [1, chatJid, msg.sender || 'Unknown', msg.timestamp || '', msg.message || '', msg.fromMe || msg.from_me || false]
           );
           insertedTotal += res.rowCount || 0;
         } catch (itemErr) {
@@ -110,10 +110,10 @@ async function batchInsertMessages(chatJid, messages) {
           try {
             const truncatedMsg = msg.message ? msg.message.substring(0, 2000) : '';
             const res = await db.query(
-              `INSERT INTO whatsapp_messages (chat_jid, sender, timestamp, message, from_me)
-               VALUES ($1, $2, $3, $4, $5)
-               ON CONFLICT (chat_jid, sender, timestamp, message) DO UPDATE SET from_me = EXCLUDED.from_me`,
-              [chatJid, msg.sender || 'Unknown', msg.timestamp || '', truncatedMsg, msg.fromMe || msg.from_me || false]
+              `INSERT INTO whatsapp_messages (user_id, chat_jid, sender, timestamp, message, from_me)
+               VALUES ($1, $2, $3, $4, $5, $6)
+               ON CONFLICT (user_id, chat_jid, sender, timestamp, message) DO UPDATE SET from_me = EXCLUDED.from_me`,
+              [1, chatJid, msg.sender || 'Unknown', msg.timestamp || '', truncatedMsg, msg.fromMe || msg.from_me || false]
             );
             insertedTotal += res.rowCount || 0;
           } catch (innerErr) {
@@ -142,10 +142,10 @@ async function seed() {
 
     try {
       await db.query(
-        `INSERT INTO whatsapp_chats (jid, name, is_monitored)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (jid) DO UPDATE SET name = EXCLUDED.name`,
-        [item.jid, item.name, true]
+        `INSERT INTO whatsapp_chats (user_id, jid, name, is_monitored)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (user_id, jid) DO UPDATE SET name = EXCLUDED.name`,
+        [1, item.jid, item.name, true]
       );
       console.log(`  ✓ Chat room "${item.name}" registered in whatsapp_chats.`);
     } catch (err) {

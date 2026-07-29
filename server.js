@@ -8,6 +8,7 @@ const db = require('./db');
 const { sendResponse } = require('./responseHelper');
 const { authenticateToken, isAdmin } = require('./middleware');
 const { filterAndSortProperties } = require('./propertyHelper');
+const { extractUserId } = require('./userMiddleware');
 
 const http = require('http');
 const { Server } = require('socket.io');
@@ -25,24 +26,36 @@ const io = new Server(server, {
 
 app.use(cors());
 app.use(express.json());
+app.use(extractUserId);
 
 // Socket.IO real-time event handling
 io.on('connection', (socket) => {
   console.log('Client connected to Socket.IO:', socket.id);
 
+  socket.on('join_user_room', (data) => {
+    if (data && (data.userId || data.user_id)) {
+      const roomName = `user_${data.userId || data.user_id}`;
+      socket.join(roomName);
+      console.log(`Socket ${socket.id} joined user room: ${roomName}`);
+    }
+  });
+
   // 1. Extension emits 'new_qr' -> Backend broadcasts 'new_qr' to Web Portal
   socket.on('new_qr', async (data) => {
     console.log('Socket event new_qr received:', data);
+    const userId = data?.userId || data?.user_id || 1;
     try {
       if (data && data.url) {
         await db.query(
-          'INSERT INTO qr_codes (url, source, page_url) VALUES ($1, $2, $3)',
-          [data.url, data.source || 'whatsapp', data.pageUrl || null]
+          'INSERT INTO qr_codes (url, source, page_url, user_id) VALUES ($1, $2, $3, $4)',
+          [data.url, data.source || 'whatsapp', data.pageUrl || null, userId]
         );
       }
     } catch (err) {
       console.error('Error saving socket new_qr to DB:', err.message);
     }
+    data.userId = userId;
+    io.to(`user_${userId}`).emit('new_qr', data);
     io.emit('new_qr', data);
   });
 
@@ -217,6 +230,7 @@ app.post('/api/auth/reset-password', authenticateToken, async (req, res) => {
 // 5. Post QR URL
 app.post('/api/qr', async (req, res) => {
   const { url, source, pageUrl } = req.body;
+  const userId = req.userId || req.body.userId || req.body.user_id || 1;
 
   if (!url) {
     return sendResponse(res, 400, true, null, 'URL is required');
@@ -224,12 +238,12 @@ app.post('/api/qr', async (req, res) => {
 
   try {
     const result = await db.query(
-      'INSERT INTO qr_codes (url, source, page_url) VALUES ($1, $2, $3) RETURNING id, url, source, page_url, created_at',
-      [url, source || 'whatsapp', pageUrl || null]
+      'INSERT INTO qr_codes (url, source, page_url, user_id) VALUES ($1, $2, $3, $4) RETURNING id, url, source, page_url, user_id, created_at',
+      [url, source || 'whatsapp', pageUrl || null, userId]
     );
 
     const qrData = result.rows[0];
-    // Broadcast real-time socket event to all web clients
+    io.to(`user_${userId}`).emit('qr_updated', qrData);
     io.emit('qr_updated', qrData);
 
     return sendResponse(res, 201, false, qrData, 'QR URL saved successfully');
@@ -256,9 +270,11 @@ app.post('/api/qr/status', async (req, res) => {
 
 // 6. Get Latest QR URL
 app.get('/api/qr/latest', async (req, res) => {
+  const userId = req.userId || req.query.userId || req.query.user_id || 1;
   try {
     const result = await db.query(
-      'SELECT id, url, source, page_url, created_at FROM qr_codes ORDER BY created_at DESC LIMIT 1'
+      'SELECT id, url, source, page_url, user_id, created_at FROM qr_codes WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1',
+      [userId]
     );
 
     if (result.rows.length === 0) {
@@ -275,6 +291,7 @@ app.get('/api/qr/latest', async (req, res) => {
 // 7. Post Scraped Contacts List (Deduplicated by name & JID)
 app.post('/api/scraped-chats/contacts', async (req, res) => {
   const { contacts } = req.body;
+  const userId = req.userId || req.body.userId || req.body.user_id || 1;
   if (!Array.isArray(contacts)) {
     return sendResponse(res, 400, true, null, 'Contacts array is required');
   }
@@ -283,11 +300,11 @@ app.post('/api/scraped-chats/contacts', async (req, res) => {
       const cleanName = (contact.name || '').trim();
       if (!cleanName) continue;
 
-      // Check if contact already exists by JID or name
+      // Check if contact already exists by JID or name for this user
       const existing = await db.query(
         `SELECT id, jid, name FROM whatsapp_chats 
-         WHERE jid = $1 OR LOWER(TRIM(name)) = LOWER(TRIM($2)) LIMIT 1`,
-        [contact.id, cleanName]
+         WHERE user_id = $1 AND (jid = $2 OR LOWER(TRIM(name)) = LOWER(TRIM($3))) LIMIT 1`,
+        [userId, contact.id, cleanName]
       );
 
       if (existing.rows.length > 0) {
@@ -295,17 +312,17 @@ app.post('/api/scraped-chats/contacts', async (req, res) => {
         const oldJid = existingRow.jid;
         const newJid = contact.id;
 
-        // If old JID was a fallback (e.g. name@c.us) and new JID is a phone number (@c.us with digits), update JID in chats & messages
         if (oldJid !== newJid && /^\d+@c\.us$/.test(newJid)) {
-          await db.query(`UPDATE whatsapp_chats SET jid = $1, avatar = COALESCE($2, avatar) WHERE id = $3`, [newJid, contact.avatar || null, existingRow.id]);
-          await db.query(`UPDATE whatsapp_messages SET chat_jid = $1 WHERE chat_jid = $2`, [newJid, oldJid]);
+          await db.query(`UPDATE whatsapp_chats SET jid = $1, avatar = COALESCE($2, avatar) WHERE id = $3 AND user_id = $4`, [newJid, contact.avatar || null, existingRow.id, userId]);
+          await db.query(`UPDATE whatsapp_messages SET chat_jid = $1 WHERE chat_jid = $2 AND user_id = $3`, [newJid, oldJid, userId]);
         } else {
-          await db.query(`UPDATE whatsapp_chats SET avatar = COALESCE($1, avatar) WHERE id = $2`, [contact.avatar || null, existingRow.id]);
+          await db.query(`UPDATE whatsapp_chats SET avatar = COALESCE($1, avatar) WHERE id = $2 AND user_id = $3`, [contact.avatar || null, existingRow.id, userId]);
         }
       } else {
         await db.query(
-          `INSERT INTO whatsapp_chats (jid, name, avatar) VALUES ($1, $2, $3)`,
-          [contact.id, cleanName, contact.avatar || null]
+          `INSERT INTO whatsapp_chats (user_id, jid, name, avatar) VALUES ($1, $2, $3, $4)
+           ON CONFLICT (user_id, jid) DO UPDATE SET name = EXCLUDED.name, avatar = COALESCE(EXCLUDED.avatar, whatsapp_chats.avatar)`,
+          [userId, contact.id, cleanName, contact.avatar || null]
         );
       }
     }
@@ -318,13 +335,15 @@ app.post('/api/scraped-chats/contacts', async (req, res) => {
 
 // 8. Get Monitored Chats list (Includes last_scraped_timestamp for incremental sync)
 app.get('/api/scraped-chats/monitored', async (req, res) => {
+  const userId = req.userId || req.query.userId || req.query.user_id || 1;
   try {
     const result = await db.query(
-      `SELECT c.jid, c.name, c.avatar, c.is_monitored, c.created_at,
-         (SELECT timestamp FROM whatsapp_messages m WHERE m.chat_jid = c.jid ORDER BY m.id DESC LIMIT 1) as last_scraped_timestamp
+      `SELECT c.jid, c.name, c.avatar, c.is_monitored, c.user_id, c.created_at,
+         (SELECT timestamp FROM whatsapp_messages m WHERE m.user_id = c.user_id AND m.chat_jid = c.jid ORDER BY m.id DESC LIMIT 1) as last_scraped_timestamp
        FROM whatsapp_chats c 
-       WHERE c.is_monitored = TRUE 
-       ORDER BY c.name ASC`
+       WHERE c.user_id = $1 AND c.is_monitored = TRUE 
+       ORDER BY c.name ASC`,
+      [userId]
     );
     return sendResponse(res, 200, false, result.rows, 'Monitored chats retrieved successfully');
   } catch (err) {
@@ -336,17 +355,18 @@ app.get('/api/scraped-chats/monitored', async (req, res) => {
 // 9. Post Scraped Chat Messages (Canonical JID matching to prevent duplicate recipient creation)
 app.post('/api/scraped-chats/messages', async (req, res) => {
   const { chatId, chatName, messages } = req.body;
+  const userId = req.userId || req.body.userId || req.body.user_id || 1;
   if ((!chatId && !chatName) || !Array.isArray(messages)) {
     return sendResponse(res, 400, true, null, 'chatId or chatName and messages array are required');
   }
   try {
-    // Resolve canonical JID from database
+    // Resolve canonical JID from database for this user
     let targetJid = chatId;
     if (chatName || chatId) {
       const match = await db.query(
         `SELECT jid FROM whatsapp_chats 
-         WHERE jid = $1 OR LOWER(TRIM(name)) = LOWER(TRIM($2)) LIMIT 1`,
-        [chatId || '', (chatName || '').trim()]
+         WHERE user_id = $1 AND (jid = $2 OR LOWER(TRIM(name)) = LOWER(TRIM($3))) LIMIT 1`,
+        [userId, chatId || '', (chatName || '').trim()]
       );
       if (match.rows.length > 0) {
         targetJid = match.rows[0].jid;
@@ -358,17 +378,17 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
       const isFromMe = msg.fromMe ?? msg.from_me ?? false;
       try {
         await db.query(
-          `INSERT INTO whatsapp_messages (chat_jid, sender, timestamp, message, from_me) 
-           VALUES ($1, $2, $3, $4, $5) 
-           ON CONFLICT (chat_jid, sender, timestamp, message) DO UPDATE SET from_me = EXCLUDED.from_me`,
-          [targetJid, msg.sender, msg.timestamp, msg.message, isFromMe]
+          `INSERT INTO whatsapp_messages (user_id, chat_jid, sender, timestamp, message, from_me) 
+           VALUES ($1, $2, $3, $4, $5, $6) 
+           ON CONFLICT (user_id, chat_jid, sender, timestamp, message) DO UPDATE SET from_me = EXCLUDED.from_me`,
+          [userId, targetJid, msg.sender, msg.timestamp, msg.message, isFromMe]
         );
         addedCount++;
       } catch (insertErr) {
         // Handled unique constraint conflicts gracefully
       }
     }
-    return sendResponse(res, 201, false, { addedCount, targetJid }, 'Messages saved successfully');
+    return sendResponse(res, 201, false, { addedCount, targetJid, userId }, 'Messages saved successfully');
   } catch (err) {
     console.error('Post messages error:', err);
     return sendResponse(res, 500, true, null, err.message || 'Server error');
@@ -378,17 +398,18 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
 // 10. Toggle Monitored Status for Chats
 app.post('/api/scraped-chats/monitor', async (req, res) => {
   const { jids } = req.body;
+  const userId = req.userId || req.body.userId || req.body.user_id || 1;
   if (!Array.isArray(jids)) {
     return sendResponse(res, 400, true, null, 'jids array is required');
   }
   try {
-    // Reset all to FALSE first
-    await db.query('UPDATE whatsapp_chats SET is_monitored = FALSE');
+    // Reset user's chats to FALSE first
+    await db.query('UPDATE whatsapp_chats SET is_monitored = FALSE WHERE user_id = $1', [userId]);
     if (jids.length > 0) {
-      // Set is_monitored to TRUE for selected JIDs
+      // Set is_monitored to TRUE for selected JIDs belonging to user
       await db.query(
-        'UPDATE whatsapp_chats SET is_monitored = TRUE WHERE jid = ANY($1)',
-        [jids]
+        'UPDATE whatsapp_chats SET is_monitored = TRUE WHERE user_id = $1 AND jid = ANY($2)',
+        [userId, jids]
       );
     }
     return sendResponse(res, 200, false, null, 'Monitored status updated successfully');
@@ -398,11 +419,13 @@ app.post('/api/scraped-chats/monitor', async (req, res) => {
   }
 });
 
-// 11. Get All Chats (both monitored and unmonitored)
+// 11. Get All Chats (both monitored and unmonitored for user)
 app.get('/api/scraped-chats', async (req, res) => {
+  const userId = req.userId || req.query.userId || req.query.user_id || 1;
   try {
     const result = await db.query(
-      'SELECT jid, name, avatar, is_monitored, created_at FROM whatsapp_chats ORDER BY name ASC'
+      'SELECT jid, name, avatar, is_monitored, user_id, created_at FROM whatsapp_chats WHERE user_id = $1 ORDER BY name ASC',
+      [userId]
     );
     return sendResponse(res, 200, false, result.rows, 'All chats retrieved successfully');
   } catch (err) {
@@ -411,16 +434,19 @@ app.get('/api/scraped-chats', async (req, res) => {
   }
 });
 
-// 11b. Get All Realtors List (Includes total message counts & identifiers)
+// 11b. Get All Realtors List (Includes total message counts & identifiers for user)
 app.get('/api/realtors', async (req, res) => {
+  const userId = req.userId || req.query.userId || req.query.user_id || 1;
   try {
     const result = await db.query(
-      `SELECT c.id, c.jid, c.name, c.avatar, c.is_monitored, c.created_at,
+      `SELECT c.id, c.jid, c.name, c.avatar, c.is_monitored, c.user_id, c.created_at,
               COUNT(m.id) as total_messages
        FROM whatsapp_chats c
-       LEFT JOIN whatsapp_messages m ON m.chat_jid = c.jid
-       GROUP BY c.id, c.jid, c.name, c.avatar, c.is_monitored, c.created_at
-       ORDER BY c.id ASC`
+       LEFT JOIN whatsapp_messages m ON m.chat_jid = c.jid AND m.user_id = c.user_id
+       WHERE c.user_id = $1
+       GROUP BY c.id, c.jid, c.name, c.avatar, c.is_monitored, c.user_id, c.created_at
+       ORDER BY c.id ASC`,
+      [userId]
     );
     return sendResponse(res, 200, false, result.rows, 'Realtors list retrieved successfully');
   } catch (err) {
@@ -431,6 +457,7 @@ app.get('/api/realtors', async (req, res) => {
 
 // 12. Get Messages for a Specific Chat / Realtor (Supports chatId, jid, or name query params)
 app.get('/api/scraped-chats/messages', async (req, res) => {
+  const userId = req.userId || req.query.userId || req.query.user_id || 1;
   const { chatId, jid, name } = req.query;
   const targetId = chatId || jid;
 
@@ -442,21 +469,21 @@ app.get('/api/scraped-chats/messages', async (req, res) => {
     let result;
     if (targetId) {
       result = await db.query(
-        `SELECT m.id, m.chat_jid, c.name as chat_name, m.sender, m.timestamp, m.message, m.from_me, m.from_me as "fromMe", m.created_at 
+        `SELECT m.id, m.chat_jid, c.name as chat_name, m.sender, m.timestamp, m.message, m.from_me, m.from_me as "fromMe", m.user_id, m.created_at 
          FROM whatsapp_messages m
-         LEFT JOIN whatsapp_chats c ON m.chat_jid = c.jid
-         WHERE m.chat_jid = $1 OR LOWER(c.name) LIKE LOWER($2)
+         LEFT JOIN whatsapp_chats c ON m.chat_jid = c.jid AND m.user_id = c.user_id
+         WHERE m.user_id = $1 AND (m.chat_jid = $2 OR LOWER(c.name) LIKE LOWER($3))
          ORDER BY m.id ASC`,
-        [targetId, `%${targetId}%`]
+        [userId, targetId, `%${targetId}%`]
       );
     } else {
       result = await db.query(
-        `SELECT m.id, m.chat_jid, c.name as chat_name, m.sender, m.timestamp, m.message, m.from_me, m.from_me as "fromMe", m.created_at 
+        `SELECT m.id, m.chat_jid, c.name as chat_name, m.sender, m.timestamp, m.message, m.from_me, m.from_me as "fromMe", m.user_id, m.created_at 
          FROM whatsapp_messages m
-         LEFT JOIN whatsapp_chats c ON m.chat_jid = c.jid
-         WHERE LOWER(c.name) LIKE LOWER($1)
+         LEFT JOIN whatsapp_chats c ON m.chat_jid = c.jid AND m.user_id = c.user_id
+         WHERE m.user_id = $1 AND LOWER(c.name) LIKE LOWER($2)
          ORDER BY m.id ASC`,
-        [`%${name}%`]
+        [userId, `%${name}%`]
       );
     }
 
@@ -550,14 +577,16 @@ const handlePropertyFilter = async (req, res) => {
       areaMax: rawFilters.areaMax ?? queryFilters.areaMax ?? ''
     };
 
+    const userId = req.userId || rawFilters.userId || rawFilters.user_id || queryFilters.userId || queryFilters.user_id || 1;
+
     let queryText = `
-      SELECT n.*, m.message as raw_message, m.timestamp as message_timestamp, m.from_me, c.name as chat_name
+      SELECT n.*, m.message as raw_message, m.timestamp as message_timestamp, m.from_me, m.user_id, c.name as chat_name
       FROM normalized_messages n
       LEFT JOIN whatsapp_messages m ON n.whatsapp_message_id = m.id
-      LEFT JOIN whatsapp_chats c ON n.chat_jid = c.jid
-      WHERE (n.is_property = true OR n.purpose IS NOT NULL OR n.property_type IS NOT NULL)
+      LEFT JOIN whatsapp_chats c ON n.chat_jid = c.jid AND m.user_id = c.user_id
+      WHERE m.user_id = $1 AND (n.is_property = true OR n.purpose IS NOT NULL OR n.property_type IS NOT NULL)
     `;
-    const params = [];
+    const params = [userId];
     const whereClauses = [];
 
     if (filters.purpose && String(filters.purpose).trim() !== '') {

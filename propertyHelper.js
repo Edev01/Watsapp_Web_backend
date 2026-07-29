@@ -128,6 +128,8 @@ function filterAndSortProperties(rawRows, filters = {}) {
       rawMessage: r.raw_message,
       fromMe: r.from_me || r.fromMe || false,
       from_me: r.from_me || r.fromMe || false,
+      userId: r.user_id || 1,
+      user_id: r.user_id || 1,
       createdAt: r.created_at
     };
   });
