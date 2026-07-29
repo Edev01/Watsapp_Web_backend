@@ -126,6 +126,8 @@ function filterAndSortProperties(rawRows, filters = {}) {
       contactNumber: r.contact_number,
       summary: r.summary,
       rawMessage: r.raw_message,
+      fromMe: r.from_me || r.fromMe || false,
+      from_me: r.from_me || r.fromMe || false,
       createdAt: r.created_at
     };
   });

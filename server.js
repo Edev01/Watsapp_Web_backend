@@ -355,12 +355,13 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
 
     let addedCount = 0;
     for (const msg of messages) {
+      const isFromMe = msg.fromMe ?? msg.from_me ?? false;
       try {
         await db.query(
-          `INSERT INTO whatsapp_messages (chat_jid, sender, timestamp, message) 
-           VALUES ($1, $2, $3, $4) 
-           ON CONFLICT (chat_jid, sender, timestamp, message) DO NOTHING`,
-          [targetJid, msg.sender, msg.timestamp, msg.message]
+          `INSERT INTO whatsapp_messages (chat_jid, sender, timestamp, message, from_me) 
+           VALUES ($1, $2, $3, $4, $5) 
+           ON CONFLICT (chat_jid, sender, timestamp, message) DO UPDATE SET from_me = EXCLUDED.from_me`,
+          [targetJid, msg.sender, msg.timestamp, msg.message, isFromMe]
         );
         addedCount++;
       } catch (insertErr) {
@@ -441,7 +442,7 @@ app.get('/api/scraped-chats/messages', async (req, res) => {
     let result;
     if (targetId) {
       result = await db.query(
-        `SELECT m.id, m.chat_jid, c.name as chat_name, m.sender, m.timestamp, m.message, m.created_at 
+        `SELECT m.id, m.chat_jid, c.name as chat_name, m.sender, m.timestamp, m.message, m.from_me, m.from_me as "fromMe", m.created_at 
          FROM whatsapp_messages m
          LEFT JOIN whatsapp_chats c ON m.chat_jid = c.jid
          WHERE m.chat_jid = $1 OR LOWER(c.name) LIKE LOWER($2)
@@ -450,7 +451,7 @@ app.get('/api/scraped-chats/messages', async (req, res) => {
       );
     } else {
       result = await db.query(
-        `SELECT m.id, m.chat_jid, c.name as chat_name, m.sender, m.timestamp, m.message, m.created_at 
+        `SELECT m.id, m.chat_jid, c.name as chat_name, m.sender, m.timestamp, m.message, m.from_me, m.from_me as "fromMe", m.created_at 
          FROM whatsapp_messages m
          LEFT JOIN whatsapp_chats c ON m.chat_jid = c.jid
          WHERE LOWER(c.name) LIKE LOWER($1)
@@ -473,7 +474,7 @@ app.get('/api/ml/dataset', async (req, res) => {
 
   try {
     let queryText = `
-      SELECT m.id, m.chat_jid, c.name as chat_name, m.sender, m.timestamp, m.message, m.created_at
+      SELECT m.id, m.chat_jid, c.name as chat_name, m.sender, m.timestamp, m.message, m.from_me, m.from_me as "fromMe", m.created_at
       FROM whatsapp_messages m
       LEFT JOIN whatsapp_chats c ON m.chat_jid = c.jid
     `;
@@ -550,7 +551,7 @@ const handlePropertyFilter = async (req, res) => {
     };
 
     let queryText = `
-      SELECT n.*, m.message as raw_message, m.timestamp as message_timestamp, c.name as chat_name
+      SELECT n.*, m.message as raw_message, m.timestamp as message_timestamp, m.from_me, c.name as chat_name
       FROM normalized_messages n
       LEFT JOIN whatsapp_messages m ON n.whatsapp_message_id = m.id
       LEFT JOIN whatsapp_chats c ON n.chat_jid = c.jid

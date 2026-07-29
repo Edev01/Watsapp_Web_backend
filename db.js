@@ -49,10 +49,12 @@ const initializeDb = async () => {
       sender VARCHAR(255),
       timestamp VARCHAR(255),
       message TEXT,
+      from_me BOOLEAN DEFAULT FALSE,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       CONSTRAINT unique_message UNIQUE (chat_jid, sender, timestamp, message)
     );
-  
+
+    ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS from_me BOOLEAN DEFAULT FALSE;
   `;
   try {
     const client = await pool.connect();
