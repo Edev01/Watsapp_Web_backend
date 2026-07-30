@@ -9,6 +9,7 @@ const { sendResponse } = require('./responseHelper');
 const { authenticateToken, isAdmin } = require('./middleware');
 const { filterAndSortProperties } = require('./propertyHelper');
 const { extractUserId } = require('./userMiddleware');
+const { findOrCreateCanonicalChat, cleanText, isSystemNotificationText } = require('./contactHelper');
 
 const http = require('http');
 const { Server } = require('socket.io');
@@ -288,7 +289,7 @@ app.get('/api/qr/latest', async (req, res) => {
   }
 });
 
-// 7. Post Scraped Contacts List (Deduplicated by name & JID)
+// 7. Post Scraped Contacts List (Deduplicated by name & JID with canonical matching)
 app.post('/api/scraped-chats/contacts', async (req, res) => {
   const { contacts } = req.body;
   const userId = req.userId || req.body.userId || req.body.user_id || 1;
@@ -297,34 +298,8 @@ app.post('/api/scraped-chats/contacts', async (req, res) => {
   }
   try {
     for (const contact of contacts) {
-      const cleanName = (contact.name || '').trim();
-      if (!cleanName) continue;
-
-      // Check if contact already exists by JID or name for this user
-      const existing = await db.query(
-        `SELECT id, jid, name FROM whatsapp_chats 
-         WHERE user_id = $1 AND (jid = $2 OR LOWER(TRIM(name)) = LOWER(TRIM($3))) LIMIT 1`,
-        [userId, contact.id, cleanName]
-      );
-
-      if (existing.rows.length > 0) {
-        const existingRow = existing.rows[0];
-        const oldJid = existingRow.jid;
-        const newJid = contact.id;
-
-        if (oldJid !== newJid && /^\d+@c\.us$/.test(newJid)) {
-          await db.query(`UPDATE whatsapp_chats SET jid = $1, avatar = COALESCE($2, avatar) WHERE id = $3 AND user_id = $4`, [newJid, contact.avatar || null, existingRow.id, userId]);
-          await db.query(`UPDATE whatsapp_messages SET chat_jid = $1 WHERE chat_jid = $2 AND user_id = $3`, [newJid, oldJid, userId]);
-        } else {
-          await db.query(`UPDATE whatsapp_chats SET avatar = COALESCE($1, avatar) WHERE id = $2 AND user_id = $3`, [contact.avatar || null, existingRow.id, userId]);
-        }
-      } else {
-        await db.query(
-          `INSERT INTO whatsapp_chats (user_id, jid, name, avatar) VALUES ($1, $2, $3, $4)
-           ON CONFLICT (user_id, jid) DO UPDATE SET name = EXCLUDED.name, avatar = COALESCE(EXCLUDED.avatar, whatsapp_chats.avatar)`,
-          [userId, contact.id, cleanName, contact.avatar || null]
-        );
-      }
+      if (!contact.name && !contact.id) continue;
+      await findOrCreateCanonicalChat(userId, contact.id, contact.name, contact.avatar);
     }
     return sendResponse(res, 200, false, null, 'Contacts updated successfully');
   } catch (err) {
@@ -361,16 +336,9 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
   }
   try {
     // Resolve canonical JID from database for this user
-    let targetJid = chatId;
-    if (chatName || chatId) {
-      const match = await db.query(
-        `SELECT jid FROM whatsapp_chats 
-         WHERE user_id = $1 AND (jid = $2 OR LOWER(TRIM(name)) = LOWER(TRIM($3))) LIMIT 1`,
-        [userId, chatId || '', (chatName || '').trim()]
-      );
-      if (match.rows.length > 0) {
-        targetJid = match.rows[0].jid;
-      }
+    const canonicalJid = await findOrCreateCanonicalChat(userId, chatId, chatName);
+    if (!canonicalJid) {
+      return sendResponse(res, 200, false, { addedCount: 0 }, 'Ignored system notification message payload');
     }
 
     let addedCount = 0;
@@ -381,14 +349,14 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
           `INSERT INTO whatsapp_messages (user_id, chat_jid, sender, timestamp, message, from_me) 
            VALUES ($1, $2, $3, $4, $5, $6) 
            ON CONFLICT (user_id, chat_jid, sender, timestamp, message) DO UPDATE SET from_me = EXCLUDED.from_me`,
-          [userId, targetJid, msg.sender, msg.timestamp, msg.message, isFromMe]
+          [userId, canonicalJid, msg.sender, msg.timestamp, msg.message, isFromMe]
         );
         addedCount++;
       } catch (insertErr) {
         // Handled unique constraint conflicts gracefully
       }
     }
-    return sendResponse(res, 201, false, { addedCount, targetJid, userId }, 'Messages saved successfully');
+    return sendResponse(res, 201, false, { addedCount, targetJid: canonicalJid, userId }, 'Messages saved successfully');
   } catch (err) {
     console.error('Post messages error:', err);
     return sendResponse(res, 500, true, null, err.message || 'Server error');
