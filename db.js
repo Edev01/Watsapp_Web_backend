@@ -30,7 +30,7 @@ const initializeDb = async () => {
 
     CREATE TABLE IF NOT EXISTS qr_codes (
       id SERIAL PRIMARY KEY,
-      user_id INTEGER REFERENCES users(id) DEFAULT 1,
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE DEFAULT 1,
       url TEXT NOT NULL,
       source VARCHAR(255) DEFAULT 'whatsapp',
       page_url TEXT,
@@ -38,11 +38,11 @@ const initializeDb = async () => {
     );
 
     ALTER TABLE qr_codes ADD COLUMN IF NOT EXISTS page_url TEXT;
-    ALTER TABLE qr_codes ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id) DEFAULT 1;
+    ALTER TABLE qr_codes ADD COLUMN IF NOT EXISTS user_id INTEGER;
 
     CREATE TABLE IF NOT EXISTS whatsapp_chats (
       id SERIAL PRIMARY KEY,
-      user_id INTEGER REFERENCES users(id) DEFAULT 1,
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE DEFAULT 1,
       jid VARCHAR(255) NOT NULL,
       name VARCHAR(255),
       avatar TEXT,
@@ -51,14 +51,14 @@ const initializeDb = async () => {
       CONSTRAINT unique_user_chat UNIQUE (user_id, jid)
     );
 
-    ALTER TABLE whatsapp_chats ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id) DEFAULT 1;
+    ALTER TABLE whatsapp_chats ADD COLUMN IF NOT EXISTS user_id INTEGER;
     ALTER TABLE whatsapp_chats DROP CONSTRAINT IF EXISTS whatsapp_chats_jid_key;
     ALTER TABLE whatsapp_chats DROP CONSTRAINT IF EXISTS unique_user_chat;
     ALTER TABLE whatsapp_chats ADD CONSTRAINT unique_user_chat UNIQUE (user_id, jid);
 
     CREATE TABLE IF NOT EXISTS whatsapp_messages (
       id SERIAL PRIMARY KEY,
-      user_id INTEGER REFERENCES users(id) DEFAULT 1,
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE DEFAULT 1,
       chat_jid VARCHAR(255) NOT NULL,
       sender VARCHAR(255),
       timestamp VARCHAR(255),
@@ -68,17 +68,33 @@ const initializeDb = async () => {
       CONSTRAINT unique_user_message UNIQUE (user_id, chat_jid, sender, timestamp, message)
     );
 
-    ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id) DEFAULT 1;
+    ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS user_id INTEGER;
     ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS from_me BOOLEAN DEFAULT FALSE;
     ALTER TABLE whatsapp_messages DROP CONSTRAINT IF EXISTS unique_message;
     ALTER TABLE whatsapp_messages DROP CONSTRAINT IF EXISTS unique_user_message;
     ALTER TABLE whatsapp_messages ADD CONSTRAINT unique_user_message UNIQUE (user_id, chat_jid, sender, timestamp, message);
+
+    -- Recreate user_id FKs with ON DELETE CASCADE so users can be removed safely
+    ALTER TABLE qr_codes DROP CONSTRAINT IF EXISTS qr_codes_user_id_fkey;
+    ALTER TABLE qr_codes
+      ADD CONSTRAINT qr_codes_user_id_fkey
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+
+    ALTER TABLE whatsapp_chats DROP CONSTRAINT IF EXISTS whatsapp_chats_user_id_fkey;
+    ALTER TABLE whatsapp_chats
+      ADD CONSTRAINT whatsapp_chats_user_id_fkey
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+
+    ALTER TABLE whatsapp_messages DROP CONSTRAINT IF EXISTS whatsapp_messages_user_id_fkey;
+    ALTER TABLE whatsapp_messages
+      ADD CONSTRAINT whatsapp_messages_user_id_fkey
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
   `;
   try {
     const client = await pool.connect();
     await client.query(queryText);
     client.release();
-    console.log('Database initialized successfully (users table checked/created).');
+    console.log('Database initialized successfully (users table checked/created, CASCADE FKs applied).');
   } catch (err) {
     console.error('Error initializing database table:', err.message);
   }

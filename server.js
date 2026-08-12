@@ -227,6 +227,42 @@ app.post('/api/users', authenticateToken, isAdmin, async (req, res) => {
   }
 });
 
+// 3b. Delete User Endpoint (Admin Only) — cascades QR/chats/messages via FK ON DELETE CASCADE
+app.delete('/api/users/:id', authenticateToken, isAdmin, async (req, res) => {
+  const targetId = parseInt(req.params.id, 10);
+  if (!targetId || Number.isNaN(targetId)) {
+    return sendResponse(res, 400, true, null, 'Valid user id is required');
+  }
+  if (targetId === 1) {
+    return sendResponse(res, 400, true, null, 'Default admin user (id=1) cannot be deleted');
+  }
+  if (req.user && Number(req.user.id) === targetId) {
+    return sendResponse(res, 400, true, null, 'You cannot delete your own account');
+  }
+
+  try {
+    const existing = await db.query('SELECT id, email, role FROM users WHERE id = $1', [targetId]);
+    if (existing.rows.length === 0) {
+      return sendResponse(res, 404, true, null, 'User not found');
+    }
+
+    // Extra safety cleanup in case some related tables lack CASCADE yet
+    await db.query('DELETE FROM qr_codes WHERE user_id = $1', [targetId]);
+    await db.query('DELETE FROM whatsapp_messages WHERE user_id = $1', [targetId]);
+    await db.query('DELETE FROM whatsapp_chats WHERE user_id = $1', [targetId]);
+
+    const result = await db.query(
+      'DELETE FROM users WHERE id = $1 RETURNING id, email, role, name',
+      [targetId]
+    );
+
+    return sendResponse(res, 200, false, result.rows[0], 'User and related data deleted successfully');
+  } catch (err) {
+    console.error('Delete user error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
 // 4. Reset Password Endpoint (Authenticated User)
 app.post('/api/auth/reset-password', authenticateToken, async (req, res) => {
   const { newPassword } = req.body;
