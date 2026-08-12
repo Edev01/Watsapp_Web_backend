@@ -48,15 +48,31 @@ async function findOrCreateCanonicalChat(userId, rawJid, rawName, avatar = null)
   const cleanedName = cleanText(rawName);
   const cleanedJid = cleanText(rawJid);
 
-  if (isSystemNotificationText(cleanedName) || isSystemNotificationText(cleanedJid)) {
-    return null; // Skip system notification strings
+  // Only reject when BOTH identifiers look like system/junk text
+  const nameIsJunk = !cleanedName || isSystemNotificationText(cleanedName);
+  const jidIsJunk = !cleanedJid || isSystemNotificationText(cleanedJid) || cleanedJid === '@c.us' || cleanedJid === '@lid';
+  if (nameIsJunk && jidIsJunk) {
+    return null;
   }
 
   // Normalize phone JID (e.g. 03372071203@c.us -> 923372071203@c.us)
   const phoneDigits = normalizePhoneDigits(cleanedJid) || normalizePhoneDigits(cleanedName);
   let canonicalJid = cleanedJid;
-  if (phoneDigits && phoneDigits.length >= 10 && phoneDigits.length <= 13) {
-    canonicalJid = `${phoneDigits}@c.us`;
+  if (phoneDigits && phoneDigits.length >= 10 && phoneDigits.length <= 15) {
+    // Keep @lid JIDs as-is when WhatsApp provides them; only normalize @c.us / bare phones
+    if (!cleanedJid.includes('@lid')) {
+      canonicalJid = `${phoneDigits}@c.us`;
+    }
+  }
+
+  // Fallback slug JID from name when no usable JID was provided
+  if (!canonicalJid || canonicalJid === '@c.us' || jidIsJunk) {
+    const slug = (cleanedName || 'unknown')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .slice(0, 40);
+    canonicalJid = `${slug || 'unknown'}@c.us`;
   }
 
   // 1. Try matching by user_id and canonical JID

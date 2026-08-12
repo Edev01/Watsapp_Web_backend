@@ -29,6 +29,30 @@ app.use(cors());
 app.use(express.json());
 app.use(extractUserId);
 
+// Broadcast QR events to the user's room + legacy global listeners
+function emitNewQr(userId, payload) {
+  const data = { ...payload, userId: Number(userId) || 1 };
+  io.to(`user_${data.userId}`).emit('new_qr', data);
+  io.to(`user_${data.userId}`).emit('qr_updated', data);
+  // Keep global emit for older frontends, but always include userId for filtering
+  io.emit('new_qr', data);
+  io.emit('qr_updated', data);
+}
+
+function emitQrDisappeared(userId, payload = {}) {
+  const data = {
+    status: 'disappeared',
+    message: 'WhatsApp opened / QR disappeared',
+    timestamp: new Date().toISOString(),
+    ...payload,
+    userId: Number(userId) || 1
+  };
+  io.to(`user_${data.userId}`).emit('qr_disappeared', data);
+  io.to(`user_${data.userId}`).emit('qr_cleared', data);
+  io.emit('qr_disappeared', data);
+  io.emit('qr_cleared', data);
+}
+
 // Socket.IO real-time event handling
 io.on('connection', (socket) => {
   console.log('Client connected to Socket.IO:', socket.id);
@@ -55,20 +79,25 @@ io.on('connection', (socket) => {
     } catch (err) {
       console.error('Error saving socket new_qr to DB:', err.message);
     }
-    data.userId = userId;
-    io.to(`user_${userId}`).emit('new_qr', data);
-    io.emit('new_qr', data);
+    emitNewQr(userId, data || {});
   });
 
   // 2. Extension emits 'qr_disappeared' -> Backend broadcasts 'qr_disappeared' to Web Portal
   socket.on('qr_disappeared', (data) => {
     console.log('Socket event qr_disappeared received:', data);
-    io.emit('qr_disappeared', data || { status: 'disappeared', message: 'WhatsApp opened / QR disappeared' });
+    const userId = data?.userId || data?.user_id || 1;
+    emitQrDisappeared(userId, data || {});
   });
 
   // Legacy support fallback
-  socket.on('qr_updated', (data) => io.emit('new_qr', data));
-  socket.on('qr_cleared', (data) => io.emit('qr_disappeared', data));
+  socket.on('qr_updated', (data) => {
+    const userId = data?.userId || data?.user_id || 1;
+    emitNewQr(userId, data || {});
+  });
+  socket.on('qr_cleared', (data) => {
+    const userId = data?.userId || data?.user_id || 1;
+    emitQrDisappeared(userId, data || {});
+  });
 
   socket.on('disconnect', () => {
     console.log('Client disconnected from Socket.IO:', socket.id);
@@ -244,8 +273,13 @@ app.post('/api/qr', async (req, res) => {
     );
 
     const qrData = result.rows[0];
-    io.to(`user_${userId}`).emit('qr_updated', qrData);
-    io.emit('qr_updated', qrData);
+    // Emit both new_qr (frontend) and qr_updated (legacy)
+    emitNewQr(userId, {
+      ...qrData,
+      url: qrData.url,
+      source: qrData.source,
+      pageUrl: qrData.page_url
+    });
 
     return sendResponse(res, 201, false, qrData, 'QR URL saved successfully');
   } catch (err) {
@@ -256,15 +290,16 @@ app.post('/api/qr', async (req, res) => {
 
 // 5b. Post QR Status / Cleared (HTTP Fallback for Extension)
 app.post('/api/qr/status', async (req, res) => {
-  const { status, message } = req.body;
+  const userId = req.userId || req.body.userId || req.body.user_id || 1;
   const payload = {
-    status: status || 'scanned',
-    message: message || 'WhatsApp logged in / QR code cleared',
-    timestamp: new Date()
+    status: req.body.status || 'disappeared',
+    message: req.body.message || 'WhatsApp logged in / QR code cleared',
+    timestamp: new Date().toISOString(),
+    userId
   };
 
-  // Broadcast real-time socket event to all web clients
-  io.emit('qr_cleared', payload);
+  // Emit both qr_disappeared (frontend) and qr_cleared (legacy)
+  emitQrDisappeared(userId, payload);
 
   return sendResponse(res, 200, false, payload, 'QR cleared status emitted successfully');
 });
@@ -329,34 +364,78 @@ app.get('/api/scraped-chats/monitored', async (req, res) => {
 
 // 9. Post Scraped Chat Messages (Canonical JID matching to prevent duplicate recipient creation)
 app.post('/api/scraped-chats/messages', async (req, res) => {
-  const { chatId, chatName, messages } = req.body;
+  const { chatId, chatName, messages, jid, name } = req.body;
   const userId = req.userId || req.body.userId || req.body.user_id || 1;
-  if ((!chatId && !chatName) || !Array.isArray(messages)) {
-    return sendResponse(res, 400, true, null, 'chatId or chatName and messages array are required');
+  const resolvedChatId = chatId || jid || null;
+  const resolvedChatName = chatName || name || null;
+
+  if ((!resolvedChatId && !resolvedChatName) || !Array.isArray(messages)) {
+    return sendResponse(res, 400, true, null, 'chatId/jid or chatName/name and messages array are required');
   }
+
+  // Empty payloads are valid no-ops (avoid noisy errors from extension observers)
+  if (messages.length === 0) {
+    return sendResponse(res, 200, false, { addedCount: 0, skippedCount: 0, userId }, 'No messages to save');
+  }
+
   try {
     // Resolve canonical JID from database for this user
-    const canonicalJid = await findOrCreateCanonicalChat(userId, chatId, chatName);
+    const canonicalJid = await findOrCreateCanonicalChat(userId, resolvedChatId, resolvedChatName);
     if (!canonicalJid) {
-      return sendResponse(res, 200, false, { addedCount: 0 }, 'Ignored system notification message payload');
+      return sendResponse(res, 200, false, { addedCount: 0, skippedCount: messages.length }, 'Ignored system notification message payload');
     }
 
     let addedCount = 0;
+    let skippedCount = 0;
+    const insertErrors = [];
+
     for (const msg of messages) {
+      const sender = (msg.sender ?? '').toString().trim();
+      const timestamp = (msg.timestamp ?? '').toString().trim();
+      const messageText = (msg.message ?? msg.text ?? '').toString();
       const isFromMe = msg.fromMe ?? msg.from_me ?? false;
+
+      if (!timestamp && !messageText) {
+        skippedCount++;
+        continue;
+      }
+
       try {
-        await db.query(
+        const result = await db.query(
           `INSERT INTO whatsapp_messages (user_id, chat_jid, sender, timestamp, message, from_me) 
            VALUES ($1, $2, $3, $4, $5, $6) 
-           ON CONFLICT (user_id, chat_jid, sender, timestamp, message) DO UPDATE SET from_me = EXCLUDED.from_me`,
-          [userId, canonicalJid, msg.sender, msg.timestamp, msg.message, isFromMe]
+           ON CONFLICT (user_id, chat_jid, sender, timestamp, message) DO NOTHING
+           RETURNING id`,
+          [userId, canonicalJid, sender || 'unknown', timestamp || 'unknown', messageText, isFromMe]
         );
-        addedCount++;
+        if (result.rowCount > 0) {
+          addedCount++;
+        } else {
+          skippedCount++; // duplicate already in DB
+        }
       } catch (insertErr) {
-        // Handled unique constraint conflicts gracefully
+        skippedCount++;
+        insertErrors.push(insertErr.message);
+        console.error('Message insert error:', insertErr.message);
       }
     }
-    return sendResponse(res, 201, false, { addedCount, targetJid: canonicalJid, userId }, 'Messages saved successfully');
+
+    // Notify frontend that this user's chat was updated
+    io.to(`user_${userId}`).emit('messages_updated', {
+      userId,
+      chatJid: canonicalJid,
+      chatName: resolvedChatName,
+      addedCount,
+      skippedCount
+    });
+
+    return sendResponse(
+      res,
+      201,
+      false,
+      { addedCount, skippedCount, targetJid: canonicalJid, userId, insertErrors: insertErrors.slice(0, 3) },
+      addedCount > 0 ? 'Messages saved successfully' : 'No new messages (duplicates skipped)'
+    );
   } catch (err) {
     console.error('Post messages error:', err);
     return sendResponse(res, 500, true, null, err.message || 'Server error');
@@ -424,14 +503,13 @@ app.get('/api/realtors', async (req, res) => {
 });
 
 // 12. Get Messages for a Specific Chat / Realtor (Supports chatId, jid, or name query params)
+// If no chat filter is provided, returns all messages for the user (multi-tenant safe).
 app.get('/api/scraped-chats/messages', async (req, res) => {
   const userId = req.userId || req.query.userId || req.query.user_id || 1;
-  const { chatId, jid, name } = req.query;
+  const { chatId, jid, name, limit, offset } = req.query;
   const targetId = chatId || jid;
-
-  if (!targetId && !name) {
-    return sendResponse(res, 400, true, null, 'chatId, jid, or name query parameter is required');
-  }
+  const pageLimit = Math.min(parseInt(limit, 10) || 5000, 10000);
+  const pageOffset = Math.max(parseInt(offset, 10) || 0, 0);
 
   try {
     let result;
@@ -440,18 +518,31 @@ app.get('/api/scraped-chats/messages', async (req, res) => {
         `SELECT m.id, m.chat_jid, c.name as chat_name, m.sender, m.timestamp, m.message, m.from_me, m.from_me as "fromMe", m.user_id, m.created_at 
          FROM whatsapp_messages m
          LEFT JOIN whatsapp_chats c ON m.chat_jid = c.jid AND m.user_id = c.user_id
-         WHERE m.user_id = $1 AND (m.chat_jid = $2 OR LOWER(c.name) LIKE LOWER($3))
-         ORDER BY m.id ASC`,
-        [userId, targetId, `%${targetId}%`]
+         WHERE m.user_id = $1 AND (m.chat_jid = $2 OR LOWER(COALESCE(c.name, '')) LIKE LOWER($3))
+         ORDER BY m.id ASC
+         LIMIT $4 OFFSET $5`,
+        [userId, targetId, `%${targetId}%`, pageLimit, pageOffset]
       );
-    } else {
+    } else if (name) {
       result = await db.query(
         `SELECT m.id, m.chat_jid, c.name as chat_name, m.sender, m.timestamp, m.message, m.from_me, m.from_me as "fromMe", m.user_id, m.created_at 
          FROM whatsapp_messages m
          LEFT JOIN whatsapp_chats c ON m.chat_jid = c.jid AND m.user_id = c.user_id
-         WHERE m.user_id = $1 AND LOWER(c.name) LIKE LOWER($2)
-         ORDER BY m.id ASC`,
-        [userId, `%${name}%`]
+         WHERE m.user_id = $1 AND LOWER(COALESCE(c.name, '')) LIKE LOWER($2)
+         ORDER BY m.id ASC
+         LIMIT $3 OFFSET $4`,
+        [userId, `%${name}%`, pageLimit, pageOffset]
+      );
+    } else {
+      // No chat filter: return this user's messages only (fixes frontend 400)
+      result = await db.query(
+        `SELECT m.id, m.chat_jid, c.name as chat_name, m.sender, m.timestamp, m.message, m.from_me, m.from_me as "fromMe", m.user_id, m.created_at 
+         FROM whatsapp_messages m
+         LEFT JOIN whatsapp_chats c ON m.chat_jid = c.jid AND m.user_id = c.user_id
+         WHERE m.user_id = $1
+         ORDER BY m.id ASC
+         LIMIT $2 OFFSET $3`,
+        [userId, pageLimit, pageOffset]
       );
     }
 
