@@ -89,6 +89,17 @@ const initializeDb = async () => {
     ALTER TABLE whatsapp_messages
       ADD CONSTRAINT whatsapp_messages_user_id_fkey
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+
+    -- Active portal user waiting to link / currently linked on the operator WhatsApp
+    CREATE TABLE IF NOT EXISTS whatsapp_link_sessions (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      status VARCHAR(50) DEFAULT 'waiting',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_link_sessions_updated ON whatsapp_link_sessions (updated_at DESC);
   `;
   try {
     const client = await pool.connect();

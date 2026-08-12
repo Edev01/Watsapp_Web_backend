@@ -53,6 +53,44 @@ function emitQrDisappeared(userId, payload = {}) {
   io.emit('qr_cleared', data);
 }
 
+async function getActiveLinkSession() {
+  const result = await db.query(
+    `SELECT s.id, s.user_id, s.status, s.created_at, s.updated_at, u.email, u.name
+     FROM whatsapp_link_sessions s
+     LEFT JOIN users u ON u.id = s.user_id
+     WHERE s.status IN ('waiting', 'linked')
+       AND s.updated_at > NOW() - INTERVAL '2 hours'
+     ORDER BY s.updated_at DESC
+     LIMIT 1`
+  );
+  return result.rows[0] || null;
+}
+
+async function resolveQrUserId(req) {
+  const explicit =
+    req.body?.userId ||
+    req.body?.user_id ||
+    req.query?.userId ||
+    req.query?.user_id ||
+    req.headers['x-user-id'];
+
+  // Prefer the portal user who claimed the active link session
+  const session = await getActiveLinkSession();
+  if (session?.user_id) {
+    // If extension/manual sent a different id, still prefer active claim
+    // unless an admin explicitly forces via x-force-user-id
+    if (!req.headers['x-force-user-id']) {
+      return parseInt(session.user_id, 10);
+    }
+  }
+
+  if (explicit && !isNaN(parseInt(explicit, 10))) {
+    return parseInt(explicit, 10);
+  }
+  if (req.userId) return parseInt(req.userId, 10);
+  return session?.user_id ? parseInt(session.user_id, 10) : null;
+}
+
 // Socket.IO real-time event handling
 io.on('connection', (socket) => {
   console.log('Client connected to Socket.IO:', socket.id);
@@ -296,7 +334,7 @@ app.post('/api/auth/reset-password', authenticateToken, async (req, res) => {
 // 5. Post QR URL
 app.post('/api/qr', async (req, res) => {
   const { url, source, pageUrl } = req.body;
-  const userId = req.userId || req.body.userId || req.body.user_id || 1;
+  const userId = (await resolveQrUserId(req)) || 1;
 
   if (!url) {
     return sendResponse(res, 400, true, null, 'URL is required');
@@ -309,7 +347,14 @@ app.post('/api/qr', async (req, res) => {
     );
 
     const qrData = result.rows[0];
-    // Emit both new_qr (frontend) and qr_updated (legacy)
+    // Keep session alive / waiting while QR is being shown
+    await db.query(
+      `UPDATE whatsapp_link_sessions
+       SET status = 'waiting', updated_at = NOW()
+       WHERE user_id = $1 AND status IN ('waiting', 'linked')`,
+      [userId]
+    );
+
     emitNewQr(userId, {
       ...qrData,
       url: qrData.url,
@@ -324,9 +369,89 @@ app.post('/api/qr', async (req, res) => {
   }
 });
 
+// 5a. Portal claims the operator WhatsApp link slot for the logged-in client
+app.post('/api/qr/claim', async (req, res) => {
+  const userId = parseInt(
+    req.userId || req.body.userId || req.body.user_id || req.headers['x-user-id'],
+    10
+  );
+
+  if (!userId || Number.isNaN(userId)) {
+    return sendResponse(res, 400, true, null, 'Authenticated userId is required to claim QR session');
+  }
+
+  try {
+    const userCheck = await db.query('SELECT id, email, name, role FROM users WHERE id = $1', [userId]);
+    if (userCheck.rows.length === 0) {
+      return sendResponse(res, 404, true, null, 'User not found');
+    }
+
+    // Only one active link session at a time on the operator machine
+    await db.query(`UPDATE whatsapp_link_sessions SET status = 'released', updated_at = NOW() WHERE status IN ('waiting', 'linked')`);
+
+    const inserted = await db.query(
+      `INSERT INTO whatsapp_link_sessions (user_id, status)
+       VALUES ($1, 'waiting')
+       RETURNING id, user_id, status, created_at, updated_at`,
+      [userId]
+    );
+
+    const session = {
+      ...inserted.rows[0],
+      email: userCheck.rows[0].email,
+      name: userCheck.rows[0].name
+    };
+
+    io.emit('link_session_claimed', session);
+    io.to(`user_${userId}`).emit('link_session_claimed', session);
+
+    return sendResponse(res, 200, false, session, 'QR link session claimed for this user');
+  } catch (err) {
+    console.error('QR claim error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
+// 5a2. Extensions poll this to know which client user owns WhatsApp right now
+app.get('/api/qr/active-session', async (req, res) => {
+  try {
+    const session = await getActiveLinkSession();
+    if (!session) {
+      return sendResponse(res, 404, true, null, 'No active QR/link session');
+    }
+    return sendResponse(res, 200, false, {
+      id: session.id,
+      userId: session.user_id,
+      user_id: session.user_id,
+      status: session.status,
+      email: session.email,
+      name: session.name,
+      created_at: session.created_at,
+      updated_at: session.updated_at
+    }, 'Active link session retrieved');
+  } catch (err) {
+    console.error('Get active session error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
+// 5a3. Release / clear active session
+app.post('/api/qr/release', async (req, res) => {
+  try {
+    await db.query(
+      `UPDATE whatsapp_link_sessions SET status = 'released', updated_at = NOW() WHERE status IN ('waiting', 'linked')`
+    );
+    io.emit('link_session_released', { status: 'released' });
+    return sendResponse(res, 200, false, { status: 'released' }, 'Link session released');
+  } catch (err) {
+    console.error('QR release error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
 // 5b. Post QR Status / Cleared (HTTP Fallback for Extension)
 app.post('/api/qr/status', async (req, res) => {
-  const userId = req.userId || req.body.userId || req.body.user_id || 1;
+  const userId = (await resolveQrUserId(req)) || 1;
   const payload = {
     status: req.body.status || 'disappeared',
     message: req.body.message || 'WhatsApp logged in / QR code cleared',
@@ -334,7 +459,17 @@ app.post('/api/qr/status', async (req, res) => {
     userId
   };
 
-  // Emit both qr_disappeared (frontend) and qr_cleared (legacy)
+  try {
+    await db.query(
+      `UPDATE whatsapp_link_sessions
+       SET status = 'linked', updated_at = NOW()
+       WHERE user_id = $1 AND status IN ('waiting', 'linked')`,
+      [userId]
+    );
+  } catch (err) {
+    console.error('Failed to mark link session linked:', err.message);
+  }
+
   emitQrDisappeared(userId, payload);
 
   return sendResponse(res, 200, false, payload, 'QR cleared status emitted successfully');
