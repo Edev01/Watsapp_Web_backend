@@ -74,21 +74,16 @@ async function resolveQrUserId(req) {
     req.query?.user_id ||
     req.headers['x-user-id'];
 
-  // Prefer the portal user who claimed the active link session
-  const session = await getActiveLinkSession();
-  if (session?.user_id) {
-    // If extension/manual sent a different id, still prefer active claim
-    // unless an admin explicitly forces via x-force-user-id
-    if (!req.headers['x-force-user-id']) {
-      return parseInt(session.user_id, 10);
-    }
-  }
-
+  // Worker / explicit client id always wins (multi-WhatsApp server)
   if (explicit && !isNaN(parseInt(explicit, 10))) {
     return parseInt(explicit, 10);
   }
+
   if (req.userId) return parseInt(req.userId, 10);
-  return session?.user_id ? parseInt(session.user_id, 10) : null;
+
+  const session = await getActiveLinkSession();
+  if (session?.user_id) return parseInt(session.user_id, 10);
+  return null;
 }
 
 // Socket.IO real-time event handling
@@ -386,8 +381,12 @@ app.post('/api/qr/claim', async (req, res) => {
       return sendResponse(res, 404, true, null, 'User not found');
     }
 
-    // Only one active link session at a time on the operator machine
-    await db.query(`UPDATE whatsapp_link_sessions SET status = 'released', updated_at = NOW() WHERE status IN ('waiting', 'linked')`);
+    // Multi-session server: only reset this user's prior claim, keep other clients
+    await db.query(
+      `UPDATE whatsapp_link_sessions SET status = 'released', updated_at = NOW()
+       WHERE user_id = $1 AND status IN ('waiting', 'linked')`,
+      [userId]
+    );
 
     const inserted = await db.query(
       `INSERT INTO whatsapp_link_sessions (user_id, status)
@@ -412,10 +411,26 @@ app.post('/api/qr/claim', async (req, res) => {
   }
 });
 
-// 5a2. Extensions poll this to know which client user owns WhatsApp right now
+// 5a2. Extensions / worker poll this to know which client user owns WhatsApp right now
 app.get('/api/qr/active-session', async (req, res) => {
   try {
-    const session = await getActiveLinkSession();
+    const wanted = req.query.userId || req.query.user_id || req.headers['x-user-id'];
+    let session = null;
+    if (wanted) {
+      const result = await db.query(
+        `SELECT s.id, s.user_id, s.status, s.created_at, s.updated_at, u.email, u.name
+         FROM whatsapp_link_sessions s
+         LEFT JOIN users u ON u.id = s.user_id
+         WHERE s.user_id = $1 AND s.status IN ('waiting', 'linked')
+           AND s.updated_at > NOW() - INTERVAL '2 hours'
+         ORDER BY s.updated_at DESC
+         LIMIT 1`,
+        [parseInt(wanted, 10)]
+      );
+      session = result.rows[0] || null;
+    } else {
+      session = await getActiveLinkSession();
+    }
     if (!session) {
       return sendResponse(res, 404, true, null, 'No active QR/link session');
     }
@@ -431,6 +446,34 @@ app.get('/api/qr/active-session', async (req, res) => {
     }, 'Active link session retrieved');
   } catch (err) {
     console.error('Get active session error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
+// 5a2b. Worker: list all waiting/linked sessions (multi-client)
+app.get('/api/qr/sessions', async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT s.id, s.user_id, s.status, s.created_at, s.updated_at, u.email, u.name
+       FROM whatsapp_link_sessions s
+       LEFT JOIN users u ON u.id = s.user_id
+       WHERE s.status IN ('waiting', 'linked')
+         AND s.updated_at > NOW() - INTERVAL '24 hours'
+       ORDER BY s.updated_at DESC`
+    );
+    const rows = result.rows.map((s) => ({
+      id: s.id,
+      userId: s.user_id,
+      user_id: s.user_id,
+      status: s.status,
+      email: s.email,
+      name: s.name,
+      created_at: s.created_at,
+      updated_at: s.updated_at
+    }));
+    return sendResponse(res, 200, false, rows, 'Link sessions retrieved');
+  } catch (err) {
+    console.error('Get sessions error:', err);
     return sendResponse(res, 500, true, null, err.message || 'Server error');
   }
 });
