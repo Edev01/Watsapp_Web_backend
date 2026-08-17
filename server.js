@@ -60,29 +60,79 @@ async function getActiveLinkSession() {
      LEFT JOIN users u ON u.id = s.user_id
      WHERE s.status IN ('waiting', 'linked')
        AND s.updated_at > NOW() - INTERVAL '2 hours'
-     ORDER BY s.updated_at DESC
+     ORDER BY
+       CASE WHEN s.status = 'waiting' THEN 0 ELSE 1 END,
+       s.updated_at DESC
      LIMIT 1`
   );
   return result.rows[0] || null;
 }
 
+async function claimLinkSession(userId) {
+  const id = parseInt(userId, 10);
+  if (!id || Number.isNaN(id)) return null;
+
+  const userCheck = await db.query('SELECT id, email, name, role FROM users WHERE id = $1', [id]);
+  if (userCheck.rows.length === 0) return null;
+
+  // Single-operator WhatsApp: release other waiting claims so the current portal user owns the QR
+  await db.query(
+    `UPDATE whatsapp_link_sessions SET status = 'released', updated_at = NOW()
+     WHERE status = 'waiting' AND user_id <> $1`,
+    [id]
+  );
+  await db.query(
+    `UPDATE whatsapp_link_sessions SET status = 'released', updated_at = NOW()
+     WHERE user_id = $1 AND status IN ('waiting', 'linked')`,
+    [id]
+  );
+
+  const inserted = await db.query(
+    `INSERT INTO whatsapp_link_sessions (user_id, status)
+     VALUES ($1, 'waiting')
+     RETURNING id, user_id, status, created_at, updated_at`,
+    [id]
+  );
+
+  return {
+    ...inserted.rows[0],
+    email: userCheck.rows[0].email,
+    name: userCheck.rows[0].name
+  };
+}
+
+/**
+ * Resolve which client owns this WhatsApp action.
+ * Auto mode: portal claim / waiting session wins over leftover extension defaults (userId=1).
+ */
 async function resolveQrUserId(req) {
-  const explicit =
+  const explicitRaw =
     req.body?.userId ||
     req.body?.user_id ||
     req.query?.userId ||
     req.query?.user_id ||
     req.headers['x-user-id'];
+  const explicit =
+    explicitRaw != null && String(explicitRaw).trim() !== '' && !isNaN(parseInt(explicitRaw, 10))
+      ? parseInt(explicitRaw, 10)
+      : null;
 
-  // Worker / explicit client id always wins (multi-WhatsApp server)
-  if (explicit && !isNaN(parseInt(explicit, 10))) {
-    return parseInt(explicit, 10);
+  const forceExplicit = String(req.headers['x-force-user-id'] || '') === '1';
+  const session = await getActiveLinkSession();
+
+  if (forceExplicit && explicit) return explicit;
+
+  // Portal claim is source of truth for laptop auto-mapping
+  if (session?.user_id) {
+    const sid = parseInt(session.user_id, 10);
+    // Ignore stale extension default "1" when a real client claimed
+    if (!explicit || explicit === 1 || explicit === sid) return sid;
+    // Real non-default explicit (e.g. worker) wins
+    return explicit;
   }
 
+  if (explicit) return explicit;
   if (req.userId) return parseInt(req.userId, 10);
-
-  const session = await getActiveLinkSession();
-  if (session?.user_id) return parseInt(session.user_id, 10);
   return null;
 }
 
@@ -90,11 +140,23 @@ async function resolveQrUserId(req) {
 io.on('connection', (socket) => {
   console.log('Client connected to Socket.IO:', socket.id);
 
-  socket.on('join_user_room', (data) => {
+  socket.on('join_user_room', async (data) => {
     if (data && (data.userId || data.user_id)) {
-      const roomName = `user_${data.userId || data.user_id}`;
+      const userId = data.userId || data.user_id;
+      const roomName = `user_${userId}`;
       socket.join(roomName);
       console.log(`Socket ${socket.id} joined user room: ${roomName}`);
+
+      // Auto-claim: portal user opening QR page owns the next WhatsApp link
+      try {
+        const session = await claimLinkSession(userId);
+        if (session) {
+          io.to(roomName).emit('link_session_claimed', session);
+          console.log(`Auto-claimed link session for user_${userId}`);
+        }
+      } catch (err) {
+        console.error('Auto-claim on join_user_room failed:', err.message);
+      }
     }
   });
 
@@ -376,30 +438,10 @@ app.post('/api/qr/claim', async (req, res) => {
   }
 
   try {
-    const userCheck = await db.query('SELECT id, email, name, role FROM users WHERE id = $1', [userId]);
-    if (userCheck.rows.length === 0) {
+    const session = await claimLinkSession(userId);
+    if (!session) {
       return sendResponse(res, 404, true, null, 'User not found');
     }
-
-    // Multi-session server: only reset this user's prior claim, keep other clients
-    await db.query(
-      `UPDATE whatsapp_link_sessions SET status = 'released', updated_at = NOW()
-       WHERE user_id = $1 AND status IN ('waiting', 'linked')`,
-      [userId]
-    );
-
-    const inserted = await db.query(
-      `INSERT INTO whatsapp_link_sessions (user_id, status)
-       VALUES ($1, 'waiting')
-       RETURNING id, user_id, status, created_at, updated_at`,
-      [userId]
-    );
-
-    const session = {
-      ...inserted.rows[0],
-      email: userCheck.rows[0].email,
-      name: userCheck.rows[0].name
-    };
 
     io.emit('link_session_claimed', session);
     io.to(`user_${userId}`).emit('link_session_claimed', session);
@@ -520,11 +562,22 @@ app.post('/api/qr/status', async (req, res) => {
 
 // 6. Get Latest QR URL
 app.get('/api/qr/latest', async (req, res) => {
-  const userId = req.userId || req.query.userId || req.query.user_id || 1;
+  const userId = req.userId || req.query.userId || req.query.user_id || null;
+
+  // Auto-claim when portal fetches QR for a logged-in client
+  if (userId) {
+    try {
+      await claimLinkSession(userId);
+    } catch (err) {
+      console.error('Auto-claim on latest QR failed:', err.message);
+    }
+  }
+
+  const resolvedUserId = userId || (await resolveQrUserId(req)) || 1;
   try {
     const result = await db.query(
       'SELECT id, url, source, page_url, user_id, created_at FROM qr_codes WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1',
-      [userId]
+      [resolvedUserId]
     );
 
     if (result.rows.length === 0) {
