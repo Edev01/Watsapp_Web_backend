@@ -28,7 +28,7 @@ const extractUserId = (req, res, next) => {
       } else if (queryId) {
         req.userId = parseInt(queryId, 10);
       } else {
-        req.userId = 1;
+        req.userId = null;
       }
       next();
     });
@@ -37,7 +37,8 @@ const extractUserId = (req, res, next) => {
     if (fallbackId && !isNaN(parseInt(fallbackId, 10))) {
       req.userId = parseInt(fallbackId, 10);
     } else {
-      req.userId = 1;
+      // Do NOT default to 1 — that remaps every anonymous QR poll to admin
+      req.userId = null;
     }
     next();
   }
