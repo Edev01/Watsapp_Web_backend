@@ -75,17 +75,34 @@ async function claimLinkSession(userId) {
   const userCheck = await db.query('SELECT id, email, name, role FROM users WHERE id = $1', [id]);
   if (userCheck.rows.length === 0) return null;
 
-  // Single-operator WhatsApp: release other waiting claims so the current portal user owns the QR
-  await db.query(
-    `UPDATE whatsapp_link_sessions SET status = 'released', updated_at = NOW()
-     WHERE status = 'waiting' AND user_id <> $1`,
+  // Admins manage clients — they must not occupy a WhatsApp link slot
+  if (String(userCheck.rows[0].role).toLowerCase() === 'admin') {
+    return null;
+  }
+
+  // Multi-tenant: keep this user's existing waiting/linked claim; do not release other clients
+  const existing = await db.query(
+    `SELECT id, user_id, status, created_at, updated_at
+     FROM whatsapp_link_sessions
+     WHERE user_id = $1 AND status IN ('waiting', 'linked')
+       AND updated_at > NOW() - INTERVAL '24 hours'
+     ORDER BY updated_at DESC
+     LIMIT 1`,
     [id]
   );
-  await db.query(
-    `UPDATE whatsapp_link_sessions SET status = 'released', updated_at = NOW()
-     WHERE user_id = $1 AND status IN ('waiting', 'linked')`,
-    [id]
-  );
+
+  if (existing.rows[0]) {
+    await db.query(
+      `UPDATE whatsapp_link_sessions SET updated_at = NOW() WHERE id = $1`,
+      [existing.rows[0].id]
+    );
+    return {
+      ...existing.rows[0],
+      updated_at: new Date().toISOString(),
+      email: userCheck.rows[0].email,
+      name: userCheck.rows[0].name
+    };
+  }
 
   const inserted = await db.query(
     `INSERT INTO whatsapp_link_sessions (user_id, status)
