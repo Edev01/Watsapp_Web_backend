@@ -551,6 +551,43 @@ app.post('/api/qr/release', async (req, res) => {
   }
 });
 
+// 5a3b. Worker: after logout / bad session, put user back to waiting for a fresh QR
+app.post('/api/qr/reset-waiting', async (req, res) => {
+  const userId = parseInt(
+    req.userId || req.body.userId || req.body.user_id || req.headers['x-user-id'],
+    10
+  );
+  if (!userId || Number.isNaN(userId)) {
+    return sendResponse(res, 400, true, null, 'userId is required');
+  }
+  try {
+    const result = await db.query(
+      `UPDATE whatsapp_link_sessions
+       SET status = 'waiting', updated_at = NOW()
+       WHERE user_id = $1 AND status IN ('waiting', 'linked')
+       RETURNING id, user_id, status, created_at, updated_at`,
+      [userId]
+    );
+    if (!result.rows[0]) {
+      const inserted = await db.query(
+        `INSERT INTO whatsapp_link_sessions (user_id, status)
+         VALUES ($1, 'waiting')
+         RETURNING id, user_id, status, created_at, updated_at`,
+        [userId]
+      );
+      return sendResponse(res, 200, false, inserted.rows[0], 'Link session created as waiting');
+    }
+    io.to(`user_${userId}`).emit('link_session_waiting', {
+      userId,
+      status: 'waiting'
+    });
+    return sendResponse(res, 200, false, result.rows[0], 'Link session reset to waiting');
+  } catch (err) {
+    console.error('QR reset-waiting error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
 // 5b. Post QR Status / Cleared (HTTP Fallback for Extension)
 app.post('/api/qr/status', async (req, res) => {
   const userId = (await resolveQrUserId(req)) || 1;
@@ -735,22 +772,64 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
 
 // 10. Toggle Monitored Status for Chats
 app.post('/api/scraped-chats/monitor', async (req, res) => {
-  const { jids } = req.body;
+  const { jids, monitored, action, replace } = req.body || {};
   const userId = req.userId || req.body.userId || req.body.user_id || 1;
   if (!Array.isArray(jids)) {
     return sendResponse(res, 400, true, null, 'jids array is required');
   }
   try {
-    // Reset user's chats to FALSE first
-    await db.query('UPDATE whatsapp_chats SET is_monitored = FALSE WHERE user_id = $1', [userId]);
-    if (jids.length > 0) {
-      // Set is_monitored to TRUE for selected JIDs belonging to user
-      await db.query(
-        'UPDATE whatsapp_chats SET is_monitored = TRUE WHERE user_id = $1 AND jid = ANY($2)',
-        [userId, jids]
-      );
+    // Modes:
+    // - replace/action=replace (legacy): wipe all then set listed jids TRUE
+    // - monitored=false / action=remove: turn OFF listed jids only
+    // - default / action=add: turn ON listed jids only (does NOT wipe others)
+    const mode =
+      replace === true || action === 'replace'
+        ? 'replace'
+        : monitored === false || action === 'remove' || action === 'unmonitor'
+          ? 'remove'
+          : 'add';
+
+    let updated = 0;
+    if (mode === 'replace') {
+      await db.query('UPDATE whatsapp_chats SET is_monitored = FALSE WHERE user_id = $1', [userId]);
+      if (jids.length > 0) {
+        const result = await db.query(
+          'UPDATE whatsapp_chats SET is_monitored = TRUE WHERE user_id = $1 AND jid = ANY($2) RETURNING jid',
+          [userId, jids]
+        );
+        updated = result.rowCount;
+      }
+    } else if (mode === 'remove') {
+      if (jids.length > 0) {
+        const result = await db.query(
+          'UPDATE whatsapp_chats SET is_monitored = FALSE WHERE user_id = $1 AND jid = ANY($2) RETURNING jid',
+          [userId, jids]
+        );
+        updated = result.rowCount;
+      }
+    } else {
+      // add (default) — matches frontend "Monitor Selected"
+      if (jids.length > 0) {
+        const result = await db.query(
+          'UPDATE whatsapp_chats SET is_monitored = TRUE WHERE user_id = $1 AND jid = ANY($2) RETURNING jid',
+          [userId, jids]
+        );
+        updated = result.rowCount;
+      }
     }
-    return sendResponse(res, 200, false, null, 'Monitored status updated successfully');
+
+    const monitoredRows = await db.query(
+      'SELECT jid, name, is_monitored FROM whatsapp_chats WHERE user_id = $1 AND is_monitored = TRUE ORDER BY name ASC',
+      [userId]
+    );
+
+    return sendResponse(
+      res,
+      200,
+      false,
+      { mode, updated, monitored: monitoredRows.rows },
+      'Monitored status updated successfully'
+    );
   } catch (err) {
     console.error('Update monitored error:', err);
     return sendResponse(res, 500, true, null, err.message || 'Server error');
