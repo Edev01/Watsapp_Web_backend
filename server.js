@@ -677,7 +677,12 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
       const sender = (msg.sender ?? '').toString().trim();
       const timestamp = (msg.timestamp ?? '').toString().trim();
       const messageText = (msg.message ?? msg.text ?? '').toString();
-      const isFromMe = msg.fromMe ?? msg.from_me ?? false;
+      // Right-side WhatsApp bubbles = from me; left-side = not me
+      const rawFromMe = msg.fromMe ?? msg.from_me ?? false;
+      const isFromMe =
+        rawFromMe === true ||
+        rawFromMe === 1 ||
+        String(rawFromMe).toLowerCase() === 'true';
 
       if (!timestamp && !messageText) {
         skippedCount++;
@@ -688,14 +693,16 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
         const result = await db.query(
           `INSERT INTO whatsapp_messages (user_id, chat_jid, sender, timestamp, message, from_me) 
            VALUES ($1, $2, $3, $4, $5, $6) 
-           ON CONFLICT (user_id, chat_jid, sender, timestamp, message) DO NOTHING
-           RETURNING id`,
+           ON CONFLICT (user_id, chat_jid, sender, timestamp, message)
+           DO UPDATE SET from_me = EXCLUDED.from_me
+           RETURNING id, (xmax = 0) AS inserted`,
           [userId, canonicalJid, sender || 'unknown', timestamp || 'unknown', messageText, isFromMe]
         );
         if (result.rowCount > 0) {
-          addedCount++;
+          if (result.rows[0]?.inserted) addedCount++;
+          else skippedCount++; // existed; from_me may have been corrected
         } else {
-          skippedCount++; // duplicate already in DB
+          skippedCount++;
         }
       } catch (insertErr) {
         skippedCount++;
