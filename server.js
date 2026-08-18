@@ -772,50 +772,59 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
 
 // 10. Toggle Monitored Status for Chats
 app.post('/api/scraped-chats/monitor', async (req, res) => {
-  const { jids, monitored, action, replace } = req.body || {};
-  const userId = req.userId || req.body.userId || req.body.user_id || 1;
-  if (!Array.isArray(jids)) {
-    return sendResponse(res, 400, true, null, 'jids array is required');
+  const body = req.body || {};
+  const userId = req.userId || body.userId || body.user_id || 1;
+
+  // Accept jids[], or a single jid / chatId / id
+  const rawJids = Array.isArray(body.jids)
+    ? body.jids
+    : [body.jid, body.chatId, body.chat_id, body.id].filter((v) => v != null && String(v).trim() !== '');
+  const jids = rawJids.map((j) => String(j).trim()).filter(Boolean);
+
+  if (jids.length === 0) {
+    return sendResponse(res, 400, true, null, 'jid/chatId or jids array is required');
   }
+
   try {
     // Modes:
-    // - replace/action=replace (legacy): wipe all then set listed jids TRUE
-    // - monitored=false / action=remove: turn OFF listed jids only
-    // - default / action=add: turn ON listed jids only (does NOT wipe others)
-    const mode =
-      replace === true || action === 'replace'
-        ? 'replace'
-        : monitored === false || action === 'remove' || action === 'unmonitor'
-          ? 'remove'
-          : 'add';
+    // - monitored/is_monitored false OR action remove/unmonitor => turn OFF listed chats only
+    // - replace/action=replace (legacy) => wipe all then set listed TRUE
+    // - default => turn ON listed chats only (does NOT wipe others)
+    const wantsOff =
+      body.monitored === false ||
+      body.is_monitored === false ||
+      body.isMonitored === false ||
+      body.action === 'remove' ||
+      body.action === 'unmonitor';
+    const wantsReplace = body.replace === true || body.action === 'replace';
+    const mode = wantsReplace ? 'replace' : wantsOff ? 'remove' : 'add';
 
     let updated = 0;
+    let updatedRows = [];
+
     if (mode === 'replace') {
       await db.query('UPDATE whatsapp_chats SET is_monitored = FALSE WHERE user_id = $1', [userId]);
-      if (jids.length > 0) {
-        const result = await db.query(
-          'UPDATE whatsapp_chats SET is_monitored = TRUE WHERE user_id = $1 AND jid = ANY($2) RETURNING jid',
-          [userId, jids]
-        );
-        updated = result.rowCount;
-      }
+      const result = await db.query(
+        'UPDATE whatsapp_chats SET is_monitored = TRUE WHERE user_id = $1 AND jid = ANY($2) RETURNING jid, name, is_monitored',
+        [userId, jids]
+      );
+      updated = result.rowCount;
+      updatedRows = result.rows;
     } else if (mode === 'remove') {
-      if (jids.length > 0) {
-        const result = await db.query(
-          'UPDATE whatsapp_chats SET is_monitored = FALSE WHERE user_id = $1 AND jid = ANY($2) RETURNING jid',
-          [userId, jids]
-        );
-        updated = result.rowCount;
-      }
+      // Unmonitor: only the given chat IDs are removed from monitored list
+      const result = await db.query(
+        'UPDATE whatsapp_chats SET is_monitored = FALSE WHERE user_id = $1 AND jid = ANY($2) RETURNING jid, name, is_monitored',
+        [userId, jids]
+      );
+      updated = result.rowCount;
+      updatedRows = result.rows;
     } else {
-      // add (default) — matches frontend "Monitor Selected"
-      if (jids.length > 0) {
-        const result = await db.query(
-          'UPDATE whatsapp_chats SET is_monitored = TRUE WHERE user_id = $1 AND jid = ANY($2) RETURNING jid',
-          [userId, jids]
-        );
-        updated = result.rowCount;
-      }
+      const result = await db.query(
+        'UPDATE whatsapp_chats SET is_monitored = TRUE WHERE user_id = $1 AND jid = ANY($2) RETURNING jid, name, is_monitored',
+        [userId, jids]
+      );
+      updated = result.rowCount;
+      updatedRows = result.rows;
     }
 
     const monitoredRows = await db.query(
@@ -827,8 +836,16 @@ app.post('/api/scraped-chats/monitor', async (req, res) => {
       res,
       200,
       false,
-      { mode, updated, monitored: monitoredRows.rows },
-      'Monitored status updated successfully'
+      {
+        mode,
+        updated,
+        jids,
+        changed: updatedRows,
+        monitored: monitoredRows.rows
+      },
+      mode === 'remove'
+        ? 'Chat(s) removed from monitored list'
+        : 'Monitored status updated successfully'
     );
   } catch (err) {
     console.error('Update monitored error:', err);
