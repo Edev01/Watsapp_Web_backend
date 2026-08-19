@@ -68,6 +68,22 @@ async function getActiveLinkSession() {
   return result.rows[0] || null;
 }
 
+async function getUserLinkSession(userId) {
+  const id = parseInt(userId, 10);
+  if (!id || Number.isNaN(id)) return null;
+  const result = await db.query(
+    `SELECT s.id, s.user_id, s.status, s.whatsapp_jid, s.created_at, s.updated_at, u.email, u.name
+     FROM whatsapp_link_sessions s
+     LEFT JOIN users u ON u.id = s.user_id
+     WHERE s.user_id = $1 AND s.status IN ('waiting', 'linked')
+       AND s.updated_at > NOW() - INTERVAL '24 hours'
+     ORDER BY s.updated_at DESC
+     LIMIT 1`,
+    [id]
+  );
+  return result.rows[0] || null;
+}
+
 async function claimLinkSession(userId) {
   const id = parseInt(userId, 10);
   if (!id || Number.isNaN(id)) return null;
@@ -82,7 +98,7 @@ async function claimLinkSession(userId) {
 
   // Multi-tenant: keep this user's existing waiting/linked claim; do not release other clients
   const existing = await db.query(
-    `SELECT id, user_id, status, created_at, updated_at
+    `SELECT id, user_id, status, whatsapp_jid, created_at, updated_at
      FROM whatsapp_link_sessions
      WHERE user_id = $1 AND status IN ('waiting', 'linked')
        AND updated_at > NOW() - INTERVAL '24 hours'
@@ -107,7 +123,7 @@ async function claimLinkSession(userId) {
   const inserted = await db.query(
     `INSERT INTO whatsapp_link_sessions (user_id, status)
      VALUES ($1, 'waiting')
-     RETURNING id, user_id, status, created_at, updated_at`,
+     RETURNING id, user_id, status, whatsapp_jid, created_at, updated_at`,
     [id]
   );
 
@@ -169,7 +185,13 @@ io.on('connection', (socket) => {
         const session = await claimLinkSession(userId);
         if (session) {
           io.to(roomName).emit('link_session_claimed', session);
-          console.log(`Auto-claimed link session for user_${userId}`);
+          io.to(roomName).emit('whatsapp_connection_status', {
+            userId: Number(userId),
+            status: session.status,
+            linked: session.status === 'linked',
+            whatsappJid: session.whatsapp_jid || null
+          });
+          console.log(`Auto-claimed link session for user_${userId} status=${session.status}`);
         }
       } catch (err) {
         console.error('Auto-claim on join_user_room failed:', err.message);
@@ -563,7 +585,7 @@ app.post('/api/qr/reset-waiting', async (req, res) => {
   try {
     const result = await db.query(
       `UPDATE whatsapp_link_sessions
-       SET status = 'waiting', updated_at = NOW()
+       SET status = 'waiting', whatsapp_jid = NULL, updated_at = NOW()
        WHERE user_id = $1 AND status IN ('waiting', 'linked')
        RETURNING id, user_id, status, created_at, updated_at`,
       [userId]
@@ -588,37 +610,82 @@ app.post('/api/qr/reset-waiting', async (req, res) => {
   }
 });
 
-// 5b. Post QR Status / Cleared (HTTP Fallback for Extension)
+// 5b. Post QR Status / Cleared (HTTP Fallback for Extension / Worker linked)
 app.post('/api/qr/status', async (req, res) => {
   const userId = (await resolveQrUserId(req)) || 1;
+  const whatsappJid = (
+    req.body.whatsappJid ||
+    req.body.whatsapp_jid ||
+    req.body.waJid ||
+    req.body.jid ||
+    null
+  );
   const payload = {
     status: req.body.status || 'disappeared',
     message: req.body.message || 'WhatsApp logged in / QR code cleared',
     timestamp: new Date().toISOString(),
-    userId
+    userId,
+    whatsappJid: whatsappJid || null
   };
 
   try {
+    // Mark this portal user linked (+ store WA account for isolation)
     await db.query(
       `UPDATE whatsapp_link_sessions
-       SET status = 'linked', updated_at = NOW()
+       SET status = 'linked',
+           whatsapp_jid = COALESCE($2, whatsapp_jid),
+           updated_at = NOW()
        WHERE user_id = $1 AND status IN ('waiting', 'linked')`,
-      [userId]
+      [userId, whatsappJid]
     );
+
+    // Isolation: same WhatsApp account cannot stay linked to another portal user
+    if (whatsappJid) {
+      const others = await db.query(
+        `UPDATE whatsapp_link_sessions
+         SET status = 'released', updated_at = NOW()
+         WHERE whatsapp_jid = $1
+           AND user_id <> $2
+           AND status IN ('waiting', 'linked')
+         RETURNING user_id`,
+        [String(whatsappJid), userId]
+      );
+      for (const row of others.rows) {
+        const otherId = row.user_id;
+        io.to(`user_${otherId}`).emit('whatsapp_connection_status', {
+          userId: otherId,
+          status: 'released',
+          linked: false,
+          reason: 'whatsapp_taken_by_another_portal_user'
+        });
+        io.to(`user_${otherId}`).emit('qr_disappeared', {
+          userId: otherId,
+          status: 'released',
+          message: 'WhatsApp linked on another portal account'
+        });
+        // Worker listens via sessions list / optional socket — also expose for poll
+        io.emit('whatsapp_force_logout', { userId: otherId, whatsappJid });
+      }
+    }
   } catch (err) {
     console.error('Failed to mark link session linked:', err.message);
   }
 
   emitQrDisappeared(userId, payload);
+  io.to(`user_${userId}`).emit('whatsapp_connection_status', {
+    userId,
+    status: 'linked',
+    linked: true,
+    whatsappJid: whatsappJid || null
+  });
 
   return sendResponse(res, 200, false, payload, 'QR cleared status emitted successfully');
 });
 
-// 6. Get Latest QR URL
+// 6. Get Latest QR URL — only while waiting to link (never while linked)
 app.get('/api/qr/latest', async (req, res) => {
   const userId = req.userId || req.query.userId || req.query.user_id || null;
 
-  // Auto-claim when portal fetches QR for a logged-in client
   if (userId) {
     try {
       await claimLinkSession(userId);
@@ -629,18 +696,76 @@ app.get('/api/qr/latest', async (req, res) => {
 
   const resolvedUserId = userId || (await resolveQrUserId(req)) || 1;
   try {
+    const link = await getUserLinkSession(resolvedUserId);
+    if (link?.status === 'linked') {
+      return sendResponse(
+        res,
+        200,
+        false,
+        {
+          linked: true,
+          status: 'linked',
+          userId: Number(resolvedUserId),
+          user_id: Number(resolvedUserId),
+          whatsappJid: link.whatsapp_jid || null,
+          url: null
+        },
+        'WhatsApp already connected — QR not shown'
+      );
+    }
+
     const result = await db.query(
-      'SELECT id, url, source, page_url, user_id, created_at FROM qr_codes WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1',
+      `SELECT id, url, source, page_url, user_id, created_at
+       FROM qr_codes
+       WHERE user_id = $1
+         AND created_at > NOW() - INTERVAL '2 minutes'
+       ORDER BY created_at DESC
+       LIMIT 1`,
       [resolvedUserId]
     );
 
     if (result.rows.length === 0) {
-      return sendResponse(res, 404, true, null, 'No QR URL found');
+      return sendResponse(res, 404, true, {
+        linked: false,
+        status: link?.status || 'waiting',
+        userId: Number(resolvedUserId)
+      }, 'No fresh QR URL found');
     }
 
-    return sendResponse(res, 200, false, result.rows[0], 'Latest QR URL retrieved successfully');
+    return sendResponse(res, 200, false, {
+      ...result.rows[0],
+      linked: false,
+      status: 'waiting'
+    }, 'Latest QR URL retrieved successfully');
   } catch (err) {
     console.error('Get latest QR error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
+// 6b. Portal: connection status for this user (linked vs waiting)
+app.get('/api/qr/connection-status', async (req, res) => {
+  const userId = req.userId || req.query.userId || req.query.user_id || null;
+  if (!userId) {
+    return sendResponse(res, 400, true, null, 'userId is required');
+  }
+  try {
+    const link = await getUserLinkSession(userId);
+    const linked = link?.status === 'linked';
+    return sendResponse(
+      res,
+      200,
+      false,
+      {
+        userId: Number(userId),
+        status: link?.status || 'none',
+        linked,
+        whatsappJid: link?.whatsapp_jid || null
+      },
+      linked ? 'WhatsApp connected' : 'WhatsApp not connected'
+    );
+  } catch (err) {
+    console.error('Get connection status error:', err);
     return sendResponse(res, 500, true, null, err.message || 'Server error');
   }
 });

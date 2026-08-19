@@ -99,7 +99,10 @@ const initializeDb = async () => {
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
+    ALTER TABLE whatsapp_link_sessions ADD COLUMN IF NOT EXISTS whatsapp_jid TEXT;
+
     CREATE INDEX IF NOT EXISTS idx_link_sessions_updated ON whatsapp_link_sessions (updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_link_sessions_wa_jid ON whatsapp_link_sessions (whatsapp_jid);
   `;
   try {
     const client = await pool.connect();
