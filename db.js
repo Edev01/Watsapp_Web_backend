@@ -23,6 +23,9 @@ const initializeDb = async () => {
 
     ALTER TABLE users ADD COLUMN IF NOT EXISTS name VARCHAR(255);
     ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_number VARCHAR(50);
+    -- Permanently bound WhatsApp (first successful scan) — cannot switch numbers later
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS bound_whatsapp_jid TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS bound_whatsapp_phone VARCHAR(32);
 
     INSERT INTO users (id, email, password_hash, role, name)
     VALUES (1, 'default_admin@whatsapp.com', '$2a$10$defaultadminhash123456789', 'admin', 'Default Admin')

@@ -53,6 +53,26 @@ function emitQrDisappeared(userId, payload = {}) {
   io.emit('qr_cleared', data);
 }
 
+function normalizeWaPhone(jidOrPhone) {
+  if (!jidOrPhone) return '';
+  const bare = String(jidOrPhone).split('@')[0].split(':')[0];
+  return bare.replace(/\D/g, '');
+}
+
+function waAccountsMatch(a, b) {
+  const pa = normalizeWaPhone(a);
+  const pb = normalizeWaPhone(b);
+  if (!pa || !pb) return false;
+  return pa === pb || pa.endsWith(pb) || pb.endsWith(pa);
+}
+
+function formatBoundPhone(phone) {
+  const digits = normalizeWaPhone(phone);
+  if (!digits) return null;
+  if (digits.startsWith('92') && digits.length >= 12) return `0${digits.slice(2)}`;
+  return digits;
+}
+
 async function getActiveLinkSession() {
   const result = await db.query(
     `SELECT s.id, s.user_id, s.status, s.created_at, s.updated_at, u.email, u.name
@@ -184,12 +204,21 @@ io.on('connection', (socket) => {
       try {
         const session = await claimLinkSession(userId);
         if (session) {
+          const userBound = await db.query(
+            'SELECT bound_whatsapp_jid, bound_whatsapp_phone FROM users WHERE id = $1',
+            [userId]
+          );
+          const boundJid = userBound.rows[0]?.bound_whatsapp_jid || session.whatsapp_jid || null;
+          const boundPhone =
+            userBound.rows[0]?.bound_whatsapp_phone || formatBoundPhone(boundJid);
           io.to(roomName).emit('link_session_claimed', session);
           io.to(roomName).emit('whatsapp_connection_status', {
             userId: Number(userId),
             status: session.status,
             linked: session.status === 'linked',
-            whatsappJid: session.whatsapp_jid || null
+            whatsappJid: session.whatsapp_jid || null,
+            boundWhatsappJid: boundJid,
+            boundPhone
           });
           console.log(`Auto-claimed link session for user_${userId} status=${session.status}`);
         }
@@ -610,7 +639,7 @@ app.post('/api/qr/reset-waiting', async (req, res) => {
   }
 });
 
-// 5b. Post QR Status / Cleared (HTTP Fallback for Extension / Worker linked)
+// 5b. Worker/extension: WhatsApp linked (or QR cleared)
 app.post('/api/qr/status', async (req, res) => {
   const userId = (await resolveQrUserId(req)) || 1;
   const whatsappJid = (
@@ -620,16 +649,62 @@ app.post('/api/qr/status', async (req, res) => {
     req.body.jid ||
     null
   );
-  const payload = {
-    status: req.body.status || 'disappeared',
-    message: req.body.message || 'WhatsApp logged in / QR code cleared',
-    timestamp: new Date().toISOString(),
-    userId,
-    whatsappJid: whatsappJid || null
-  };
+  const phone = normalizeWaPhone(whatsappJid);
 
   try {
-    // Mark this portal user linked (+ store WA account for isolation)
+    const userRes = await db.query(
+      'SELECT id, bound_whatsapp_jid, bound_whatsapp_phone FROM users WHERE id = $1',
+      [userId]
+    );
+    const user = userRes.rows[0];
+    if (!user) {
+      return sendResponse(res, 404, true, null, 'User not found');
+    }
+
+    // Sticky bind: first successful WhatsApp number is permanent for this portal user
+    if (whatsappJid && user.bound_whatsapp_jid) {
+      if (!waAccountsMatch(user.bound_whatsapp_jid, whatsappJid)) {
+        const boundPhone =
+          user.bound_whatsapp_phone || formatBoundPhone(user.bound_whatsapp_jid);
+        io.to(`user_${userId}`).emit('whatsapp_bind_mismatch', {
+          userId,
+          linked: false,
+          boundWhatsappJid: user.bound_whatsapp_jid,
+          boundPhone,
+          attemptedWhatsappJid: whatsappJid,
+          message: `This portal user can only link WhatsApp ${boundPhone || user.bound_whatsapp_jid}`
+        });
+        io.to(`user_${userId}`).emit('whatsapp_connection_status', {
+          userId,
+          status: 'waiting',
+          linked: false,
+          boundWhatsappJid: user.bound_whatsapp_jid,
+          boundPhone,
+          error: 'WHATSAPP_BIND_MISMATCH'
+        });
+        return sendResponse(
+          res,
+          409,
+          true,
+          {
+            code: 'WHATSAPP_BIND_MISMATCH',
+            boundWhatsappJid: user.bound_whatsapp_jid,
+            boundPhone,
+            attemptedWhatsappJid: whatsappJid
+          },
+          `Portal user is permanently bound to WhatsApp ${boundPhone || user.bound_whatsapp_jid}`
+        );
+      }
+    } else if (whatsappJid && !user.bound_whatsapp_jid) {
+      await db.query(
+        `UPDATE users
+         SET bound_whatsapp_jid = $2,
+             bound_whatsapp_phone = $3
+         WHERE id = $1 AND bound_whatsapp_jid IS NULL`,
+        [userId, String(whatsappJid), phone || null]
+      );
+    }
+
     await db.query(
       `UPDATE whatsapp_link_sessions
        SET status = 'linked',
@@ -639,47 +714,41 @@ app.post('/api/qr/status', async (req, res) => {
       [userId, whatsappJid]
     );
 
-    // Isolation: same WhatsApp account cannot stay linked to another portal user
-    if (whatsappJid) {
-      const others = await db.query(
-        `UPDATE whatsapp_link_sessions
-         SET status = 'released', updated_at = NOW()
-         WHERE whatsapp_jid = $1
-           AND user_id <> $2
-           AND status IN ('waiting', 'linked')
-         RETURNING user_id`,
-        [String(whatsappJid), userId]
-      );
-      for (const row of others.rows) {
-        const otherId = row.user_id;
-        io.to(`user_${otherId}`).emit('whatsapp_connection_status', {
-          userId: otherId,
-          status: 'released',
-          linked: false,
-          reason: 'whatsapp_taken_by_another_portal_user'
-        });
-        io.to(`user_${otherId}`).emit('qr_disappeared', {
-          userId: otherId,
-          status: 'released',
-          message: 'WhatsApp linked on another portal account'
-        });
-        // Worker listens via sessions list / optional socket — also expose for poll
-        io.emit('whatsapp_force_logout', { userId: otherId, whatsappJid });
-      }
-    }
+    const bound = await db.query(
+      'SELECT bound_whatsapp_jid, bound_whatsapp_phone FROM users WHERE id = $1',
+      [userId]
+    );
+    const boundJid = bound.rows[0]?.bound_whatsapp_jid || whatsappJid;
+    const boundPhone =
+      bound.rows[0]?.bound_whatsapp_phone ||
+      formatBoundPhone(boundJid);
+
+    const payload = {
+      status: req.body.status || 'disappeared',
+      message: req.body.message || 'WhatsApp logged in / QR code cleared',
+      timestamp: new Date().toISOString(),
+      userId,
+      whatsappJid: whatsappJid || null,
+      boundWhatsappJid: boundJid || null,
+      boundPhone: boundPhone || null,
+      linked: true
+    };
+
+    emitQrDisappeared(userId, payload);
+    io.to(`user_${userId}`).emit('whatsapp_connection_status', {
+      userId,
+      status: 'linked',
+      linked: true,
+      whatsappJid: whatsappJid || null,
+      boundWhatsappJid: boundJid || null,
+      boundPhone: boundPhone || null
+    });
+
+    return sendResponse(res, 200, false, payload, 'WhatsApp linked for this portal user');
   } catch (err) {
     console.error('Failed to mark link session linked:', err.message);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
   }
-
-  emitQrDisappeared(userId, payload);
-  io.to(`user_${userId}`).emit('whatsapp_connection_status', {
-    userId,
-    status: 'linked',
-    linked: true,
-    whatsappJid: whatsappJid || null
-  });
-
-  return sendResponse(res, 200, false, payload, 'QR cleared status emitted successfully');
 });
 
 // 6. Get Latest QR URL — only while waiting to link (never while linked)
@@ -698,6 +767,13 @@ app.get('/api/qr/latest', async (req, res) => {
   try {
     const link = await getUserLinkSession(resolvedUserId);
     if (link?.status === 'linked') {
+      const userBound = await db.query(
+        'SELECT bound_whatsapp_jid, bound_whatsapp_phone FROM users WHERE id = $1',
+        [resolvedUserId]
+      );
+      const boundJid = userBound.rows[0]?.bound_whatsapp_jid || link.whatsapp_jid || null;
+      const boundPhone =
+        userBound.rows[0]?.bound_whatsapp_phone || formatBoundPhone(boundJid);
       return sendResponse(
         res,
         200,
@@ -707,7 +783,9 @@ app.get('/api/qr/latest', async (req, res) => {
           status: 'linked',
           userId: Number(resolvedUserId),
           user_id: Number(resolvedUserId),
-          whatsappJid: link.whatsapp_jid || null,
+          whatsappJid: link.whatsapp_jid || boundJid,
+          boundWhatsappJid: boundJid,
+          boundPhone,
           url: null
         },
         'WhatsApp already connected — QR not shown'
@@ -743,7 +821,8 @@ app.get('/api/qr/latest', async (req, res) => {
   }
 });
 
-// 6b. Portal: connection status for this user (linked vs waiting)
+// 6b. Portal: is WhatsApp logged in for this user?
+// GET /api/qr/connection-status?userId=28
 app.get('/api/qr/connection-status', async (req, res) => {
   const userId = req.userId || req.query.userId || req.query.user_id || null;
   if (!userId) {
@@ -751,16 +830,35 @@ app.get('/api/qr/connection-status', async (req, res) => {
   }
   try {
     const link = await getUserLinkSession(userId);
+    const userBound = await db.query(
+      'SELECT bound_whatsapp_jid, bound_whatsapp_phone, email, name FROM users WHERE id = $1',
+      [userId]
+    );
+    const boundJid = userBound.rows[0]?.bound_whatsapp_jid || link?.whatsapp_jid || null;
+    const boundPhone =
+      userBound.rows[0]?.bound_whatsapp_phone || formatBoundPhone(boundJid);
     const linked = link?.status === 'linked';
+
     return sendResponse(
       res,
       200,
       false,
       {
         userId: Number(userId),
-        status: link?.status || 'none',
+        // true => show "WhatsApp Connected", hide QR
         linked,
-        whatsappJid: link?.whatsapp_jid || null
+        status: link?.status || (boundJid ? 'waiting' : 'none'),
+        // live session jid (if currently linked)
+        whatsappJid: linked ? link?.whatsapp_jid || boundJid : null,
+        // permanent first-scan bind (never changes)
+        boundWhatsappJid: boundJid,
+        boundPhone: boundPhone || null,
+        canLinkOtherNumbers: !boundJid,
+        message: linked
+          ? `WhatsApp connected${boundPhone ? ` (${boundPhone})` : ''}`
+          : boundJid
+            ? `Waiting to link bound WhatsApp${boundPhone ? ` ${boundPhone}` : ''}`
+            : 'No WhatsApp linked yet — scan QR to bind the first number'
       },
       linked ? 'WhatsApp connected' : 'WhatsApp not connected'
     );
