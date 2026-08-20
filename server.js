@@ -1163,6 +1163,150 @@ app.get('/api/scraped-chats/messages', async (req, res) => {
   }
 });
 
+/**
+ * Delete selected messages and/or selected chats for the authenticated user.
+ *
+ * POST /api/scraped-chats/delete
+ * DELETE /api/scraped-chats/delete
+ * Body:
+ * {
+ *   messageIds?: number[],          // delete these message rows
+ *   chatIds?: string[],             // delete chats by jid (+ all their messages)
+ *   jids?: string[],                // alias of chatIds
+ *   deleteChatMessages?: boolean    // default true when deleting chats
+ * }
+ */
+async function handleDeleteScrapedChats(req, res) {
+  const userId = parseInt(
+    req.userId || req.body?.userId || req.body?.user_id || req.headers['x-user-id'],
+    10
+  );
+  if (!userId || Number.isNaN(userId)) {
+    return sendResponse(res, 400, true, null, 'userId is required');
+  }
+
+  const body = req.body || {};
+  const messageIds = Array.isArray(body.messageIds)
+    ? body.messageIds.map((id) => parseInt(id, 10)).filter((id) => !Number.isNaN(id))
+    : Array.isArray(body.message_ids)
+      ? body.message_ids.map((id) => parseInt(id, 10)).filter((id) => !Number.isNaN(id))
+      : [];
+
+  const chatIds = [
+    ...(Array.isArray(body.chatIds) ? body.chatIds : []),
+    ...(Array.isArray(body.chat_ids) ? body.chat_ids : []),
+    ...(Array.isArray(body.jids) ? body.jids : []),
+    ...(body.chatId || body.jid || body.chat_id ? [body.chatId || body.jid || body.chat_id] : [])
+  ]
+    .map((j) => String(j).trim())
+    .filter(Boolean);
+
+  const deleteChatMessages = body.deleteChatMessages !== false && body.delete_chat_messages !== false;
+
+  if (messageIds.length === 0 && chatIds.length === 0) {
+    return sendResponse(
+      res,
+      400,
+      true,
+      null,
+      'Provide messageIds and/or chatIds (jids) to delete'
+    );
+  }
+
+  try {
+    let deletedMessages = 0;
+    let deletedChats = 0;
+
+    const childTables = [
+      'normalized_messages',
+      'model_comparisons',
+      'message_embeddings'
+    ];
+
+    if (messageIds.length > 0) {
+      for (const table of childTables) {
+        try {
+          await db.query(
+            `DELETE FROM ${table}
+             WHERE whatsapp_message_id = ANY($1::int[])`,
+            [messageIds]
+          );
+        } catch (_) {
+          /* optional table */
+        }
+      }
+
+      const msgResult = await db.query(
+        `DELETE FROM whatsapp_messages
+         WHERE user_id = $1 AND id = ANY($2::int[])
+         RETURNING id`,
+        [userId, messageIds]
+      );
+      deletedMessages += msgResult.rowCount;
+    }
+
+    if (chatIds.length > 0) {
+      if (deleteChatMessages) {
+        for (const table of childTables) {
+          try {
+            await db.query(
+              `DELETE FROM ${table} child
+               USING whatsapp_messages m
+               WHERE child.whatsapp_message_id = m.id
+                 AND m.user_id = $1
+                 AND m.chat_jid = ANY($2::text[])`,
+              [userId, chatIds]
+            );
+          } catch (_) {}
+        }
+
+        const chatMsgResult = await db.query(
+          `DELETE FROM whatsapp_messages
+           WHERE user_id = $1 AND chat_jid = ANY($2::text[])
+           RETURNING id`,
+          [userId, chatIds]
+        );
+        deletedMessages += chatMsgResult.rowCount;
+      }
+
+      const chatResult = await db.query(
+        `DELETE FROM whatsapp_chats
+         WHERE user_id = $1 AND jid = ANY($2::text[])
+         RETURNING jid, name`,
+        [userId, chatIds]
+      );
+      deletedChats = chatResult.rowCount;
+    }
+
+    io.to(`user_${userId}`).emit('chats_deleted', {
+      userId,
+      deletedMessages,
+      deletedChats,
+      messageIds,
+      chatIds
+    });
+
+    return sendResponse(
+      res,
+      200,
+      false,
+      {
+        deletedMessages,
+        deletedChats,
+        messageIds,
+        chatIds
+      },
+      'Selected chats/messages deleted successfully'
+    );
+  } catch (err) {
+    console.error('Delete scraped chats/messages error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+}
+
+app.post('/api/scraped-chats/delete', handleDeleteScrapedChats);
+app.delete('/api/scraped-chats/delete', handleDeleteScrapedChats);
+
 // 13. ML Dataset Endpoint (Fetch all scraped realtor messages with chat names, search & pagination)
 app.get('/api/ml/dataset', async (req, res) => {
   const { limit = 1000, offset = 0, chatId, jid, name } = req.query;
