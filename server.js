@@ -29,28 +29,28 @@ app.use(cors());
 app.use(express.json());
 app.use(extractUserId);
 
-// Broadcast QR events to the user's room + legacy global listeners
+// Broadcast QR events ONLY to that portal user's room (no global steal across tenants)
 function emitNewQr(userId, payload) {
-  const data = { ...payload, userId: Number(userId) || 1 };
-  io.to(`user_${data.userId}`).emit('new_qr', data);
-  io.to(`user_${data.userId}`).emit('qr_updated', data);
-  // Keep global emit for older frontends, but always include userId for filtering
-  io.emit('new_qr', data);
-  io.emit('qr_updated', data);
+  const uid = Number(userId);
+  if (!uid) return;
+  const data = { ...payload, userId: uid, user_id: uid };
+  io.to(`user_${uid}`).emit('new_qr', data);
+  io.to(`user_${uid}`).emit('qr_updated', data);
 }
 
 function emitQrDisappeared(userId, payload = {}) {
+  const uid = Number(userId);
+  if (!uid) return;
   const data = {
     status: 'disappeared',
     message: 'WhatsApp opened / QR disappeared',
     timestamp: new Date().toISOString(),
     ...payload,
-    userId: Number(userId) || 1
+    userId: uid,
+    user_id: uid
   };
-  io.to(`user_${data.userId}`).emit('qr_disappeared', data);
-  io.to(`user_${data.userId}`).emit('qr_cleared', data);
-  io.emit('qr_disappeared', data);
-  io.emit('qr_cleared', data);
+  io.to(`user_${uid}`).emit('qr_disappeared', data);
+  io.to(`user_${uid}`).emit('qr_cleared', data);
 }
 
 function normalizeWaPhone(jidOrPhone) {
@@ -156,7 +156,8 @@ async function claimLinkSession(userId) {
 
 /**
  * Resolve which client owns this WhatsApp action.
- * Auto mode: portal claim / waiting session wins over leftover extension defaults (userId=1).
+ * Worker posts always include x-force-user-id + x-user-id and must NEVER be remapped
+ * to another portal user's "active claim" (that bug made same-WA scans land on user 1).
  */
 async function resolveQrUserId(req) {
   const explicitRaw =
@@ -171,16 +172,24 @@ async function resolveQrUserId(req) {
       : null;
 
   const forceExplicit = String(req.headers['x-force-user-id'] || '') === '1';
+  const source = String(req.body?.source || '').toLowerCase();
+  const fromWorker =
+    forceExplicit ||
+    source === 'whatsapp-worker' ||
+    String(req.headers['x-wa-worker'] || '') === '1';
+
+  // Worker / forced tenant id is authoritative — allow same WA on many portal users
+  if (explicit && fromWorker) return explicit;
+
+  // Any real non-admin explicit id also wins (do not steal onto active claim)
+  if (explicit && explicit !== 1) return explicit;
+
   const session = await getActiveLinkSession();
 
-  if (forceExplicit && explicit) return explicit;
-
-  // Portal claim is source of truth for laptop auto-mapping
+  // Legacy extension auto-map: only when no usable explicit id
   if (session?.user_id) {
     const sid = parseInt(session.user_id, 10);
-    // Ignore stale extension default "1" when a real client claimed
     if (!explicit || explicit === 1 || explicit === sid) return sid;
-    // Real non-default explicit (e.g. worker) wins
     return explicit;
   }
 
@@ -868,10 +877,28 @@ app.get('/api/qr/connection-status', async (req, res) => {
   }
 });
 
+function resolveTenantUserId(req, fallback = null) {
+  const force = String(req.headers['x-force-user-id'] || '') === '1';
+  const headerId = req.headers['x-user-id'];
+  if (force && headerId != null && !isNaN(parseInt(headerId, 10))) {
+    return parseInt(headerId, 10);
+  }
+  const raw =
+    req.userId ||
+    req.body?.userId ||
+    req.body?.user_id ||
+    req.query?.userId ||
+    req.query?.user_id ||
+    headerId ||
+    fallback;
+  if (raw == null || String(raw).trim() === '' || isNaN(parseInt(raw, 10))) return fallback;
+  return parseInt(raw, 10);
+}
+
 // 7. Post Scraped Contacts List (Deduplicated by name & JID with canonical matching)
 app.post('/api/scraped-chats/contacts', async (req, res) => {
   const { contacts } = req.body;
-  const userId = req.userId || req.body.userId || req.body.user_id || 1;
+  const userId = resolveTenantUserId(req, 1);
   if (!Array.isArray(contacts)) {
     return sendResponse(res, 400, true, null, 'Contacts array is required');
   }
@@ -909,7 +936,7 @@ app.get('/api/scraped-chats/monitored', async (req, res) => {
 // 9. Post Scraped Chat Messages (Canonical JID matching to prevent duplicate recipient creation)
 app.post('/api/scraped-chats/messages', async (req, res) => {
   const { chatId, chatName, messages, jid, name } = req.body;
-  const userId = req.userId || req.body.userId || req.body.user_id || 1;
+  const userId = resolveTenantUserId(req, 1);
   const resolvedChatId = chatId || jid || null;
   const resolvedChatName = chatName || name || null;
 
