@@ -8,6 +8,38 @@ function cleanText(text) {
   return String(text).replace(/[\u200B-\u200D\u200E\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, '').trim();
 }
 
+function normalizeForMatch(text) {
+  return cleanText(text)
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+const COMMON_EXACT = new Set([
+  'ok', 'okay', 'okk', 'okkk', 'k', 'kk', 'kkk', 'oke', 'okey',
+  'yes', 'no', 'yeah', 'yep', 'yup', 'nope', 'na', 'nah', 'yea',
+  'done', 'ok done', 'okay done',
+  'sure', 'alright', 'all right', 'right', 'fine',
+  'please', 'plz', 'pls', 'please confirm',
+  'hi', 'hello', 'hey', 'hy', 'hii', 'hiii', 'helloo', 'helo',
+  'bye', 'goodbye', 'good night', 'goodnight', 'gn', 'good morning', 'gm',
+  'good evening', 'good afternoon',
+  'assalamualaikum', 'assalam o alaikum', 'asalamualaikum', 'salam',
+  'walaikum assalam', 'wa alaikum assalam', 'ws', 'aoa', 'aoa wr wb',
+  'jazakallah', 'jazakallah khair', 'allah hafiz',
+  'ji', 'jee', 'haan', 'han', 'ha', 'theek', 'theek hai', 'thik', 'thik hai',
+  'acha', 'achha', 'accha', 'sahi', 'sahi hai', 'bilkul',
+  'bhai', 'bro', 'sir', 'mam', 'madam', 'ji bhai',
+  'hmm', 'hm', 'hmmm', 'lol', 'haha', 'hahaha', 'hehe', 'hehehe',
+  'nice', 'cool', 'great', 'perfect', 'awesome', 'wow',
+  'thanks', 'thank you', 'thankyou', 'thx', 'ty', 'tysm', 'thanks bro',
+  'ok thanks', 'ok thank you', 'okay thanks',
+  'seen', 'check', 'checking', 'wait', 'waiting', 'ok wait', 'hold on',
+  'yes please', 'ok please',
+  'null', 'undefined', 'test', 'testing'
+]);
+
 /**
  * Determines if text is a WhatsApp system notification or non-chat metadata string
  */
@@ -21,10 +53,36 @@ function isSystemNotificationText(text) {
       cleaned.includes('end-to-end encrypted') ||
       cleaned.includes('added you') ||
       cleaned.includes('created group') ||
+      cleaned.includes('this message was deleted') ||
+      cleaned.includes('you deleted this message') ||
       /^\d{1,2}:\d{2}$/.test(cleaned) ||
       /\.(json|txt|pdf|png|jpg|docx)$/i.test(cleaned)) {
     return true;
   }
+  return false;
+}
+
+function isEmojiOnly(text) {
+  const t = cleanText(text);
+  if (!t) return true;
+  if (/\p{L}|\p{N}/u.test(t)) return false;
+  return true;
+}
+
+/**
+ * Common filler chats that should not be stored / normalized.
+ */
+function isCommonJunkMessage(text) {
+  const raw = cleanText(text);
+  if (!raw) return true;
+  if (isSystemNotificationText(raw)) return true;
+  if (isEmojiOnly(raw)) return true;
+
+  const norm = normalizeForMatch(raw);
+  if (!norm) return true;
+  if (norm.length <= 2 && !/\d/.test(norm) && !COMMON_EXACT.has(norm)) return true;
+  if (COMMON_EXACT.has(norm)) return true;
+  if (/^(.)\1{2,}$/u.test(norm.replace(/\s/g, ''))) return true;
   return false;
 }
 
@@ -138,6 +196,7 @@ async function findOrCreateCanonicalChat(userId, rawJid, rawName, avatar = null)
 module.exports = {
   cleanText,
   isSystemNotificationText,
+  isCommonJunkMessage,
   normalizePhoneDigits,
   findOrCreateCanonicalChat
 };

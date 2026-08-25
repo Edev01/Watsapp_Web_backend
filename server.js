@@ -9,7 +9,7 @@ const { sendResponse } = require('./responseHelper');
 const { authenticateToken, isAdmin } = require('./middleware');
 const { filterAndSortProperties } = require('./propertyHelper');
 const { extractUserId } = require('./userMiddleware');
-const { findOrCreateCanonicalChat, cleanText, isSystemNotificationText } = require('./contactHelper');
+const { findOrCreateCanonicalChat, cleanText, isSystemNotificationText, isCommonJunkMessage } = require('./contactHelper');
 const {
   DEFAULT_MODEL: NORMALIZE_MODEL,
   getNormalizeCounts,
@@ -985,6 +985,12 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
         continue;
       }
 
+      // Skip common fillers (ok/hi/thanks/emoji-only/system notices)
+      if (isCommonJunkMessage(messageText)) {
+        skippedCount++;
+        continue;
+      }
+
       try {
         const result = await db.query(
           `INSERT INTO whatsapp_messages (user_id, chat_jid, sender, timestamp, message, from_me) 
@@ -1015,6 +1021,21 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
       addedCount,
       skippedCount
     });
+
+    // Auto-queue AI normalization for this tenant (no PC / manual step).
+    // Render Background Worker (auto_pipeline) or AI_BOT_URL picks it up.
+    if (addedCount > 0) {
+      queueNormalizeJob(userId, { embed: true }).then(({ job, alreadyActive }) => {
+        if (alreadyActive) return;
+        return notifyNormalizeBot(userId, job).then((botNotify) => {
+          if (!botNotify.notified) {
+            console.log(
+              `[normalize] queued user=${userId} (bot: ${botNotify.reason || 'waiting for worker'})`
+            );
+          }
+        });
+      }).catch((e) => console.warn('[normalize] auto-queue failed:', e.message));
+    }
 
     return sendResponse(
       res,
