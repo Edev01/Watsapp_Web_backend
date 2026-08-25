@@ -106,6 +106,22 @@ const initializeDb = async () => {
 
     CREATE INDEX IF NOT EXISTS idx_link_sessions_updated ON whatsapp_link_sessions (updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_link_sessions_wa_jid ON whatsapp_link_sessions (whatsapp_jid);
+
+    -- Per-user AI normalization job (portal trigger + status)
+    CREATE TABLE IF NOT EXISTS normalize_jobs (
+      user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      status VARCHAR(32) NOT NULL DEFAULT 'idle',
+      model_used VARCHAR(64) DEFAULT 'qwen2.5:7b',
+      embed BOOLEAN DEFAULT TRUE,
+      batch_size INTEGER DEFAULT 50,
+      processed_this_run INTEGER DEFAULT 0,
+      started_at TIMESTAMP,
+      finished_at TIMESTAMP,
+      last_error TEXT,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_normalize_jobs_status ON normalize_jobs (status);
   `;
   try {
     const client = await pool.connect();

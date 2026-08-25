@@ -10,6 +10,15 @@ const { authenticateToken, isAdmin } = require('./middleware');
 const { filterAndSortProperties } = require('./propertyHelper');
 const { extractUserId } = require('./userMiddleware');
 const { findOrCreateCanonicalChat, cleanText, isSystemNotificationText } = require('./contactHelper');
+const {
+  DEFAULT_MODEL: NORMALIZE_MODEL,
+  getNormalizeCounts,
+  getNormalizeJob,
+  queueNormalizeJob,
+  markNormalizeJobError,
+  notifyNormalizeBot,
+  buildStatusPayload
+} = require('./normalizeHelper');
 
 const http = require('http');
 const { Server } = require('socket.io');
@@ -1490,6 +1499,129 @@ app.post('/api/properties/filter', handlePropertyFilter);
 app.get('/api/properties/filter', handlePropertyFilter);
 app.post('/api/properties', handlePropertyFilter);
 app.get('/api/properties', handlePropertyFilter);
+
+// ---------------------------------------------------------------------------
+// Normalization (AI) — portal user triggers + polls progress
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /api/normalize/status
+ * Auth required. Returns % done, totals, pending, property/embed counts, job state.
+ */
+app.get('/api/normalize/status', authenticateToken, async (req, res) => {
+  try {
+    const userId = Number(req.user?.id || req.userId);
+    if (!userId) {
+      return sendResponse(res, 401, true, null, 'Authenticated userId is required');
+    }
+
+    const model =
+      (typeof req.query.model === 'string' && req.query.model.trim()) || NORMALIZE_MODEL;
+
+    const [counts, job] = await Promise.all([
+      getNormalizeCounts(userId, model),
+      getNormalizeJob(userId)
+    ]);
+
+    return sendResponse(
+      res,
+      200,
+      false,
+      buildStatusPayload(userId, counts, job, model),
+      'Normalization status retrieved'
+    );
+  } catch (err) {
+    console.error('Normalize status error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
+/**
+ * POST /api/normalize/trigger
+ * Auth required. Queues AI normalization for the logged-in user's scraped messages.
+ * Body (optional): { batchSize?: number, embed?: boolean, model?: string }
+ */
+app.post('/api/normalize/trigger', authenticateToken, async (req, res) => {
+  try {
+    const userId = Number(req.user?.id || req.userId);
+    if (!userId) {
+      return sendResponse(res, 401, true, null, 'Authenticated userId is required');
+    }
+
+    const body = req.body || {};
+    const model =
+      (typeof body.model === 'string' && body.model.trim()) || NORMALIZE_MODEL;
+    const embed = body.embed !== false && body.embed !== 'false';
+    const batchSize = body.batchSize ?? body.batch_size ?? 50;
+
+    const countsBefore = await getNormalizeCounts(userId, model);
+    if (countsBefore.totalMessages === 0) {
+      return sendResponse(
+        res,
+        400,
+        true,
+        buildStatusPayload(userId, countsBefore, null, model),
+        'No scraped messages to normalize for this user'
+      );
+    }
+    if (countsBefore.pendingCount === 0) {
+      return sendResponse(
+        res,
+        200,
+        false,
+        {
+          ...buildStatusPayload(userId, countsBefore, await getNormalizeJob(userId), model),
+          triggered: false
+        },
+        'All messages are already normalized'
+      );
+    }
+
+    const { job, alreadyActive } = await queueNormalizeJob(userId, {
+      model,
+      embed,
+      batchSize
+    });
+
+    let botNotify = { notified: false, reason: null };
+    if (!alreadyActive) {
+      botNotify = await notifyNormalizeBot(userId, job);
+      // Job stays queued for auto_pipeline if bot is offline — only mark failed
+      // when the bot explicitly rejected (not network/offline).
+      if (
+        botNotify.notified === false &&
+        botNotify.reason &&
+        /HTTP 4\d\d|detail|rejected|secret/i.test(String(botNotify.reason))
+      ) {
+        await markNormalizeJobError(userId, botNotify.reason);
+      }
+    }
+
+    const [counts, freshJob] = await Promise.all([
+      getNormalizeCounts(userId, model),
+      getNormalizeJob(userId)
+    ]);
+
+    const payload = {
+      ...buildStatusPayload(userId, counts, freshJob || job, model),
+      triggered: !alreadyActive,
+      alreadyRunning: alreadyActive,
+      botNotified: Boolean(botNotify.notified),
+      botNote: botNotify.reason || null
+    };
+
+    const message = alreadyActive
+      ? 'Normalization already in progress for this user'
+      : botNotify.notified
+        ? 'Normalization started'
+        : 'Normalization queued (AI worker will pick it up when available)';
+
+    return sendResponse(res, alreadyActive ? 200 : 202, false, payload, message);
+  } catch (err) {
+    console.error('Normalize trigger error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
 
 // Root Route
 app.get('/', (req, res) => {
