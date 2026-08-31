@@ -55,9 +55,21 @@ const initializeDb = async () => {
     );
 
     ALTER TABLE whatsapp_chats ADD COLUMN IF NOT EXISTS user_id INTEGER;
+    ALTER TABLE whatsapp_chats ADD COLUMN IF NOT EXISTS monitored_at TIMESTAMPTZ;
+    ALTER TABLE whatsapp_chats ADD COLUMN IF NOT EXISTS last_scraped_at TIMESTAMPTZ;
+
+    -- Existing monitored chats: treat chat creation as monitor start (no retroactive floor reset)
+    UPDATE whatsapp_chats
+    SET monitored_at = COALESCE(monitored_at, created_at, NOW())
+    WHERE is_monitored = TRUE AND monitored_at IS NULL;
     ALTER TABLE whatsapp_chats DROP CONSTRAINT IF EXISTS whatsapp_chats_jid_key;
     ALTER TABLE whatsapp_chats DROP CONSTRAINT IF EXISTS unique_user_chat;
     ALTER TABLE whatsapp_chats ADD CONSTRAINT unique_user_chat UNIQUE (user_id, jid);
+
+    CREATE INDEX IF NOT EXISTS idx_whatsapp_chats_user_monitored
+      ON whatsapp_chats (user_id, is_monitored);
+    CREATE INDEX IF NOT EXISTS idx_whatsapp_chats_user_name
+      ON whatsapp_chats (user_id, name);
 
     CREATE TABLE IF NOT EXISTS whatsapp_messages (
       id SERIAL PRIMARY KEY,

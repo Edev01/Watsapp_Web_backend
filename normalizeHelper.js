@@ -1,6 +1,6 @@
 const db = require('./db');
 
-const DEFAULT_MODEL = process.env.NORMALIZE_MODEL || 'qwen2.5:7b';
+const DEFAULT_MODEL = process.env.NORMALIZE_MODEL || 'openai/gpt-oss-20b';
 
 /**
  * Counts for one portal user's normalization progress.

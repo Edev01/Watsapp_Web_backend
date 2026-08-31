@@ -630,6 +630,7 @@ app.post('/api/qr/reset-waiting', async (req, res) => {
     return sendResponse(res, 400, true, null, 'userId is required');
   }
   try {
+    const pausedCount = await stampMonitoredScrapePause(userId);
     const result = await db.query(
       `UPDATE whatsapp_link_sessions
        SET status = 'waiting', whatsapp_jid = NULL, updated_at = NOW()
@@ -644,13 +645,19 @@ app.post('/api/qr/reset-waiting', async (req, res) => {
          RETURNING id, user_id, status, created_at, updated_at`,
         [userId]
       );
-      return sendResponse(res, 200, false, inserted.rows[0], 'Link session created as waiting');
+      return sendResponse(
+        res,
+        200,
+        false,
+        { ...inserted.rows[0], pausedMonitoredChats: pausedCount },
+        'Link session created as waiting'
+      );
     }
     io.to(`user_${userId}`).emit('link_session_waiting', {
       userId,
       status: 'waiting'
     });
-    return sendResponse(res, 200, false, result.rows[0], 'Link session reset to waiting');
+    return sendResponse(res, 200, false, { ...result.rows[0], pausedMonitoredChats: pausedCount }, 'Link session reset to waiting');
   } catch (err) {
     console.error('QR reset-waiting error:', err);
     return sendResponse(res, 500, true, null, err.message || 'Server error');
@@ -904,6 +911,59 @@ function resolveTenantUserId(req, fallback = null) {
   return parseInt(raw, 10);
 }
 
+/** Stamp last_scraped_at on all monitored chats (WhatsApp logout / session pause). */
+async function stampMonitoredScrapePause(userId) {
+  const result = await db.query(
+    `UPDATE whatsapp_chats
+     SET last_scraped_at = GREATEST(COALESCE(last_scraped_at, to_timestamp(0)), NOW())
+     WHERE user_id = $1 AND is_monitored = TRUE
+     RETURNING jid`,
+    [userId]
+  );
+  return result.rowCount;
+}
+
+function parseChatListQuery(req) {
+  const userId = resolveTenantUserId(req, 1);
+  const rawType = String(req.query.type || req.query.filter || 'all').toLowerCase();
+  const type = ['monitored', 'chats', 'all'].includes(rawType) ? rawType : 'all';
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 500, 1), 5000);
+  const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+  const search = String(req.query.search || req.query.q || '').trim();
+  return { userId, type, limit, offset, search };
+}
+
+function buildChatListSql({ userId, type, limit, offset, search }) {
+  const params = [userId];
+  let where = 'WHERE user_id = $1';
+
+  if (type === 'monitored') {
+    where += ' AND is_monitored = TRUE';
+  } else if (type === 'chats') {
+    where += ' AND is_monitored = FALSE';
+  }
+
+  if (search) {
+    params.push(`%${search}%`);
+    where += ` AND (LOWER(COALESCE(name, '')) LIKE LOWER($${params.length}) OR LOWER(jid) LIKE LOWER($${params.length}))`;
+  }
+
+  params.push(limit, offset);
+  const limitIdx = params.length - 1;
+  const offsetIdx = params.length;
+
+  const sql = `
+    SELECT jid, name, avatar, is_monitored, user_id, created_at, monitored_at, last_scraped_at
+    FROM whatsapp_chats
+    ${where}
+    ORDER BY name ASC NULLS LAST, jid ASC
+    LIMIT $${limitIdx} OFFSET $${offsetIdx}`;
+
+  const countSql = `SELECT COUNT(*)::int AS total FROM whatsapp_chats ${where}`;
+
+  return { sql, countSql, params, countParams: params.slice(0, -2) };
+}
+
 // 7. Post Scraped Contacts List (Deduplicated by name & JID with canonical matching)
 app.post('/api/scraped-chats/contacts', async (req, res) => {
   const { contacts } = req.body;
@@ -929,7 +989,8 @@ app.get('/api/scraped-chats/monitored', async (req, res) => {
   try {
     const result = await db.query(
       `SELECT c.jid, c.name, c.avatar, c.is_monitored, c.user_id, c.created_at,
-         (SELECT timestamp FROM whatsapp_messages m WHERE m.user_id = c.user_id AND m.chat_jid = c.jid ORDER BY m.id DESC LIMIT 1) as last_scraped_timestamp
+         c.monitored_at,
+         c.last_scraped_at
        FROM whatsapp_chats c 
        WHERE c.user_id = $1 AND c.is_monitored = TRUE 
        ORDER BY c.name ASC`,
@@ -968,11 +1029,15 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
     let addedCount = 0;
     let skippedCount = 0;
     const insertErrors = [];
+    let maxMessageEpoch = null;
 
     for (const msg of messages) {
       const sender = (msg.sender ?? '').toString().trim();
       const timestamp = (msg.timestamp ?? '').toString().trim();
       const messageText = (msg.message ?? msg.text ?? '').toString();
+      const rawEpoch = msg.messageEpoch ?? msg.message_epoch ?? msg.ts_epoch;
+      const messageEpoch =
+        rawEpoch != null && !Number.isNaN(Number(rawEpoch)) ? Number(rawEpoch) : null;
       // Right-side WhatsApp bubbles = from me; left-side = not me
       const rawFromMe = msg.fromMe ?? msg.from_me ?? false;
       const isFromMe =
@@ -1001,8 +1066,15 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
           [userId, canonicalJid, sender || 'unknown', timestamp || 'unknown', messageText, isFromMe]
         );
         if (result.rowCount > 0) {
-          if (result.rows[0]?.inserted) addedCount++;
-          else skippedCount++; // existed; from_me may have been corrected
+          if (result.rows[0]?.inserted) {
+            addedCount++;
+            if (messageEpoch != null) {
+              maxMessageEpoch =
+                maxMessageEpoch == null
+                  ? messageEpoch
+                  : Math.max(maxMessageEpoch, messageEpoch);
+            }
+          } else skippedCount++; // existed; from_me may have been corrected
         } else {
           skippedCount++;
         }
@@ -1011,6 +1083,15 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
         insertErrors.push(insertErr.message);
         console.error('Message insert error:', insertErr.message);
       }
+    }
+
+    if (maxMessageEpoch != null && addedCount > 0) {
+      await db.query(
+        `UPDATE whatsapp_chats
+         SET last_scraped_at = GREATEST(COALESCE(last_scraped_at, to_timestamp(0)), to_timestamp($3))
+         WHERE user_id = $1 AND jid = $2`,
+        [userId, canonicalJid, maxMessageEpoch]
+      );
     }
 
     // Notify frontend that this user's chat was updated
@@ -1085,7 +1166,10 @@ app.post('/api/scraped-chats/monitor', async (req, res) => {
     if (mode === 'replace') {
       await db.query('UPDATE whatsapp_chats SET is_monitored = FALSE WHERE user_id = $1', [userId]);
       const result = await db.query(
-        'UPDATE whatsapp_chats SET is_monitored = TRUE WHERE user_id = $1 AND jid = ANY($2) RETURNING jid, name, is_monitored',
+        `UPDATE whatsapp_chats
+         SET is_monitored = TRUE, monitored_at = NOW()
+         WHERE user_id = $1 AND jid = ANY($2)
+         RETURNING jid, name, is_monitored, monitored_at`,
         [userId, jids]
       );
       updated = result.rowCount;
@@ -1100,7 +1184,11 @@ app.post('/api/scraped-chats/monitor', async (req, res) => {
       updatedRows = result.rows;
     } else {
       const result = await db.query(
-        'UPDATE whatsapp_chats SET is_monitored = TRUE WHERE user_id = $1 AND jid = ANY($2) RETURNING jid, name, is_monitored',
+        `UPDATE whatsapp_chats
+         SET is_monitored = TRUE,
+             monitored_at = CASE WHEN is_monitored = FALSE THEN NOW() ELSE monitored_at END
+         WHERE user_id = $1 AND jid = ANY($2)
+         RETURNING jid, name, is_monitored, monitored_at`,
         [userId, jids]
       );
       updated = result.rowCount;
@@ -1133,17 +1221,79 @@ app.post('/api/scraped-chats/monitor', async (req, res) => {
   }
 });
 
-// 11. Get All Chats (both monitored and unmonitored for user)
+// 11. Get chats (type=monitored|chats|all, optional search/limit/offset)
 app.get('/api/scraped-chats', async (req, res) => {
-  const userId = req.userId || req.query.userId || req.query.user_id || 1;
+  const { userId, type, limit, offset, search } = parseChatListQuery(req);
   try {
-    const result = await db.query(
-      'SELECT jid, name, avatar, is_monitored, user_id, created_at FROM whatsapp_chats WHERE user_id = $1 ORDER BY name ASC',
-      [userId]
+    const { sql, countSql, params, countParams } = buildChatListSql({
+      userId,
+      type,
+      limit,
+      offset,
+      search
+    });
+    const [result, countResult] = await Promise.all([
+      db.query(sql, params),
+      db.query(countSql, countParams)
+    ]);
+    const total = countResult.rows[0]?.total ?? result.rowCount;
+    return sendResponse(
+      res,
+      200,
+      false,
+      {
+        chats: result.rows,
+        type,
+        total,
+        limit,
+        offset,
+        hasMore: offset + result.rows.length < total
+      },
+      'Chats retrieved successfully'
     );
-    return sendResponse(res, 200, false, result.rows, 'All chats retrieved successfully');
   } catch (err) {
     console.error('Get all chats error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
+// 11a. Lightweight chat counts for dashboard stats
+app.get('/api/scraped-chats/stats', async (req, res) => {
+  const userId = resolveTenantUserId(req, 1);
+  try {
+    const result = await db.query(
+      `SELECT
+         COUNT(*)::int AS total,
+         COUNT(*) FILTER (WHERE is_monitored = TRUE)::int AS monitored,
+         COUNT(*) FILTER (WHERE is_monitored = FALSE)::int AS unmonitored
+       FROM whatsapp_chats
+       WHERE user_id = $1`,
+      [userId]
+    );
+    return sendResponse(res, 200, false, result.rows[0], 'Chat stats retrieved');
+  } catch (err) {
+    console.error('Get chat stats error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
+// 11a2. Worker: stamp scrape pause when WhatsApp session ends
+app.post('/api/scraped-chats/pause-scraping', async (req, res) => {
+  const userId = resolveTenantUserId(req, null);
+  if (!userId) {
+    return sendResponse(res, 400, true, null, 'userId is required');
+  }
+  try {
+    const pausedCount = await stampMonitoredScrapePause(userId);
+    return sendResponse(
+      res,
+      200,
+      false,
+      { userId, pausedMonitoredChats: pausedCount, pausedAt: new Date().toISOString() },
+      'Scrape pause stamped on monitored chats'
+    );
+  } catch (err) {
+    console.error('Pause scraping error:', err);
     return sendResponse(res, 500, true, null, err.message || 'Server error');
   }
 });
