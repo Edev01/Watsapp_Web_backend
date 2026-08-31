@@ -285,9 +285,6 @@ io.on('connection', (socket) => {
   });
 });
 
-// Initialize database
-db.initializeDb();
-
 // 1. Admin Sign Up
 app.post('/api/auth/admin/signup', async (req, res) => {
   const { email, password, name, phone_number } = req.body;
@@ -1799,7 +1796,14 @@ app.get('/', (req, res) => {
   return sendResponse(res, 200, false, { service: 'whatsapp-scraper-backend' }, 'API service running');
 });
 
-// Start Server
-server.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
-});
+// Start Server (await DB migration so monitored_at exists before traffic)
+(async () => {
+  try {
+    await db.initializeDb();
+  } catch (err) {
+    console.error('Database init failed on startup:', err.message);
+  }
+  server.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT}`);
+  });
+})();

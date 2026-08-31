@@ -138,15 +138,43 @@ const initializeDb = async () => {
   try {
     const client = await pool.connect();
     await client.query(queryText);
+    await ensureScrapeColumns(client);
     client.release();
     console.log('Database initialized successfully (users table checked/created, CASCADE FKs applied).');
   } catch (err) {
     console.error('Error initializing database table:', err.message);
+    throw err;
   }
 };
+
+/** Ensure forward-only scrape columns exist (safe to run on every startup). */
+async function ensureScrapeColumns(client) {
+  const dbClient = client || (await pool.connect());
+  try {
+    await dbClient.query(`
+      ALTER TABLE whatsapp_chats ADD COLUMN IF NOT EXISTS monitored_at TIMESTAMPTZ;
+      ALTER TABLE whatsapp_chats ADD COLUMN IF NOT EXISTS last_scraped_at TIMESTAMPTZ;
+    `);
+    await dbClient.query(`
+      UPDATE whatsapp_chats
+      SET monitored_at = COALESCE(monitored_at, created_at, NOW())
+      WHERE is_monitored = TRUE AND monitored_at IS NULL;
+    `);
+    await dbClient.query(`
+      CREATE INDEX IF NOT EXISTS idx_whatsapp_chats_user_monitored
+        ON whatsapp_chats (user_id, is_monitored);
+      CREATE INDEX IF NOT EXISTS idx_whatsapp_chats_user_name
+        ON whatsapp_chats (user_id, name);
+    `);
+    console.log('Scrape column migration OK (monitored_at, last_scraped_at).');
+  } finally {
+    if (!client) dbClient.release();
+  }
+}
 
 module.exports = {
   query: (text, params) => pool.query(text, params),
   initializeDb,
+  ensureScrapeColumns: () => ensureScrapeColumns(),
   pool
 };
