@@ -924,10 +924,56 @@ function parseChatListQuery(req) {
   const userId = resolveTenantUserId(req, 1);
   const rawType = String(req.query.type || req.query.filter || 'all').toLowerCase();
   const type = ['monitored', 'chats', 'all'].includes(rawType) ? rawType : 'all';
-  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 500, 1), 5000);
-  const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
   const search = String(req.query.search || req.query.q || '').trim();
-  return { userId, type, limit, offset, search };
+
+  const pageSize = Math.min(
+    Math.max(
+      parseInt(req.query.pageSize || req.query.page_size || req.query.limit, 10) || 50,
+      1
+    ),
+    500
+  );
+
+  const hasExplicitOffset =
+    req.query.offset != null && String(req.query.offset).trim() !== '';
+  const hasExplicitPage =
+    req.query.page != null && String(req.query.page).trim() !== '';
+
+  let page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+  let offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+  let limit = pageSize;
+
+  if (hasExplicitOffset && !hasExplicitPage) {
+    offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+    if (req.query.limit != null) {
+      limit = Math.min(Math.max(parseInt(req.query.limit, 10) || pageSize, 1), 500);
+    }
+    page = Math.floor(offset / limit) + 1;
+  } else {
+    page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    offset = (page - 1) * pageSize;
+    limit = pageSize;
+  }
+
+  return { userId, type, limit, offset, page, pageSize: limit, search };
+}
+
+function buildPaginationMeta({ page, pageSize, limit, offset, total, rowCount }) {
+  const totalPages = Math.max(Math.ceil(total / limit), total > 0 ? 1 : 0);
+  const safePage = Math.min(Math.max(page, 1), totalPages || 1);
+  return {
+    page: safePage,
+    pageSize: limit,
+    limit,
+    offset,
+    total,
+    totalPages,
+    count: rowCount,
+    hasNext: offset + rowCount < total,
+    hasPrev: offset > 0,
+    nextPage: offset + rowCount < total ? safePage + 1 : null,
+    prevPage: safePage > 1 ? safePage - 1 : null
+  };
 }
 
 function buildChatListSql({ userId, type, limit, offset, search }) {
@@ -1218,9 +1264,9 @@ app.post('/api/scraped-chats/monitor', async (req, res) => {
   }
 });
 
-// 11. Get chats (type=monitored|chats|all, optional search/limit/offset)
+// 11. Get chats (type=monitored|chats|all, pagination: page & pageSize)
 app.get('/api/scraped-chats', async (req, res) => {
-  const { userId, type, limit, offset, search } = parseChatListQuery(req);
+  const { userId, type, limit, offset, page, pageSize, search } = parseChatListQuery(req);
   try {
     const { sql, countSql, params, countParams } = buildChatListSql({
       userId,
@@ -1234,6 +1280,14 @@ app.get('/api/scraped-chats', async (req, res) => {
       db.query(countSql, countParams)
     ]);
     const total = countResult.rows[0]?.total ?? result.rowCount;
+    const pagination = buildPaginationMeta({
+      page,
+      pageSize,
+      limit,
+      offset,
+      total,
+      rowCount: result.rows.length
+    });
     return sendResponse(
       res,
       200,
@@ -1241,10 +1295,13 @@ app.get('/api/scraped-chats', async (req, res) => {
       {
         chats: result.rows,
         type,
+        search: search || null,
+        pagination,
+        // legacy fields
         total,
         limit,
         offset,
-        hasMore: offset + result.rows.length < total
+        hasMore: pagination.hasNext
       },
       'Chats retrieved successfully'
     );
