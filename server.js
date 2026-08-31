@@ -113,6 +113,60 @@ async function getUserLinkSession(userId) {
   return result.rows[0] || null;
 }
 
+/** WhatsApp link state for portal login / connection-status (no 24h window). */
+async function resolveWhatsAppConnectionForUser(userId) {
+  const id = parseInt(userId, 10);
+  if (!id || Number.isNaN(id)) {
+    return {
+      whatsappConnected: false,
+      linked: false,
+      status: 'none',
+      whatsappJid: null,
+      boundWhatsappJid: null,
+      boundPhone: null,
+      canLinkOtherNumbers: true,
+      message: 'Invalid user'
+    };
+  }
+
+  const [sessionRes, userRes] = await Promise.all([
+    db.query(
+      `SELECT id, user_id, status, whatsapp_jid, created_at, updated_at
+       FROM whatsapp_link_sessions
+       WHERE user_id = $1
+       ORDER BY updated_at DESC
+       LIMIT 1`,
+      [id]
+    ),
+    db.query(
+      'SELECT bound_whatsapp_jid, bound_whatsapp_phone FROM users WHERE id = $1',
+      [id]
+    )
+  ]);
+
+  const link = sessionRes.rows[0] || null;
+  const boundJid = userRes.rows[0]?.bound_whatsapp_jid || null;
+  const boundPhone =
+    userRes.rows[0]?.bound_whatsapp_phone || formatBoundPhone(boundJid);
+  const linked = link?.status === 'linked';
+  const status = link?.status || (boundJid ? 'waiting' : 'none');
+
+  return {
+    whatsappConnected: linked,
+    linked,
+    status,
+    whatsappJid: linked ? link?.whatsapp_jid || boundJid : null,
+    boundWhatsappJid: boundJid,
+    boundPhone: boundPhone || null,
+    canLinkOtherNumbers: !boundJid,
+    message: linked
+      ? `WhatsApp connected${boundPhone ? ` (${boundPhone})` : ''}`
+      : boundJid
+        ? `Waiting to link bound WhatsApp${boundPhone ? ` ${boundPhone}` : ''}`
+        : 'No WhatsApp linked yet — scan QR to bind the first number'
+  };
+}
+
 async function claimLinkSession(userId) {
   const id = parseInt(userId, 10);
   if (!id || Number.isNaN(id)) return null;
@@ -365,6 +419,10 @@ app.post('/api/auth/login', async (req, res) => {
     if (user.role === 'user') {
       data.user.is_first_login = user.is_first_login;
     }
+
+    const whatsapp = await resolveWhatsAppConnectionForUser(user.id);
+    data.whatsappConnected = whatsapp.whatsappConnected;
+    data.whatsapp = whatsapp;
 
     return sendResponse(res, 200, false, data, 'Login successful');
   } catch (err) {
@@ -851,15 +909,7 @@ app.get('/api/qr/connection-status', async (req, res) => {
     return sendResponse(res, 400, true, null, 'userId is required');
   }
   try {
-    const link = await getUserLinkSession(userId);
-    const userBound = await db.query(
-      'SELECT bound_whatsapp_jid, bound_whatsapp_phone, email, name FROM users WHERE id = $1',
-      [userId]
-    );
-    const boundJid = userBound.rows[0]?.bound_whatsapp_jid || link?.whatsapp_jid || null;
-    const boundPhone =
-      userBound.rows[0]?.bound_whatsapp_phone || formatBoundPhone(boundJid);
-    const linked = link?.status === 'linked';
+    const whatsapp = await resolveWhatsAppConnectionForUser(userId);
 
     return sendResponse(
       res,
@@ -867,22 +917,9 @@ app.get('/api/qr/connection-status', async (req, res) => {
       false,
       {
         userId: Number(userId),
-        // true => show "WhatsApp Connected", hide QR
-        linked,
-        status: link?.status || (boundJid ? 'waiting' : 'none'),
-        // live session jid (if currently linked)
-        whatsappJid: linked ? link?.whatsapp_jid || boundJid : null,
-        // permanent first-scan bind (never changes)
-        boundWhatsappJid: boundJid,
-        boundPhone: boundPhone || null,
-        canLinkOtherNumbers: !boundJid,
-        message: linked
-          ? `WhatsApp connected${boundPhone ? ` (${boundPhone})` : ''}`
-          : boundJid
-            ? `Waiting to link bound WhatsApp${boundPhone ? ` ${boundPhone}` : ''}`
-            : 'No WhatsApp linked yet — scan QR to bind the first number'
+        ...whatsapp
       },
-      linked ? 'WhatsApp connected' : 'WhatsApp not connected'
+      whatsapp.linked ? 'WhatsApp connected' : 'WhatsApp not connected'
     );
   } catch (err) {
     console.error('Get connection status error:', err);
