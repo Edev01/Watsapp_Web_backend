@@ -925,58 +925,10 @@ function parseChatListQuery(req) {
   const rawType = String(req.query.type || req.query.filter || 'all').toLowerCase();
   const type = ['monitored', 'chats', 'all'].includes(rawType) ? rawType : 'all';
   const search = String(req.query.search || req.query.q || '').trim();
-
-  const pageSize = Math.min(
-    Math.max(
-      parseInt(req.query.pageSize || req.query.page_size || req.query.limit, 10) || 50,
-      1
-    ),
-    500
-  );
-
-  const hasExplicitOffset =
-    req.query.offset != null && String(req.query.offset).trim() !== '';
-  const hasExplicitPage =
-    req.query.page != null && String(req.query.page).trim() !== '';
-
-  let page = Math.max(parseInt(req.query.page, 10) || 1, 1);
-  let offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
-  let limit = pageSize;
-
-  if (hasExplicitOffset && !hasExplicitPage) {
-    offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
-    if (req.query.limit != null) {
-      limit = Math.min(Math.max(parseInt(req.query.limit, 10) || pageSize, 1), 500);
-    }
-    page = Math.floor(offset / limit) + 1;
-  } else {
-    page = Math.max(parseInt(req.query.page, 10) || 1, 1);
-    offset = (page - 1) * pageSize;
-    limit = pageSize;
-  }
-
-  return { userId, type, limit, offset, page, pageSize: limit, search };
+  return { userId, type, search };
 }
 
-function buildPaginationMeta({ page, pageSize, limit, offset, total, rowCount }) {
-  const totalPages = Math.max(Math.ceil(total / limit), total > 0 ? 1 : 0);
-  const safePage = Math.min(Math.max(page, 1), totalPages || 1);
-  return {
-    page: safePage,
-    pageSize: limit,
-    limit,
-    offset,
-    total,
-    totalPages,
-    count: rowCount,
-    hasNext: offset + rowCount < total,
-    hasPrev: offset > 0,
-    nextPage: offset + rowCount < total ? safePage + 1 : null,
-    prevPage: safePage > 1 ? safePage - 1 : null
-  };
-}
-
-function buildChatListSql({ userId, type, limit, offset, search }) {
+function buildChatListSql({ userId, type, search }) {
   const params = [userId];
   let where = 'WHERE user_id = $1';
 
@@ -991,20 +943,13 @@ function buildChatListSql({ userId, type, limit, offset, search }) {
     where += ` AND (LOWER(COALESCE(name, '')) LIKE LOWER($${params.length}) OR LOWER(jid) LIKE LOWER($${params.length}))`;
   }
 
-  params.push(limit, offset);
-  const limitIdx = params.length - 1;
-  const offsetIdx = params.length;
-
   const sql = `
     SELECT jid, name, avatar, is_monitored, user_id, created_at, monitored_at, last_scraped_at
     FROM whatsapp_chats
     ${where}
-    ORDER BY name ASC NULLS LAST, jid ASC
-    LIMIT $${limitIdx} OFFSET $${offsetIdx}`;
+    ORDER BY name ASC NULLS LAST, jid ASC`;
 
-  const countSql = `SELECT COUNT(*)::int AS total FROM whatsapp_chats ${where}`;
-
-  return { sql, countSql, params, countParams: params.slice(0, -2) };
+  return { sql, params };
 }
 
 // 7. Post Scraped Contacts List (Deduplicated by name & JID with canonical matching)
@@ -1264,30 +1209,12 @@ app.post('/api/scraped-chats/monitor', async (req, res) => {
   }
 });
 
-// 11. Get chats (type=monitored|chats|all, pagination: page & pageSize)
+// 11. Get chats (type=monitored|chats|all — returns full list, no pagination)
 app.get('/api/scraped-chats', async (req, res) => {
-  const { userId, type, limit, offset, page, pageSize, search } = parseChatListQuery(req);
+  const { userId, type, search } = parseChatListQuery(req);
   try {
-    const { sql, countSql, params, countParams } = buildChatListSql({
-      userId,
-      type,
-      limit,
-      offset,
-      search
-    });
-    const [result, countResult] = await Promise.all([
-      db.query(sql, params),
-      db.query(countSql, countParams)
-    ]);
-    const total = countResult.rows[0]?.total ?? result.rowCount;
-    const pagination = buildPaginationMeta({
-      page,
-      pageSize,
-      limit,
-      offset,
-      total,
-      rowCount: result.rows.length
-    });
+    const { sql, params } = buildChatListSql({ userId, type, search });
+    const result = await db.query(sql, params);
     return sendResponse(
       res,
       200,
@@ -1296,12 +1223,7 @@ app.get('/api/scraped-chats', async (req, res) => {
         chats: result.rows,
         type,
         search: search || null,
-        pagination,
-        // legacy fields
-        total,
-        limit,
-        offset,
-        hasMore: pagination.hasNext
+        total: result.rowCount
       },
       'Chats retrieved successfully'
     );
