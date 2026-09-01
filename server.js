@@ -1607,7 +1607,15 @@ const handlePropertyFilter = async (req, res) => {
       priceMax: rawFilters.priceMax ?? queryFilters.priceMax ?? '',
       areaUnit: rawFilters.areaUnit || queryFilters.areaUnit || rawFilters.area_unit || queryFilters.area_unit || 'Marla',
       areaMin: rawFilters.areaMin ?? queryFilters.areaMin ?? '',
-      areaMax: rawFilters.areaMax ?? queryFilters.areaMax ?? ''
+      areaMax: rawFilters.areaMax ?? queryFilters.areaMax ?? '',
+      status:
+        rawFilters.status ||
+        rawFilters.propertyStatus ||
+        rawFilters.property_status ||
+        queryFilters.status ||
+        queryFilters.propertyStatus ||
+        queryFilters.property_status ||
+        ''
     };
 
     const userId = req.userId || rawFilters.userId || rawFilters.user_id || queryFilters.userId || queryFilters.user_id || 1;
@@ -1657,6 +1665,20 @@ const handlePropertyFilter = async (req, res) => {
       params.push(`%${String(filters.propertySubType).trim().toLowerCase()}%`);
       const idx = `$${params.length}`;
       whereClauses.push(`(LOWER(n.property_type) LIKE ${idx} OR LOWER(n.summary) LIKE ${idx} OR LOWER(m.message) LIKE ${idx})`);
+    }
+
+    if (filters.status && String(filters.status).trim() !== '') {
+      const statusList = String(filters.status)
+        .split(',')
+        .map((s) => normalizePropertyStatus(s))
+        .filter(Boolean);
+      if (statusList.length) {
+        params.push(statusList);
+        const idx = `$${params.length}`;
+        whereClauses.push(
+          `UPPER(COALESCE(n.property_status, 'AVAILABLE')) = ANY(${idx})`
+        );
+      }
     }
 
     if (whereClauses.length > 0) {
