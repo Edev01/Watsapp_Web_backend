@@ -1180,6 +1180,15 @@ app.post('/api/scraped-chats/monitor', async (req, res) => {
   }
 
   try {
+    const canonicalJids = [];
+    for (const raw of jids) {
+      const canonical = await findOrCreateCanonicalChat(userId, raw, null);
+      if (canonical) canonicalJids.push(canonical);
+    }
+    if (canonicalJids.length === 0) {
+      return sendResponse(res, 400, true, null, 'No valid chat JIDs to update');
+    }
+
     // Modes:
     // - monitored/is_monitored false OR action remove/unmonitor => turn OFF listed chats only
     // - replace/action=replace (legacy) => wipe all then set listed TRUE
@@ -1203,7 +1212,7 @@ app.post('/api/scraped-chats/monitor', async (req, res) => {
          SET is_monitored = TRUE, monitored_at = NOW()
          WHERE user_id = $1 AND jid = ANY($2)
          RETURNING jid, name, is_monitored, monitored_at`,
-        [userId, jids]
+        [userId, canonicalJids]
       );
       updated = result.rowCount;
       updatedRows = result.rows;
@@ -1211,7 +1220,7 @@ app.post('/api/scraped-chats/monitor', async (req, res) => {
       // Unmonitor: only the given chat IDs are removed from monitored list
       const result = await db.query(
         'UPDATE whatsapp_chats SET is_monitored = FALSE WHERE user_id = $1 AND jid = ANY($2) RETURNING jid, name, is_monitored',
-        [userId, jids]
+        [userId, canonicalJids]
       );
       updated = result.rowCount;
       updatedRows = result.rows;
@@ -1219,13 +1228,24 @@ app.post('/api/scraped-chats/monitor', async (req, res) => {
       const result = await db.query(
         `UPDATE whatsapp_chats
          SET is_monitored = TRUE,
-             monitored_at = CASE WHEN is_monitored = FALSE THEN NOW() ELSE monitored_at END
+             monitored_at = CASE WHEN is_monitored = FALSE THEN NOW() ELSE monitored_at END,
+             last_scraped_at = CASE WHEN is_monitored = FALSE THEN NULL ELSE last_scraped_at END
          WHERE user_id = $1 AND jid = ANY($2)
          RETURNING jid, name, is_monitored, monitored_at`,
-        [userId, jids]
+        [userId, canonicalJids]
       );
       updated = result.rowCount;
       updatedRows = result.rows;
+    }
+
+    if (mode === 'add' && updated === 0) {
+      return sendResponse(
+        res,
+        404,
+        true,
+        { jids: canonicalJids },
+        'Chat not found for this user — sync WhatsApp chats first, then monitor'
+      );
     }
 
     const monitoredRows = await db.query(
