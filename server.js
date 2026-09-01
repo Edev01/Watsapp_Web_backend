@@ -7,7 +7,7 @@ require('dotenv').config();
 const db = require('./db');
 const { sendResponse } = require('./responseHelper');
 const { authenticateToken, isAdmin } = require('./middleware');
-const { filterAndSortProperties } = require('./propertyHelper');
+const { filterAndSortProperties, PROPERTY_STATUSES, normalizePropertyStatus, isValidPropertyStatus } = require('./propertyHelper');
 const { extractUserId } = require('./userMiddleware');
 const { findOrCreateCanonicalChat, cleanText, isSystemNotificationText, isCommonJunkMessage } = require('./contactHelper');
 const {
@@ -1683,6 +1683,96 @@ app.post('/api/properties/filter', handlePropertyFilter);
 app.get('/api/properties/filter', handlePropertyFilter);
 app.post('/api/properties', handlePropertyFilter);
 app.get('/api/properties', handlePropertyFilter);
+
+/** Allowed property listing statuses */
+app.get('/api/properties/statuses', (req, res) => {
+  return sendResponse(
+    res,
+    200,
+    false,
+    { statuses: [...PROPERTY_STATUSES], default: 'AVAILABLE' },
+    'Property statuses retrieved'
+  );
+});
+
+/**
+ * Update property listing status by normalized_messages.id
+ * PATCH /api/properties/:propertyId/status  body: { status: "SOLD" }
+ * POST  /api/properties/:propertyId/status  body or query: status=SOLD
+ */
+const handleUpdatePropertyStatus = async (req, res) => {
+  const propertyId = parseInt(req.params.propertyId, 10);
+  if (!propertyId || Number.isNaN(propertyId)) {
+    return sendResponse(res, 400, true, null, 'propertyId is required');
+  }
+
+  const rawStatus =
+    req.body?.status ??
+    req.body?.propertyStatus ??
+    req.body?.property_status ??
+    req.query?.status ??
+    req.query?.propertyStatus;
+
+  const status = normalizePropertyStatus(rawStatus);
+  if (!status) {
+    return sendResponse(
+      res,
+      400,
+      true,
+      { allowed: [...PROPERTY_STATUSES] },
+      `Invalid status. Allowed: ${PROPERTY_STATUSES.join(', ')}`
+    );
+  }
+
+  const userId = Number(req.user?.id || req.userId || 1);
+
+  try {
+    const check = await db.query(
+      `SELECT n.id, n.property_status, n.summary, m.user_id
+       FROM normalized_messages n
+       JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
+       WHERE n.id = $1`,
+      [propertyId]
+    );
+
+    if (!check.rows[0]) {
+      return sendResponse(res, 404, true, null, 'Property not found');
+    }
+
+    const row = check.rows[0];
+    if (Number(row.user_id) !== userId && req.user?.role !== 'admin') {
+      return sendResponse(res, 403, true, null, 'You can only update your own properties');
+    }
+
+    const result = await db.query(
+      `UPDATE normalized_messages
+       SET property_status = $2
+       WHERE id = $1
+       RETURNING id, property_status, summary, whatsapp_message_id, chat_jid, purpose, property_type, city, price`,
+      [propertyId, status]
+    );
+
+    return sendResponse(
+      res,
+      200,
+      false,
+      {
+        propertyId: result.rows[0].id,
+        previousStatus: (row.property_status || 'AVAILABLE').toUpperCase(),
+        status: result.rows[0].property_status,
+        property: result.rows[0]
+      },
+      `Property marked as ${status}`
+    );
+  } catch (err) {
+    console.error('Update property status error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+};
+
+app.patch('/api/properties/:propertyId/status', authenticateToken, handleUpdatePropertyStatus);
+app.post('/api/properties/:propertyId/status', authenticateToken, handleUpdatePropertyStatus);
+app.put('/api/properties/:propertyId/status', authenticateToken, handleUpdatePropertyStatus);
 
 // ---------------------------------------------------------------------------
 // Normalization (AI) — portal user triggers + polls progress

@@ -1,6 +1,41 @@
 /**
- * Property Helper Utilities for Parsing Real Estate Prices & Area Units
+ * Property listing lifecycle statuses (portal manual updates).
  */
+const PROPERTY_STATUSES = Object.freeze([
+  'AVAILABLE',
+  'SOLD',
+  'RENTED',
+  'RESERVED',
+  'WITHDRAWN',
+  'ON_HOLD'
+]);
+
+const PROPERTY_STATUS_ALIASES = Object.freeze({
+  ACTIVE: 'AVAILABLE',
+  OPEN: 'AVAILABLE',
+  FOR_SALE: 'AVAILABLE',
+  FOR_RENT: 'AVAILABLE',
+  PENDING: 'ON_HOLD',
+  HOLD: 'ON_HOLD',
+  REMOVED: 'WITHDRAWN',
+  INACTIVE: 'WITHDRAWN',
+  LEASED: 'RENTED'
+});
+
+function normalizePropertyStatus(raw) {
+  if (raw == null || String(raw).trim() === '') return null;
+  const key = String(raw)
+    .trim()
+    .toUpperCase()
+    .replace(/[\s-]+/g, '_');
+  if (PROPERTY_STATUSES.includes(key)) return key;
+  if (PROPERTY_STATUS_ALIASES[key]) return PROPERTY_STATUS_ALIASES[key];
+  return null;
+}
+
+function isValidPropertyStatus(raw) {
+  return normalizePropertyStatus(raw) != null;
+}
 
 /**
  * Parses real estate price strings (e.g. "PKR 1.8 Cr", "85 Lac", "45,000 / month", "15000000") into numeric PKR.
@@ -125,6 +160,8 @@ function filterAndSortProperties(rawRows, filters = {}) {
       price: r.price,
       contactNumber: r.contact_number,
       summary: r.summary,
+      propertyStatus: (r.property_status || 'AVAILABLE').toUpperCase(),
+      property_status: (r.property_status || 'AVAILABLE').toUpperCase(),
       rawMessage: r.raw_message,
       fromMe: r.from_me || r.fromMe || false,
       from_me: r.from_me || r.fromMe || false,
@@ -183,6 +220,9 @@ function filterAndSortProperties(rawRows, filters = {}) {
 }
 
 module.exports = {
+  PROPERTY_STATUSES,
+  normalizePropertyStatus,
+  isValidPropertyStatus,
   parsePriceInPKR,
   parseAreaInUnit,
   filterAndSortProperties
