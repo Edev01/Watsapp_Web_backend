@@ -1739,14 +1739,14 @@ app.get('/api/properties/statuses', (req, res) => {
 });
 
 /**
- * Update property listing status by normalized_messages.id
- * PATCH /api/properties/:propertyId/status  body: { status: "SOLD" }
- * POST  /api/properties/:propertyId/status  body or query: status=SOLD
+ * Update property listing status by whatsapp_messages.id (message id from portal/search).
+ * PATCH /api/properties/:messageId/status  body: { status: "SOLD" }
+ * POST  /api/properties/:messageId/status  body or query: status=SOLD
  */
 const handleUpdatePropertyStatus = async (req, res) => {
-  const propertyId = parseInt(req.params.propertyId, 10);
-  if (!propertyId || Number.isNaN(propertyId)) {
-    return sendResponse(res, 400, true, null, 'propertyId is required');
+  const messageId = parseInt(req.params.propertyId, 10);
+  if (!messageId || Number.isNaN(messageId)) {
+    return sendResponse(res, 400, true, null, 'messageId is required');
   }
 
   const rawStatus =
@@ -1771,11 +1771,13 @@ const handleUpdatePropertyStatus = async (req, res) => {
 
   try {
     const check = await db.query(
-      `SELECT n.id, n.property_status, n.summary, m.user_id
+      `SELECT n.id, n.property_status, n.summary, m.user_id, m.id AS message_id
        FROM normalized_messages n
        JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
-       WHERE n.id = $1`,
-      [propertyId]
+       WHERE m.id = $1
+       ORDER BY n.id DESC
+       LIMIT 1`,
+      [messageId]
     );
 
     if (!check.rows[0]) {
@@ -1790,9 +1792,9 @@ const handleUpdatePropertyStatus = async (req, res) => {
     const result = await db.query(
       `UPDATE normalized_messages
        SET property_status = $2
-       WHERE id = $1
+       WHERE whatsapp_message_id = $1
        RETURNING id, property_status, summary, whatsapp_message_id, chat_jid, purpose, property_type, city, price`,
-      [propertyId, status]
+      [messageId, status]
     );
 
     return sendResponse(
@@ -1800,6 +1802,7 @@ const handleUpdatePropertyStatus = async (req, res) => {
       200,
       false,
       {
+        messageId: result.rows[0].whatsapp_message_id,
         propertyId: result.rows[0].id,
         previousStatus: (row.property_status || 'AVAILABLE').toUpperCase(),
         status: result.rows[0].property_status,
