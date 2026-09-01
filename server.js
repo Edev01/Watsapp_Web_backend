@@ -962,10 +962,13 @@ function parseChatListQuery(req) {
   const rawType = String(req.query.type || req.query.filter || 'all').toLowerCase();
   const type = ['monitored', 'chats', 'all'].includes(rawType) ? rawType : 'all';
   const search = String(req.query.search || req.query.q || '').trim();
-  return { userId, type, search };
+  const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+  const pageSize = Math.min(Math.max(parseInt(req.query.pageSize, 10) || 50, 1), 200);
+  const offset = (page - 1) * pageSize;
+  return { userId, type, search, page, pageSize, offset };
 }
 
-function buildChatListSql({ userId, type, search }) {
+function buildChatListSql({ userId, type, search, pageSize, offset }) {
   const params = [userId];
   let where = 'WHERE user_id = $1';
 
@@ -980,13 +983,18 @@ function buildChatListSql({ userId, type, search }) {
     where += ` AND (LOWER(COALESCE(name, '')) LIKE LOWER($${params.length}) OR LOWER(jid) LIKE LOWER($${params.length}))`;
   }
 
+  const countSql = `SELECT COUNT(*)::int AS total FROM whatsapp_chats ${where}`;
+  const countParams = [...params];
+
+  params.push(pageSize, offset);
   const sql = `
     SELECT jid, name, avatar, is_monitored, user_id, created_at, monitored_at, last_scraped_at
     FROM whatsapp_chats
     ${where}
-    ORDER BY name ASC NULLS LAST, jid ASC`;
+    ORDER BY name ASC NULLS LAST, jid ASC
+    LIMIT $${params.length - 1} OFFSET $${params.length}`;
 
-  return { sql, params };
+  return { sql, params, countSql, countParams };
 }
 
 // 7. Post Scraped Contacts List (Deduplicated by name & JID with canonical matching)
@@ -1246,12 +1254,22 @@ app.post('/api/scraped-chats/monitor', async (req, res) => {
   }
 });
 
-// 11. Get chats (type=monitored|chats|all — returns full list, no pagination)
+// 11. Get chats (type=monitored|chats|all — paginated, supports search)
 app.get('/api/scraped-chats', async (req, res) => {
-  const { userId, type, search } = parseChatListQuery(req);
+  const { userId, type, search, page, pageSize, offset } = parseChatListQuery(req);
   try {
-    const { sql, params } = buildChatListSql({ userId, type, search });
-    const result = await db.query(sql, params);
+    const { sql, params, countSql, countParams } = buildChatListSql({
+      userId,
+      type,
+      search,
+      pageSize,
+      offset,
+    });
+    const [result, countResult] = await Promise.all([
+      db.query(sql, params),
+      db.query(countSql, countParams),
+    ]);
+    const total = countResult.rows[0]?.total ?? result.rowCount;
     return sendResponse(
       res,
       200,
@@ -1260,7 +1278,10 @@ app.get('/api/scraped-chats', async (req, res) => {
         chats: result.rows,
         type,
         search: search || null,
-        total: result.rowCount
+        total,
+        page,
+        pageSize,
+        hasMore: page * pageSize < total,
       },
       'Chats retrieved successfully'
     );
