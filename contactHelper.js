@@ -98,12 +98,98 @@ function normalizePhoneDigits(str) {
   return digits;
 }
 
+function digitsOnly(str) {
+  return String(str || '').replace(/\D/g, '');
+}
+
+/** True when title is basically a phone number / bare JID (not a real display name). */
+function isPhoneLikeName(str) {
+  const cleaned = cleanText(str);
+  if (!cleaned) return true;
+
+  const digits = digitsOnly(cleaned);
+  const compact = cleaned.replace(/\s/g, '');
+
+  if (digits.length >= 10 && digits.length <= 15) {
+    const nonDigitChars = compact.replace(/\d/g, '').replace(/[+()-]/g, '');
+    if (nonDigitChars.length <= 2) return true;
+  }
+
+  if (/^92\d{10}$/.test(digits) || /^03\d{9}$/.test(digits)) return true;
+  if (/^\d{10,20}(@|$)/.test(cleaned)) return true;
+
+  return false;
+}
+
+function jidLocalPart(jid) {
+  return cleanText(jid).split('@')[0] || '';
+}
+
+/** Prefer human-readable titles over phone-number placeholders. */
+function pickBetterChatName(existing, incoming, jid = '') {
+  const current = cleanText(existing);
+  const next = cleanText(incoming);
+  const jidPart = jidLocalPart(jid);
+
+  if (!next || isSystemNotificationText(next)) return current || jidPart || null;
+  if (!current) return next;
+
+  const currentPhone = isPhoneLikeName(current);
+  const nextPhone = isPhoneLikeName(next);
+
+  if (currentPhone && !nextPhone) return next;
+  if (!currentPhone && nextPhone) return current;
+
+  if (current === jidPart && next && next !== jidPart) return next;
+  if (next === jidPart && current && current !== jidPart) return current;
+
+  return next.length > current.length ? next : current;
+}
+
+async function updateChatNameIfBetter(userId, jid, rawName, avatar = null) {
+  if (!jid) return;
+  const incoming = cleanText(rawName);
+  if (!incoming || isSystemNotificationText(incoming) || isPhoneLikeName(incoming)) {
+    if (avatar) {
+      await db.query(
+        `UPDATE whatsapp_chats SET avatar = COALESCE($3, avatar) WHERE user_id = $1 AND jid = $2`,
+        [userId, jid, avatar]
+      );
+    }
+    return;
+  }
+
+  const row = await db.query(
+    `SELECT id, name FROM whatsapp_chats WHERE user_id = $1 AND jid = $2 LIMIT 1`,
+    [userId, jid]
+  );
+  if (!row.rows[0]) return;
+
+  const better = pickBetterChatName(row.rows[0].name, incoming, jid);
+  if (better && better !== row.rows[0].name) {
+    await db.query(`UPDATE whatsapp_chats SET name = $2, avatar = COALESCE($3, avatar) WHERE id = $1`, [
+      row.rows[0].id,
+      better,
+      avatar
+    ]);
+  } else if (avatar) {
+    await db.query(`UPDATE whatsapp_chats SET avatar = COALESCE($2, avatar) WHERE id = $1`, [
+      row.rows[0].id,
+      avatar
+    ]);
+  }
+}
+
 /**
  * Finds existing canonical chat or creates a clean chat entry.
  * Prevents creating duplicate recipient chat rooms when new messages arrive.
  */
 async function findOrCreateCanonicalChat(userId, rawJid, rawName, avatar = null) {
   const cleanedName = cleanText(rawName);
+  const usableName =
+    cleanedName && !isPhoneLikeName(cleanedName) && !isSystemNotificationText(cleanedName)
+      ? cleanedName
+      : '';
   const cleanedJid = cleanText(rawJid);
 
   // Only reject when BOTH identifiers look like system/junk text
@@ -140,9 +226,7 @@ async function findOrCreateCanonicalChat(userId, rawJid, rawName, avatar = null)
   );
   if (matchByJid.rows.length > 0) {
     const existing = matchByJid.rows[0];
-    if (avatar) {
-      await db.query(`UPDATE whatsapp_chats SET avatar = COALESCE($1, avatar) WHERE id = $2`, [avatar, existing.id]);
-    }
+    await updateChatNameIfBetter(userId, existing.jid, usableName || cleanedName, avatar);
     return existing.jid;
   }
 
@@ -159,8 +243,10 @@ async function findOrCreateCanonicalChat(userId, rawJid, rawName, avatar = null)
         // Upgrade fallback JID to canonical international phone JID
         await db.query(`UPDATE whatsapp_chats SET jid = $1, avatar = COALESCE($2, avatar) WHERE id = $3`, [canonicalJid, avatar, existing.id]);
         await db.query(`UPDATE whatsapp_messages SET chat_jid = $1 WHERE chat_jid = $2 AND user_id = $3`, [canonicalJid, existing.jid, userId]);
+        await updateChatNameIfBetter(userId, canonicalJid, usableName || cleanedName, avatar);
         return canonicalJid;
       }
+      await updateChatNameIfBetter(userId, existing.jid, usableName || cleanedName, avatar);
       return existing.jid;
     }
   }
@@ -174,22 +260,28 @@ async function findOrCreateCanonicalChat(userId, rawJid, rawName, avatar = null)
     );
     if (matchByName.rows.length > 0) {
       const existing = matchByName.rows[0];
-      if (avatar) {
-        await db.query(`UPDATE whatsapp_chats SET avatar = COALESCE($1, avatar) WHERE id = $2`, [avatar, existing.id]);
-      }
+      await updateChatNameIfBetter(userId, existing.jid, usableName || cleanedName, avatar);
       return existing.jid;
     }
   }
+
+  const initialName = usableName || jidLocalPart(canonicalJid);
 
   // 4. No existing match -> Insert new clean chat room
   const insertRes = await db.query(
     `INSERT INTO whatsapp_chats (user_id, jid, name, avatar) 
      VALUES ($1, $2, $3, $4) 
-     ON CONFLICT (user_id, jid) DO UPDATE SET name = EXCLUDED.name, avatar = COALESCE(EXCLUDED.avatar, whatsapp_chats.avatar)
-     RETURNING jid`,
-    [userId, canonicalJid, cleanedName || canonicalJid.split('@')[0], avatar]
+     ON CONFLICT (user_id, jid) DO UPDATE SET
+       name = CASE
+         WHEN whatsapp_chats.name IS NULL OR whatsapp_chats.name = '' THEN EXCLUDED.name
+         ELSE whatsapp_chats.name
+       END,
+       avatar = COALESCE(EXCLUDED.avatar, whatsapp_chats.avatar)
+     RETURNING jid, name`,
+    [userId, canonicalJid, initialName, avatar]
   );
 
+  await updateChatNameIfBetter(userId, insertRes.rows[0].jid, usableName || cleanedName, avatar);
   return insertRes.rows[0].jid;
 }
 
@@ -198,5 +290,7 @@ module.exports = {
   isSystemNotificationText,
   isCommonJunkMessage,
   normalizePhoneDigits,
+  isPhoneLikeName,
+  pickBetterChatName,
   findOrCreateCanonicalChat
 };
