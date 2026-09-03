@@ -3,7 +3,11 @@ require('dotenv').config();
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false }
+  ssl: process.env.DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false },
+  // Supabase Transaction-mode pooler: keep max connections low to avoid ECHECKOUTTIMEOUT.
+  max: parseInt(process.env.DB_POOL_MAX || '4', 10),
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 20000
 });
 
 const MIGRATION_LOCK_KEY = 839274651;
