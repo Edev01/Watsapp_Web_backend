@@ -4,7 +4,7 @@
   "description": "Backend API for WhatsApp Scraper web portal",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
+    "start": "node --dns-result-order=ipv4first server.js",
     "dev": "node server.js"
   },
   "dependencies": {
