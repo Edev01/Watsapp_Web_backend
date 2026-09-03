@@ -7,11 +7,35 @@ const { Pool } = require('pg');
 
 const userId = parseInt(process.argv[2] || '75', 10);
 
+/** Local scripts use direct Supabase (pooler :6543 often blocked on home networks). */
+function getScriptDatabaseUrl() {
+  if (process.env.DATABASE_URL_DIRECT) {
+    return process.env.DATABASE_URL_DIRECT;
+  }
+  if (!process.env.DATABASE_URL) {
+    return null;
+  }
+  const pooler = process.env.DATABASE_URL;
+  if (pooler.includes('db.wgiyjessxvfqmzwmwfhw.supabase.co')) {
+    return pooler;
+  }
+  const u = new URL(pooler);
+  const password = decodeURIComponent(u.password);
+  return `postgresql://postgres:${encodeURIComponent(password)}@db.wgiyjessxvfqmzwmwfhw.supabase.co:5432/postgres`;
+}
+
+const databaseUrl = getScriptDatabaseUrl();
+if (!databaseUrl) {
+  console.error('DATABASE_URL is missing. Copy .env from the backend repo or set it in your shell.');
+  process.exit(1);
+}
+
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL.includes('localhost')
+  connectionString: databaseUrl,
+  ssl: databaseUrl.includes('localhost')
     ? false
-    : { rejectUnauthorized: false }
+    : { rejectUnauthorized: false },
+  connectionTimeoutMillis: 15000
 });
 
 async function main() {
@@ -51,6 +75,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(err.message);
+  console.error('fix_phone_chat_names failed:', err.message || err);
   process.exit(1);
 });
