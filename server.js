@@ -191,13 +191,18 @@ async function claimLinkSession(userId) {
   );
 
   if (existing.rows[0]) {
-    await db.query(
-      `UPDATE whatsapp_link_sessions SET updated_at = NOW() WHERE id = $1`,
-      [existing.rows[0].id]
-    );
+    const row = existing.rows[0];
+    const ageMs = Date.now() - new Date(row.updated_at).getTime();
+    // Portal polls /api/qr/latest every few seconds — don't write every time.
+    if (!Number.isFinite(ageMs) || ageMs > 120000) {
+      await db.query(
+        `UPDATE whatsapp_link_sessions SET updated_at = NOW() WHERE id = $1`,
+        [row.id]
+      );
+      row.updated_at = new Date().toISOString();
+    }
     return {
-      ...existing.rows[0],
-      updated_at: new Date().toISOString(),
+      ...row,
       email: userCheck.rows[0].email,
       name: userCheck.rows[0].name
     };
@@ -545,11 +550,12 @@ app.post('/api/qr', async (req, res) => {
     );
 
     const qrData = result.rows[0];
-    // Keep session alive / waiting while QR is being shown
+    // Touch session only if it went stale — QR posts are frequent and Render is slow.
     await db.query(
       `UPDATE whatsapp_link_sessions
        SET status = 'waiting', updated_at = NOW()
-       WHERE user_id = $1 AND status IN ('waiting', 'linked')`,
+       WHERE user_id = $1 AND status IN ('waiting', 'linked')
+         AND updated_at < NOW() - INTERVAL '90 seconds'`,
       [userId]
     );
 
@@ -636,13 +642,21 @@ app.get('/api/qr/active-session', async (req, res) => {
 // 5a2b. Worker: list all waiting/linked sessions (multi-client)
 app.get('/api/qr/sessions', async (req, res) => {
   try {
+    const workerSlim = String(req.query.worker || '') === '1';
     const result = await db.query(
-      `SELECT s.id, s.user_id, s.status, s.created_at, s.updated_at, u.email, u.name
-       FROM whatsapp_link_sessions s
-       LEFT JOIN users u ON u.id = s.user_id
-       WHERE s.status IN ('waiting', 'linked')
-         AND s.updated_at > NOW() - INTERVAL '24 hours'
-       ORDER BY s.updated_at DESC`
+      workerSlim
+        ? `SELECT s.id, s.user_id, s.status, s.created_at, s.updated_at, u.email, u.name
+           FROM whatsapp_link_sessions s
+           LEFT JOIN users u ON u.id = s.user_id
+           WHERE s.status = 'linked'
+              OR (s.status = 'waiting' AND s.updated_at > NOW() - INTERVAL '15 minutes')
+           ORDER BY s.updated_at DESC`
+        : `SELECT s.id, s.user_id, s.status, s.created_at, s.updated_at, u.email, u.name
+           FROM whatsapp_link_sessions s
+           LEFT JOIN users u ON u.id = s.user_id
+           WHERE s.status IN ('waiting', 'linked')
+             AND s.updated_at > NOW() - INTERVAL '24 hours'
+           ORDER BY s.updated_at DESC`
     );
     const rows = result.rows.map((s) => ({
       id: s.id,
@@ -876,7 +890,7 @@ app.get('/api/qr/latest', async (req, res) => {
       `SELECT id, url, source, page_url, user_id, created_at
        FROM qr_codes
        WHERE user_id = $1
-         AND created_at > NOW() - INTERVAL '2 minutes'
+         AND created_at > NOW() - INTERVAL '5 minutes'
        ORDER BY created_at DESC
        LIMIT 1`,
       [resolvedUserId]
@@ -1063,6 +1077,7 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
     let skippedCount = 0;
     const insertErrors = [];
     let maxMessageEpoch = null;
+    const toInsert = [];
 
     for (const msg of messages) {
       const sender = (msg.sender ?? '').toString().trim();
@@ -1071,7 +1086,6 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
       const rawEpoch = msg.messageEpoch ?? msg.message_epoch ?? msg.ts_epoch;
       const messageEpoch =
         rawEpoch != null && !Number.isNaN(Number(rawEpoch)) ? Number(rawEpoch) : null;
-      // Right-side WhatsApp bubbles = from me; left-side = not me
       const rawFromMe = msg.fromMe ?? msg.from_me ?? false;
       const isFromMe =
         rawFromMe === true ||
@@ -1082,37 +1096,58 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
         skippedCount++;
         continue;
       }
-
-      // Skip common fillers (ok/hi/thanks/emoji-only/system notices)
       if (isCommonJunkMessage(messageText)) {
         skippedCount++;
         continue;
       }
+      toInsert.push({
+        sender: sender || 'unknown',
+        timestamp: timestamp || 'unknown',
+        messageText,
+        isFromMe,
+        messageEpoch
+      });
+    }
 
+    if (toInsert.length) {
       try {
+        const params = [];
+        const values = [];
+        let p = 1;
+        for (const row of toInsert) {
+          values.push(`($${p++},$${p++},$${p++},$${p++},$${p++},$${p++})`);
+          params.push(
+            userId,
+            canonicalJid,
+            row.sender,
+            row.timestamp,
+            row.messageText,
+            row.isFromMe
+          );
+        }
         const result = await db.query(
-          `INSERT INTO whatsapp_messages (user_id, chat_jid, sender, timestamp, message, from_me) 
-           VALUES ($1, $2, $3, $4, $5, $6) 
+          `INSERT INTO whatsapp_messages (user_id, chat_jid, sender, timestamp, message, from_me)
+           VALUES ${values.join(',')}
            ON CONFLICT (user_id, chat_jid, sender, timestamp, message)
            DO UPDATE SET from_me = EXCLUDED.from_me
            RETURNING id, (xmax = 0) AS inserted`,
-          [userId, canonicalJid, sender || 'unknown', timestamp || 'unknown', messageText, isFromMe]
+          params
         );
-        if (result.rowCount > 0) {
-          if (result.rows[0]?.inserted) {
-            addedCount++;
-            if (messageEpoch != null) {
-              maxMessageEpoch =
-                maxMessageEpoch == null
-                  ? messageEpoch
-                  : Math.max(maxMessageEpoch, messageEpoch);
-            }
-          } else skippedCount++; // existed; from_me may have been corrected
-        } else {
-          skippedCount++;
+        for (const r of result.rows) {
+          if (r.inserted) addedCount++;
+          else skippedCount++;
         }
+        for (const row of toInsert) {
+          if (row.messageEpoch != null) {
+            maxMessageEpoch =
+              maxMessageEpoch == null
+                ? row.messageEpoch
+                : Math.max(maxMessageEpoch, row.messageEpoch);
+          }
+        }
+        if (addedCount === 0) maxMessageEpoch = null;
       } catch (insertErr) {
-        skippedCount++;
+        skippedCount += toInsert.length;
         insertErrors.push(insertErr.message);
         console.error('Message insert error:', insertErr.message);
       }
