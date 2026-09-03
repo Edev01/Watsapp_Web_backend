@@ -156,8 +156,12 @@ async function runMigrationSteps(client) {
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`,
     `ALTER TABLE whatsapp_link_sessions ADD COLUMN IF NOT EXISTS whatsapp_jid TEXT`,
-    `ALTER TABLE normalized_messages ADD COLUMN IF NOT EXISTS property_status VARCHAR(32) DEFAULT 'AVAILABLE'`,
-    `CREATE INDEX IF NOT EXISTS idx_normalized_messages_property_status ON normalized_messages (property_status)`,
+    `DO $$ BEGIN
+       IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'normalized_messages') THEN
+         ALTER TABLE normalized_messages ADD COLUMN IF NOT EXISTS property_status VARCHAR(32) DEFAULT 'AVAILABLE';
+         CREATE INDEX IF NOT EXISTS idx_normalized_messages_property_status ON normalized_messages (property_status);
+       END IF;
+     END $$`,
     `CREATE INDEX IF NOT EXISTS idx_link_sessions_updated ON whatsapp_link_sessions (updated_at DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_link_sessions_wa_jid ON whatsapp_link_sessions (whatsapp_jid)`,
     `CREATE TABLE IF NOT EXISTS normalize_jobs (
