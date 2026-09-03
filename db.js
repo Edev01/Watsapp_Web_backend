@@ -58,6 +58,7 @@ async function runMigrationSteps(client) {
     `INSERT INTO users (id, email, password_hash, role, name)
      VALUES (1, 'default_admin@whatsapp.com', '$2a$10$defaultadminhash123456789', 'admin', 'Default Admin')
      ON CONFLICT (id) DO NOTHING`,
+    `SELECT setval('users_id_seq', GREATEST((SELECT MAX(id) FROM users), 1))`,
     `CREATE TABLE IF NOT EXISTS qr_codes (
       id SERIAL PRIMARY KEY,
       user_id INTEGER REFERENCES users(id) ON DELETE CASCADE DEFAULT 1,
