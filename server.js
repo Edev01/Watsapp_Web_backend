@@ -726,6 +726,14 @@ app.post('/api/qr/reset-waiting', async (req, res) => {
       userId,
       status: 'waiting'
     });
+    io.to(`user_${userId}`).emit('whatsapp_connection_status', {
+      userId: Number(userId),
+      status: 'waiting',
+      linked: false,
+      whatsappConnected: false,
+      whatsappJid: null,
+      message: 'WhatsApp logged out — scan QR to reconnect'
+    });
     return sendResponse(res, 200, false, { ...result.rows[0], pausedMonitoredChats: pausedCount }, 'Link session reset to waiting');
   } catch (err) {
     console.error('QR reset-waiting error:', err);
