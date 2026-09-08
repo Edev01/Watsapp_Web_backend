@@ -550,14 +550,7 @@ app.post('/api/qr', async (req, res) => {
     );
 
     const qrData = result.rows[0];
-    // Touch session only if it went stale — QR posts are frequent and Render is slow.
-    await db.query(
-      `UPDATE whatsapp_link_sessions
-       SET status = 'waiting', updated_at = NOW()
-       WHERE user_id = $1 AND status IN ('waiting', 'linked')
-         AND updated_at < NOW() - INTERVAL '90 seconds'`,
-      [userId]
-    );
+    // Do NOT update updated_at here — QR posts are automated worker outputs and must not bump human user presence.
 
     emitNewQr(userId, {
       ...qrData,
@@ -677,14 +670,44 @@ app.get('/api/qr/sessions', async (req, res) => {
 
 // 5a3. Release / clear active session
 app.post('/api/qr/release', async (req, res) => {
+  const userId = parseInt(
+    req.userId || req.body?.userId || req.body?.user_id || req.headers['x-user-id'],
+    10
+  );
   try {
-    await db.query(
-      `UPDATE whatsapp_link_sessions SET status = 'released', updated_at = NOW() WHERE status IN ('waiting', 'linked')`
-    );
-    io.emit('link_session_released', { status: 'released' });
-    return sendResponse(res, 200, false, { status: 'released' }, 'Link session released');
+    if (userId) {
+      await db.query(
+        `UPDATE whatsapp_link_sessions SET status = 'released', updated_at = NOW() WHERE user_id = $1 AND status = 'waiting'`,
+        [userId]
+      );
+      io.to(`user_${userId}`).emit('link_session_released', { status: 'released', userId });
+    } else {
+      await db.query(
+        `UPDATE whatsapp_link_sessions SET status = 'released', updated_at = NOW() WHERE status = 'waiting'`
+      );
+      io.emit('link_session_released', { status: 'released' });
+    }
+    return sendResponse(res, 200, false, { status: 'released', userId: userId || null }, 'Link session released');
   } catch (err) {
     console.error('QR release error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
+// 5a3a. User Auth Logout Endpoint
+app.post('/api/auth/logout', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user?.id;
+    if (userId) {
+      await db.query(
+        `UPDATE whatsapp_link_sessions SET status = 'released', updated_at = NOW() WHERE user_id = $1 AND status = 'waiting'`,
+        [userId]
+      );
+      io.to(`user_${userId}`).emit('link_session_released', { status: 'released', userId });
+    }
+    return sendResponse(res, 200, false, null, 'Logged out successfully');
+  } catch (err) {
+    console.error('Logout error:', err);
     return sendResponse(res, 500, true, null, err.message || 'Server error');
   }
 });
