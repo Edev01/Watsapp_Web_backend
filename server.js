@@ -1385,7 +1385,12 @@ app.get('/api/scraped-chats/stats', async (req, res) => {
       `SELECT
          COUNT(*)::int AS total,
          COUNT(*) FILTER (WHERE is_monitored = TRUE)::int AS monitored,
-         COUNT(*) FILTER (WHERE is_monitored = FALSE)::int AS unmonitored
+         COUNT(*) FILTER (WHERE is_monitored = FALSE)::int AS unmonitored,
+         (
+           SELECT COUNT(*)::int
+           FROM whatsapp_messages m
+           WHERE m.user_id = $1
+         ) AS messages
        FROM whatsapp_chats
        WHERE user_id = $1`,
       [userId]
