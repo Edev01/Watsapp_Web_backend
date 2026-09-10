@@ -177,7 +177,22 @@ async function runMigrationSteps(client) {
       last_error TEXT,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`,
-    `CREATE INDEX IF NOT EXISTS idx_normalize_jobs_status ON normalize_jobs (status)`
+    `CREATE INDEX IF NOT EXISTS idx_normalize_jobs_status ON normalize_jobs (status)`,
+    `CREATE TABLE IF NOT EXISTS complaints (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      name VARCHAR(255) NOT NULL,
+      email VARCHAR(255) NOT NULL,
+      phone VARCHAR(50),
+      message TEXT NOT NULL,
+      status VARCHAR(50) NOT NULL DEFAULT 'submitted',
+      email_sent BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_complaints_user_id ON complaints (user_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_complaints_status ON complaints (status)`,
+    `CREATE INDEX IF NOT EXISTS idx_complaints_created_at ON complaints (created_at DESC)`
   ];
 
   for (const sql of steps) {

@@ -19,6 +19,9 @@ const {
   notifyNormalizeBot,
   buildStatusPayload
 } = require('./normalizeHelper');
+const { sendComplaintEmail } = require('./mailHelper');
+
+const COMPLAINT_STATUSES = ['submitted', 'read', 'reviewing', 'in_progress', 'resolved'];
 
 const http = require('http');
 const { Server } = require('socket.io');
@@ -2030,6 +2033,163 @@ app.post('/api/normalize/trigger', authenticateToken, async (req, res) => {
     return sendResponse(res, alreadyActive ? 200 : 202, false, payload, message);
   } catch (err) {
     console.error('Normalize trigger error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
+// ── Complaints ──────────────────────────────────────────────────────────────
+
+const mapComplaintRow = (row) => ({
+  id: row.id,
+  userId: row.user_id,
+  user_id: row.user_id,
+  name: row.name,
+  email: row.email,
+  phone: row.phone || '',
+  message: row.message,
+  status: row.status,
+  emailSent: Boolean(row.email_sent),
+  createdAt: row.created_at,
+  updatedAt: row.updated_at,
+  userAccountEmail: row.user_account_email || null,
+  userAccountName: row.user_account_name || null,
+});
+
+// POST /api/complaints — logged-in user submits a complaint (saved + emailed)
+app.post('/api/complaints', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user?.id || req.userId;
+    const name = String(req.body?.name || '').trim();
+    const email = String(req.body?.email || '').trim();
+    const phone = String(req.body?.phone || req.body?.phone_number || '').trim();
+    const message = String(req.body?.message || '').trim();
+
+    if (!name || !email || !message) {
+      return sendResponse(res, 400, true, null, 'Name, email, and message are required');
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return sendResponse(res, 400, true, null, 'A valid email is required');
+    }
+
+    const inserted = await db.query(
+      `INSERT INTO complaints (user_id, name, email, phone, message, status, email_sent)
+       VALUES ($1, $2, $3, $4, $5, 'submitted', FALSE)
+       RETURNING id, user_id, name, email, phone, message, status, email_sent, created_at, updated_at`,
+      [userId || null, name, email, phone || null, message]
+    );
+
+    const row = inserted.rows[0];
+    let emailSent = false;
+    let emailNote = null;
+
+    try {
+      const mailResult = await sendComplaintEmail({
+        name,
+        email,
+        phone,
+        message,
+        complaintId: row.id,
+      });
+      emailSent = Boolean(mailResult?.sent);
+      emailNote = mailResult?.reason || null;
+      if (emailSent) {
+        await db.query(
+          `UPDATE complaints SET email_sent = TRUE, updated_at = NOW() WHERE id = $1`,
+          [row.id]
+        );
+        row.email_sent = true;
+      }
+    } catch (mailErr) {
+      console.error('Complaint email failed:', mailErr.message);
+      emailNote = mailErr.message || 'Email send failed';
+    }
+
+    return sendResponse(
+      res,
+      201,
+      false,
+      { ...mapComplaintRow(row), emailNote },
+      emailSent
+        ? 'Complaint submitted and email sent'
+        : 'Complaint submitted (email pending / not configured)'
+    );
+  } catch (err) {
+    console.error('Create complaint error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
+// GET /api/complaints — user: own complaints; admin: all
+app.get('/api/complaints', authenticateToken, async (req, res) => {
+  try {
+    const isAdminUser = String(req.user?.role || '').toLowerCase() === 'admin';
+    const userId = req.user?.id;
+
+    const result = isAdminUser
+      ? await db.query(
+          `SELECT c.id, c.user_id, c.name, c.email, c.phone, c.message, c.status, c.email_sent,
+                  c.created_at, c.updated_at, u.email AS user_account_email, u.name AS user_account_name
+           FROM complaints c
+           LEFT JOIN users u ON u.id = c.user_id
+           ORDER BY c.created_at DESC`
+        )
+      : await db.query(
+          `SELECT c.id, c.user_id, c.name, c.email, c.phone, c.message, c.status, c.email_sent,
+                  c.created_at, c.updated_at, u.email AS user_account_email, u.name AS user_account_name
+           FROM complaints c
+           LEFT JOIN users u ON u.id = c.user_id
+           WHERE c.user_id = $1
+           ORDER BY c.created_at DESC`,
+          [userId]
+        );
+
+    return sendResponse(
+      res,
+      200,
+      false,
+      result.rows.map(mapComplaintRow),
+      'Complaints retrieved'
+    );
+  } catch (err) {
+    console.error('List complaints error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
+// PATCH /api/complaints/:id/status — admin updates status (visible on user portal)
+app.patch('/api/complaints/:id/status', authenticateToken, isAdmin, async (req, res) => {
+  try {
+    const complaintId = parseInt(req.params.id, 10);
+    const status = String(req.body?.status || '').trim().toLowerCase();
+
+    if (!complaintId || Number.isNaN(complaintId)) {
+      return sendResponse(res, 400, true, null, 'Valid complaint id is required');
+    }
+    if (!COMPLAINT_STATUSES.includes(status)) {
+      return sendResponse(
+        res,
+        400,
+        true,
+        null,
+        `Status must be one of: ${COMPLAINT_STATUSES.join(', ')}`
+      );
+    }
+
+    const result = await db.query(
+      `UPDATE complaints
+       SET status = $1, updated_at = NOW()
+       WHERE id = $2
+       RETURNING id, user_id, name, email, phone, message, status, email_sent, created_at, updated_at`,
+      [status, complaintId]
+    );
+
+    if (!result.rows[0]) {
+      return sendResponse(res, 404, true, null, 'Complaint not found');
+    }
+
+    return sendResponse(res, 200, false, mapComplaintRow(result.rows[0]), 'Complaint status updated');
+  } catch (err) {
+    console.error('Update complaint status error:', err);
     return sendResponse(res, 500, true, null, err.message || 'Server error');
   }
 });
