@@ -65,6 +65,43 @@ function emitQrDisappeared(userId, payload = {}) {
   io.to(`user_${uid}`).emit('qr_cleared', data);
 }
 
+/** Push session start/stop to the Baileys worker ( Contabo / local ). Worker also polls claims. */
+async function notifyWorker(userId, action = 'start') {
+  const base = String(process.env.WORKER_BASE_URL || '').replace(/\/$/, '');
+  const key = process.env.WORKER_API_KEY || '';
+  const uid = Number(userId);
+  if (!base || !uid) return { skipped: true };
+
+  const path =
+    action === 'stop'
+      ? `/sessions/${uid}/stop`
+      : action === 'fresh-qr'
+        ? `/sessions/${uid}/fresh-qr`
+        : `/sessions/${uid}/start`;
+
+  try {
+    const res = await fetch(`${base}${path}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': key
+      },
+      body: action === 'stop' ? JSON.stringify({ logout: false }) : undefined,
+      signal: AbortSignal.timeout(20000)
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      console.warn(`[worker] ${action} user=${uid} failed: ${res.status} ${text.slice(0, 160)}`);
+      return { ok: false, status: res.status };
+    }
+    console.log(`[worker] ${action} user=${uid} ok`);
+    return { ok: true };
+  } catch (err) {
+    console.warn(`[worker] ${action} user=${uid} error:`, err.message);
+    return { ok: false, error: err.message };
+  }
+}
+
 function normalizeWaPhone(jidOrPhone) {
   if (!jidOrPhone) return '';
   const bare = String(jidOrPhone).split('@')[0].split(':')[0];
@@ -301,6 +338,10 @@ io.on('connection', (socket) => {
             boundPhone
           });
           console.log(`Auto-claimed link session for user_${userId} status=${session.status}`);
+          // Wake Baileys worker immediately so QR appears over Socket.IO without waiting for poll
+          if (session.status === 'waiting' || session.status === 'linked') {
+            notifyWorker(userId, 'start').catch(() => {});
+          }
         }
       } catch (err) {
         console.error('Auto-claim on join_user_room failed:', err.message);
@@ -589,6 +630,10 @@ app.post('/api/qr/claim', async (req, res) => {
     io.emit('link_session_claimed', session);
     io.to(`user_${userId}`).emit('link_session_claimed', session);
 
+    if (session.status === 'waiting' || session.status === 'linked') {
+      notifyWorker(userId, 'start').catch(() => {});
+    }
+
     return sendResponse(res, 200, false, session, 'QR link session claimed for this user');
   } catch (err) {
     console.error('QR claim error:', err);
@@ -684,6 +729,7 @@ app.post('/api/qr/release', async (req, res) => {
         [userId]
       );
       io.to(`user_${userId}`).emit('link_session_released', { status: 'released', userId });
+      notifyWorker(userId, 'stop').catch(() => {});
     } else {
       await db.query(
         `UPDATE whatsapp_link_sessions SET status = 'released', updated_at = NOW() WHERE status = 'waiting'`
@@ -1451,12 +1497,20 @@ app.get('/api/realtors', async (req, res) => {
 // If no chat filter is provided, returns all messages for the user (multi-tenant safe).
 app.get('/api/scraped-chats/messages', async (req, res) => {
   const userId = req.userId || req.query.userId || req.query.user_id || 1;
-  const { chatId, jid, name, limit, offset } = req.query;
+  const { chatId, jid, name, limit, offset, countOnly } = req.query;
   const targetId = chatId || jid;
   const pageLimit = Math.min(parseInt(limit, 10) || 5000, 10000);
   const pageOffset = Math.max(parseInt(offset, 10) || 0, 0);
 
   try {
+    if (countOnly === '1' || countOnly === 'true') {
+      const result = await db.query(
+        'SELECT COUNT(*)::int AS count FROM whatsapp_messages WHERE user_id = $1',
+        [userId]
+      );
+      return sendResponse(res, 200, false, result.rows[0], 'Message count retrieved');
+    }
+
     let result;
     if (targetId) {
       result = await db.query(
@@ -1706,7 +1760,7 @@ app.get('/api/ml/dataset', async (req, res) => {
 });
 
 // 14. Property Filter Endpoint (Supports POST/GET /api/properties/filter and /api/properties)
-const handlePropertyFilter = async (req, res) => {
+const runPropertySearch = async (req) => {
   try {
     const rawFilters = req.body?.filters || req.body || {};
     const queryFilters = req.query || {};
@@ -1714,7 +1768,7 @@ const handlePropertyFilter = async (req, res) => {
     const filters = {
       purpose: rawFilters.purpose || queryFilters.purpose || '',
       city: rawFilters.city || queryFilters.city || '',
-      location: rawFilters.location || queryFilters.location || rawFilters.vicinity || queryFilters.vicinity || rawFilters.area || queryFilters.area || '',
+      location: rawFilters.location || queryFilters.location || rawFilters.query || queryFilters.query || rawFilters.vicinity || queryFilters.vicinity || rawFilters.area || queryFilters.area || '',
       propertyType: rawFilters.propertyType || queryFilters.propertyType || rawFilters.property_type || queryFilters.property_type || '',
       propertySubType: rawFilters.propertySubType || queryFilters.propertySubType || rawFilters.property_sub_type || queryFilters.property_sub_type || '',
       sortBy: rawFilters.sortBy || queryFilters.sortBy || rawFilters.sort_by || queryFilters.sort_by || 'Newest First',
@@ -1803,12 +1857,24 @@ const handlePropertyFilter = async (req, res) => {
     queryText += ' ORDER BY n.id DESC';
 
     const dbResult = await db.query(queryText, params);
-    const properties = filterAndSortProperties(dbResult.rows, filters);
+    return {
+      filters,
+      userId,
+      properties: filterAndSortProperties(dbResult.rows, filters)
+    };
+  } catch (err) {
+    err.searchContext = 'runPropertySearch';
+    throw err;
+  }
+};
 
+const handlePropertyFilter = async (req, res) => {
+  try {
+    const { filters, properties } = await runPropertySearch(req);
     return sendResponse(res, 200, false, {
       total: properties.length,
-      filters: filters,
-      properties: properties
+      filters,
+      properties
     }, 'Properties retrieved successfully');
   } catch (err) {
     console.error('Property filter error:', err);
@@ -1816,10 +1882,53 @@ const handlePropertyFilter = async (req, res) => {
   }
 };
 
+function toDashboardSearchResult(p) {
+  return {
+    message_id: p.whatsappMessageId || p.id,
+    raw_message: p.rawMessage || p.raw_message || '',
+    summary: p.summary || '',
+    city: p.city || '',
+    area: p.area || '',
+    vicinity: p.vicinity || '',
+    property_type: p.propertyType || p.property_type || '',
+    property_sub_type: p.propertySubType || p.property_sub_type || null,
+    purpose: p.purpose || '',
+    size: p.size || '',
+    size_value: p.parsedAreaInTargetUnit ?? p.size_value ?? null,
+    size_unit: p.targetAreaUnit || p.size_unit || '',
+    price: p.price || '',
+    price_value: p.parsedPricePKR ?? p.price_value ?? null,
+    contact_number: p.contactNumber || p.contact_number || '',
+    category: p.category || '',
+    intent: p.intent || '',
+    sentiment: p.sentiment || '',
+    created_at: p.createdAt || p.created_at,
+    property_status: p.propertyStatus || p.property_status || 'AVAILABLE',
+    similarity_score: p.similarityScore || p.similarity_score || null
+  };
+}
+
+/** Same JSON shape the portal expects from FastAPI POST /api/dashboard-search */
+const handleDashboardSearch = async (req, res) => {
+  try {
+    const { properties } = await runPropertySearch(req);
+    const results = properties.map(toDashboardSearchResult);
+    return res.json({ success: true, count: results.length, results });
+  } catch (err) {
+    console.error('Dashboard search error:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Server error', results: [] });
+  }
+};
+
 app.post('/api/properties/filter', handlePropertyFilter);
 app.get('/api/properties/filter', handlePropertyFilter);
 app.post('/api/properties', handlePropertyFilter);
 app.get('/api/properties', handlePropertyFilter);
+
+['/api/dashboard-search', '/ml-api/api/dashboard-search', '/ml-api/dashboard-search'].forEach((path) => {
+  app.post(path, handleDashboardSearch);
+  app.get(path, handleDashboardSearch);
+});
 
 /** Allowed property listing statuses */
 app.get('/api/properties/statuses', (req, res) => {
@@ -2206,7 +2315,19 @@ app.get('/', (req, res) => {
   } catch (err) {
     console.error('Database init failed on startup:', err.message);
   }
+
   server.listen(PORT, () => {
     console.log(`Server is running on port ${PORT}`);
   });
+
+  const mlCompatPort = parseInt(process.env.ML_COMPAT_PORT || '8000', 10);
+  if (mlCompatPort && mlCompatPort !== Number(PORT)) {
+    const mlServer = http.createServer(app);
+    mlServer.on('error', (err) => {
+      console.warn(`[ml-compat] port ${mlCompatPort} not bound:`, err.message);
+    });
+    mlServer.listen(mlCompatPort, '0.0.0.0', () => {
+      console.log(`ML-compat dashboard-search listening on port ${mlCompatPort}`);
+    });
+  }
 })();
