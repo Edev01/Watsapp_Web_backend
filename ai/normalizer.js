@@ -1,6 +1,7 @@
 const db = require('../db');
 const { getConfig } = require('./config');
-const { LLMClient } = require('./llmClient');
+const { LLMClient, expandListingSchemas } = require('./llmClient');
+const { splitPropertyOffers, extractSharedContacts } = require('./listingSplitter');
 const {
   loadSkippedIds,
   logNormalizationFailure,
@@ -114,7 +115,9 @@ async function releaseClaim(messageId, modelName) {
 }
 
 async function saveNormalized(job, schema, targetModel) {
-  const isProp = Boolean(schema.is_property_listing_or_inquiry);
+  const listingRows = expandListingSchemas(schema);
+  if (!listingRows.length) return 0;
+
   const entities = schema.entities || {
     products: [],
     dates_mentioned: [],
@@ -122,45 +125,60 @@ async function saveNormalized(job, schema, targetModel) {
     names: []
   };
 
+  // Replace prior rows for this message+model so re-runs can split multi-listings
   await db.query(
-    `INSERT INTO normalized_messages (
-       whatsapp_message_id, chat_jid, sender, category, intent, sentiment, language,
-       summary, entities, city, is_property, purpose, property_type, property_sub_type,
-       area, vicinity, size, size_value, size_unit, price, price_value, contact_number,
-       confidence_score, model_used, created_at
-     ) VALUES (
-       $1,$2,$3,$4,$5,$6,$7,
-       $8,$9::jsonb,$10,$11,$12,$13,$14,
-       $15,$16,$17,$18,$19,$20,$21,$22,
-       $23,$24,NOW()
-     )`,
-    [
-      job.id,
-      job.chat_jid,
-      job.sender,
-      schema.category,
-      schema.intent,
-      schema.sentiment,
-      schema.language,
-      schema.summary,
-      JSON.stringify(entities),
-      isProp ? schema.city : null,
-      isProp,
-      isProp ? schema.purpose : null,
-      isProp ? schema.property_type : null,
-      isProp ? schema.property_sub_type : null,
-      isProp ? schema.area : null,
-      isProp ? schema.vicinity : null,
-      isProp ? schema.size : null,
-      isProp ? schema.size_value : null,
-      isProp ? schema.size_unit : null,
-      isProp ? schema.price : null,
-      isProp ? schema.price_value : null,
-      isProp ? schema.contact_number : null,
-      schema.confidence_score,
-      targetModel
-    ]
+    `DELETE FROM normalized_messages
+     WHERE whatsapp_message_id = $1 AND model_used = $2`,
+    [job.id, targetModel]
   );
+
+  let saved = 0;
+  for (const row of listingRows) {
+    const isProp = Boolean(row.is_property_listing_or_inquiry);
+    await db.query(
+      `INSERT INTO normalized_messages (
+         whatsapp_message_id, chat_jid, sender, category, intent, sentiment, language,
+         summary, entities, city, is_property, purpose, property_type, property_sub_type,
+         area, vicinity, size, size_value, size_unit, price, price_value, contact_number,
+         confidence_score, model_used, listing_index, listing_excerpt, created_at
+       ) VALUES (
+         $1,$2,$3,$4,$5,$6,$7,
+         $8,$9::jsonb,$10,$11,$12,$13,$14,
+         $15,$16,$17,$18,$19,$20,$21,$22,
+         $23,$24,$25,$26,NOW()
+       )`,
+      [
+        job.id,
+        job.chat_jid,
+        job.sender,
+        row.category,
+        row.intent,
+        row.sentiment,
+        row.language,
+        row.summary,
+        JSON.stringify(entities),
+        isProp ? row.city : null,
+        isProp,
+        isProp ? row.purpose : null,
+        isProp ? row.property_type : null,
+        isProp ? row.property_sub_type : null,
+        isProp ? row.area : null,
+        isProp ? row.vicinity : null,
+        isProp ? row.size : null,
+        isProp ? row.size_value : null,
+        isProp ? row.size_unit : null,
+        isProp ? row.price : null,
+        isProp ? row.price_value : null,
+        isProp ? row.contact_number : null,
+        row.confidence_score,
+        targetModel,
+        Number(row.listing_index) || 0,
+        row.listing_excerpt ? String(row.listing_excerpt).slice(0, 2000) : null
+      ]
+    );
+    saved += 1;
+  }
+  return saved;
 }
 
 async function loadPendingJobs(targetModel, userId, window) {
@@ -219,6 +237,66 @@ async function loadPendingJobs(targetModel, userId, window) {
 
 async function normalizeOne(job, llmClient, targetModel) {
   try {
+    const sharedContact = extractSharedContacts(job.message);
+    const chunks = splitPropertyOffers(job.message);
+    const useChunks = chunks.length >= 2;
+
+    let listingSchemas = [];
+
+    if (useChunks) {
+      // Normalize each offer slice separately (reliable for agent multi-dumps)
+      for (let i = 0; i < chunks.length; i += 1) {
+        const chunk = chunks[i];
+        const result = await llmClient.normalizeMessage(chunk, job.sender, targetModel);
+        if (!result.isValid || !result.schema) {
+          console.warn(
+            `[ai] Chunk ${i + 1}/${chunks.length} failed for message ${job.id}: ${(result.errorReason || '').slice(0, 120)}`
+          );
+          continue;
+        }
+        const rows = expandListingSchemas(result.schema);
+        for (const row of rows) {
+          row.listing_excerpt = chunk.slice(0, 2000);
+          row.listing_index = listingSchemas.length;
+          if (!row.contact_number && sharedContact) row.contact_number = sharedContact;
+          // Prefer SALE/RENT from chunk; keep is_property true if chunk looks like a listing
+          if (row.is_property_listing_or_inquiry == null) {
+            row.is_property_listing_or_inquiry = true;
+          }
+          listingSchemas.push(row);
+        }
+      }
+      if (!listingSchemas.length) {
+        return { id: job.id, ok: false };
+      }
+      // Wrap as synthetic schema for saveNormalized
+      const envelope = {
+        ...listingSchemas[0],
+        is_property_listing_or_inquiry: true,
+        listings: listingSchemas.map((r) => ({
+          purpose: r.purpose,
+          property_type: r.property_type,
+          property_sub_type: r.property_sub_type,
+          city: r.city,
+          area: r.area,
+          vicinity: r.vicinity,
+          size: r.size,
+          size_value: r.size_value,
+          size_unit: r.size_unit,
+          price: r.price,
+          price_value: r.price_value,
+          contact_number: r.contact_number || sharedContact,
+          summary: r.summary,
+          listing_excerpt: r.listing_excerpt
+        }))
+      };
+      const saved = await saveNormalized(job, envelope, targetModel);
+      console.info(
+        `[ai] Message ${job.id} (user ${tenantId(job.user_id)}) split → ${saved} listing(s) from ${chunks.length} chunks`
+      );
+      return { id: job.id, ok: true, listings: saved };
+    }
+
     const result = await llmClient.normalizeMessage(
       job.message,
       job.sender,
@@ -226,11 +304,19 @@ async function normalizeOne(job, llmClient, targetModel) {
     );
 
     if (result.isValid && result.schema) {
-      await saveNormalized(job, result.schema, targetModel);
+      if (sharedContact && Array.isArray(result.schema.listings)) {
+        for (const L of result.schema.listings) {
+          if (L && !L.contact_number) L.contact_number = sharedContact;
+        }
+      }
+      if (sharedContact && !result.schema.contact_number) {
+        result.schema.contact_number = sharedContact;
+      }
+      const saved = await saveNormalized(job, result.schema, targetModel);
       console.info(
-        `[ai] Message ${job.id} (user ${tenantId(job.user_id)}) normalized in ${result.latency.toFixed(2)}s`
+        `[ai] Message ${job.id} (user ${tenantId(job.user_id)}) → ${saved} listing(s) in ${result.latency.toFixed(2)}s`
       );
-      return { id: job.id, ok: true };
+      return { id: job.id, ok: true, listings: saved };
     }
 
     const reason = result.errorReason || 'Unknown parse/validation failure';

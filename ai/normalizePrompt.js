@@ -5,7 +5,7 @@ Your task is to analyze the given WhatsApp message and extract structured inform
 JSON Schema format required:
 {
   "is_property_listing_or_inquiry": true or false,
-  "summary": "Concise 1-2 sentence summary of the message context",
+  "summary": "Concise 1-2 sentence overview of the whole message",
   "category": "INQUIRY | SUPPORT | SALES | COMPLAINT | GENERAL | SPAM",
   "intent": "Short summary of user's core intent or query",
   "sentiment": "POSITIVE | NEUTRAL | NEGATIVE",
@@ -21,6 +21,24 @@ JSON Schema format required:
   "price": "Price mentioned, e.g. 15 Crore, 45,000 / month, 1.8 Cr or null",
   "price_value": 15000000,
   "contact_number": "Phone number(s) mentioned in message, or null",
+  "listings": [
+    {
+      "purpose": "SALE | RENT or null",
+      "property_type": "PLOT | HOUSE | ... or null",
+      "property_sub_type": "... or null",
+      "city": "... or null",
+      "area": "... or null",
+      "vicinity": "... or null",
+      "size": "... or null",
+      "size_value": 100,
+      "size_unit": "Sq. Yd. or null",
+      "price": "Price for THIS offer only, or null if Demand?/on call",
+      "price_value": null,
+      "contact_number": "phones or null",
+      "summary": "1 sentence about THIS offer only",
+      "listing_excerpt": "Exact text slice from the message for THIS offer only"
+    }
+  ],
   "entities": {
     "products": [],
     "dates_mentioned": [],
@@ -42,15 +60,21 @@ Rules:
    - NEVER use "BUY" - use "SALE" instead
 6. Location hierarchy:
    - "area" = Major housing society/neighborhood (DHA, Bahria Town, Clifton, North Nazimabad, etc.)
-   - "vicinity" = Sub-location (Phase 6, Block H, Scheme 33, etc.)
+   - "vicinity" = Sub-location (Phase 6, Block H, Scheme 33, Street 3, etc.)
 7. Normalize city names: "Karachi", "Lahore", "Islamabad", "Rawalpindi", "Faisalabad", etc.
 8. Handle spelling variations: "Cliftn" -> "Clifton", "Krachi" -> "Karachi"
-9. CRITICAL NUMERIC RULES (multi-listing messages):
-   - size_value MUST be a single number or null. NEVER an array. NEVER "500, 568".
-   - price_value MUST be a single number or null. NEVER an array.
-   - If the message has multiple properties, extract the FIRST/primary listing only for size_value, price_value, property_type, area, vicinity.
+9. CRITICAL NUMERIC RULES:
+   - size_value and price_value MUST be a single number or null. NEVER an array.
    - property_type must be ONE value (e.g. "HOUSE"), never "HOUSE | PLOT".
    - intent must always be a string (use "" if none), never null.
+   - If price is missing, "Demand?", "on call", or "Price on Call" → price=null and price_value=null. NEVER invent a price from phone numbers.
+10. MULTI-LISTING RULES (CRITICAL):
+   - Agent broadcast messages often pack MANY separate offers in one WhatsApp message.
+   - If there are 2+ distinct property offers, put EACH offer in "listings" (max 15).
+   - Each listings[] item MUST have its own size/location/price/summary and a "listing_excerpt" copied from the message for that offer only (do not paste the whole message).
+   - Top-level purpose/property_type/city/area/vicinity/size/price/contact_number MUST mirror the FIRST listing (backward compatible).
+   - If only one property offer exists, set "listings" to a one-element array OR omit listings (top-level fields are enough).
+   - Do NOT merge different streets/sizes into one listing.
 `;
 
 const CATEGORIES = new Set([

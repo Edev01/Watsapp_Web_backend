@@ -233,11 +233,35 @@ function expandLocationQuery(raw) {
 
 /**
  * Parses real estate price strings (e.g. "PKR 1.8 Cr", "85 Lac", "45,000 / month", "15000000") into numeric PKR.
+ * Never treats Pakistani mobile numbers (03XXXXXXXXX) as prices — that caused fake "322 Cr" demands.
  */
+function isLikelyPhoneNumber(digits) {
+  const d = String(digits || '').replace(/\D/g, '');
+  if (!d) return false;
+  // 03XXXXXXXXX (11), 923XXXXXXXXX (12), or 3XXXXXXXXX (10) mobile shapes
+  if (/^03\d{9}$/.test(d)) return true;
+  if (/^923\d{9}$/.test(d)) return true;
+  if (/^3\d{9}$/.test(d)) return true;
+  return false;
+}
+
 function parsePriceInPKR(priceStr, rawMsg) {
-  const sourceStr = priceStr || '';
-  if (!sourceStr && !rawMsg) return null;
-  const str = String(sourceStr || rawMsg).toLowerCase().replace(/,/g, '').trim();
+  const explicit = String(priceStr || '').trim();
+  // Prefer the structured price field; only fall back to raw text when needed
+  const primary = explicit && !/^(null|n\/?a|none|price on call|on call|call|demand\?+)$/i.test(explicit)
+    ? explicit
+    : '';
+  const source = primary || String(rawMsg || '');
+  if (!source) return null;
+
+  const str = source.toLowerCase().replace(/,/g, '').trim();
+
+  // When scanning raw WhatsApp text, require a price cue so phone digits are not used
+  const scanningRaw = !primary && Boolean(rawMsg);
+  if (scanningRaw) {
+    const hasPriceCue = /(?:\b(?:cr|crore|cror|crores|lac|lacs|lakh|lakhs|million|price|demand|pkr|rs\.?)\b|\b\d+(?:\.\d+)?\s*(?:cr|lac|lakh))/i.test(str);
+    if (!hasPriceCue) return null;
+  }
 
   let total = 0;
   let matchedAny = false;
@@ -256,11 +280,13 @@ function parsePriceInPKR(priceStr, rawMsg) {
     matchedAny = true;
   }
 
-  // K / Thousand
-  let kMatch = str.match(/(\d+(?:\.\d+)?)\s*(?:k|thousand)\b/i);
-  if (kMatch) {
-    total += parseFloat(kMatch[1]) * 1000;
-    matchedAny = true;
+  // K / Thousand (only with explicit price field, not raw "75" frontage etc.)
+  if (primary) {
+    let kMatch = str.match(/(\d+(?:\.\d+)?)\s*(?:k|thousand)\b/i);
+    if (kMatch) {
+      total += parseFloat(kMatch[1]) * 1000;
+      matchedAny = true;
+    }
   }
 
   if (matchedAny) return total;
@@ -268,13 +294,16 @@ function parsePriceInPKR(priceStr, rawMsg) {
   // Direct currency format: PKR 45000, Rs. 150000
   let pkrMatch = str.match(/(?:pkr|rs\.?|\$)\s*(\d+(?:\.\d+)?)/i);
   if (pkrMatch) {
-    return parseFloat(pkrMatch[1]);
+    const n = parseFloat(pkrMatch[1]);
+    if (!isLikelyPhoneNumber(String(Math.trunc(n)))) return n;
   }
 
-  // Pure digits: 15000000, 45000
-  let digitMatch = str.match(/(\d{5,})/);
-  if (digitMatch) {
-    return parseFloat(digitMatch[1]);
+  // Pure digits only from explicit price field (never from raw message — phones live there)
+  if (primary) {
+    let digitMatch = str.match(/(\d{5,})/);
+    if (digitMatch && !isLikelyPhoneNumber(digitMatch[1])) {
+      return parseFloat(digitMatch[1]);
+    }
   }
 
   return null;
@@ -346,20 +375,28 @@ function collapseRepeatedText(raw) {
  * Collapse doubled paste ("hellohello") and whitespace so duplicate scrapes match.
  */
 function listingFingerprint(row) {
-  const raw = collapseRepeatedText(row.rawMessage || row.raw_message || row.summary || '');
-  return [raw.slice(0, 200), String(row.purpose || '').toLowerCase()].join('|');
+  const raw = collapseRepeatedText(
+    row.listing_excerpt || row.rawMessage || row.raw_message || row.summary || ''
+  );
+  return [
+    raw.slice(0, 200),
+    String(row.purpose || '').toLowerCase(),
+    String(row.size || ''),
+    String(row.vicinity || row.area || ''),
+    String(row.listing_index ?? row.listingIndex ?? '')
+  ].join('|');
 }
 
 function dedupeListings(items) {
-  const seenMsg = new Set();
+  const seenId = new Set();
   const seenFp = new Set();
   const out = [];
   for (const item of items) {
-    const mid = item.whatsappMessageId || item.whatsapp_message_id;
-    if (mid != null) {
-      const key = String(mid);
-      if (seenMsg.has(key)) continue;
-      seenMsg.add(key);
+    // Each normalized listing row is unique (multi-offers share whatsapp_message_id)
+    if (item.id != null) {
+      const key = `id:${item.id}`;
+      if (seenId.has(key)) continue;
+      seenId.add(key);
     }
     const fp = listingFingerprint(item);
     if (fp && seenFp.has(fp)) continue;
@@ -378,6 +415,7 @@ function filterAndSortProperties(rawRows, filters = {}) {
     return {
       id: r.id,
       whatsappMessageId: r.whatsapp_message_id,
+      listingIndex: r.listing_index ?? 0,
       chatJid: r.chat_jid,
       chatName: r.chat_name,
       sender: r.sender,
@@ -398,6 +436,7 @@ function filterAndSortProperties(rawRows, filters = {}) {
       propertyStatus: (r.property_status || 'AVAILABLE').toUpperCase(),
       property_status: (r.property_status || 'AVAILABLE').toUpperCase(),
       rawMessage: r.raw_message,
+      listingExcerpt: r.listing_excerpt || null,
       fromMe: r.from_me || r.fromMe || false,
       from_me: r.from_me || r.fromMe || false,
       userId: r.user_id || 1,

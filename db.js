@@ -161,7 +161,10 @@ async function runMigrationSteps(client) {
        IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'normalized_messages') THEN
          BEGIN
            ALTER TABLE normalized_messages ADD COLUMN IF NOT EXISTS property_status VARCHAR(32) DEFAULT 'AVAILABLE';
+           ALTER TABLE normalized_messages ADD COLUMN IF NOT EXISTS listing_index INTEGER DEFAULT 0;
+           ALTER TABLE normalized_messages ADD COLUMN IF NOT EXISTS listing_excerpt TEXT;
            CREATE INDEX IF NOT EXISTS idx_normalized_messages_property_status ON normalized_messages (property_status);
+           CREATE INDEX IF NOT EXISTS idx_nm_message_listing ON normalized_messages (whatsapp_message_id, listing_index);
          EXCEPTION WHEN insufficient_privilege THEN
            RAISE NOTICE 'skip normalized_messages DDL: not table owner';
          END;

@@ -122,14 +122,8 @@ function firstNumber(value) {
   return null;
 }
 
-function coerceLlmDict(data) {
-  if (!data || typeof data !== 'object' || Array.isArray(data)) {
-    return data;
-  }
-
-  for (const key of ['summary', 'intent', 'language']) {
-    if (data[key] == null) data[key] = '';
-  }
+function coerceListingFields(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return data;
 
   const purpose = data.purpose;
   if (typeof purpose === 'string') {
@@ -160,6 +154,21 @@ function coerceLlmDict(data) {
   data.size_value = firstNumber(data.size_value);
   data.price_value = firstNumber(data.price_value);
 
+  // Never keep invented prices that are clearly phone numbers
+  if (data.price_value != null) {
+    const digits = String(Math.trunc(Number(data.price_value)));
+    if (/^03?\d{9}$/.test(digits) || /^923\d{9}$/.test(digits)) {
+      data.price_value = null;
+      if (!data.price || /demand\?|on call|price on call/i.test(String(data.price))) {
+        data.price = null;
+      }
+    }
+  }
+  if (data.price != null && /^(demand\?+|on call|price on call|call|n\/?a|null)$/i.test(String(data.price).trim())) {
+    data.price = null;
+    data.price_value = null;
+  }
+
   let sunit = data.size_unit;
   if (Array.isArray(sunit) && sunit.length) {
     data.size_unit = String(sunit[0]);
@@ -172,6 +181,36 @@ function coerceLlmDict(data) {
     data.contact_number = contact.filter(Boolean).map(String).join(', ') || null;
   } else if (contact != null && typeof contact !== 'string') {
     data.contact_number = String(contact);
+  }
+
+  if (data.summary != null && typeof data.summary !== 'string') {
+    data.summary = String(data.summary);
+  }
+  if (data.listing_excerpt != null && typeof data.listing_excerpt !== 'string') {
+    data.listing_excerpt = String(data.listing_excerpt);
+  }
+
+  return data;
+}
+
+function coerceLlmDict(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    return data;
+  }
+
+  for (const key of ['summary', 'intent', 'language']) {
+    if (data[key] == null) data[key] = '';
+  }
+
+  coerceListingFields(data);
+
+  if (Array.isArray(data.listings)) {
+    data.listings = data.listings
+      .filter((item) => item && typeof item === 'object' && !Array.isArray(item))
+      .slice(0, 15)
+      .map((item) => coerceListingFields({ ...item }));
+  } else {
+    data.listings = null;
   }
 
   if (!data.entities || typeof data.entities !== 'object' || Array.isArray(data.entities)) {
@@ -208,6 +247,36 @@ function coerceLlmDict(data) {
 
   data.is_property_listing_or_inquiry = Boolean(data.is_property_listing_or_inquiry);
   return data;
+}
+
+/**
+ * Expand LLM schema into one row-ready object per property offer.
+ */
+function expandListingSchemas(schema) {
+  if (!schema || typeof schema !== 'object') return [];
+
+  const listingFields = [
+    'purpose', 'property_type', 'property_sub_type', 'city', 'area', 'vicinity',
+    'size', 'size_value', 'size_unit', 'price', 'price_value', 'contact_number',
+    'summary', 'listing_excerpt'
+  ];
+
+  const fromArray = Array.isArray(schema.listings) ? schema.listings.filter(Boolean) : [];
+  const sources = fromArray.length ? fromArray : [null];
+
+  return sources.slice(0, 15).map((item, index) => {
+    const row = { ...schema };
+    delete row.listings;
+    if (item) {
+      for (const key of listingFields) {
+        if (item[key] !== undefined) row[key] = item[key];
+      }
+    }
+    row.listing_index = index;
+    if (!row.listing_excerpt) row.listing_excerpt = null;
+    if (!row.summary) row.summary = schema.summary || '';
+    return row;
+  });
 }
 
 function validateSchema(data) {
@@ -390,6 +459,7 @@ class LLMClient {
               `Your previous output was invalid. Error: ${error}. ` +
               'Reply with ONLY one valid JSON object. No thinking, no markdown. ' +
               'size_value and price_value must be single numbers or null, never arrays. ' +
+              'If the message has multiple property offers, put each in a listings[] array with listing_excerpt. ' +
               'intent must be a string.'
           }
         ],
@@ -492,5 +562,7 @@ module.exports = {
   parseLlmOutput,
   cleanJsonResponse,
   repairTruncatedJson,
-  stripThinkBlocks
+  stripThinkBlocks,
+  expandListingSchemas,
+  coerceListingFields
 };

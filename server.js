@@ -1819,11 +1819,12 @@ const runPropertySearch = async (req) => {
 
   let queryText = `
     SELECT * FROM (
-      SELECT DISTINCT ON (n.whatsapp_message_id)
-             n.id, n.whatsapp_message_id, n.chat_jid, n.purpose, n.city, n.area, n.vicinity,
+      SELECT n.id, n.whatsapp_message_id, n.chat_jid, n.purpose, n.city, n.area, n.vicinity,
              n.property_type, n.property_sub_type, n.size, n.price, n.contact_number,
              n.summary, n.property_status, n.created_at, n.category, n.intent, n.sentiment,
-             LEFT(m.message, 500) AS raw_message, m.timestamp AS message_timestamp, m.from_me, m.user_id
+             n.listing_index,
+             LEFT(COALESCE(NULLIF(TRIM(n.listing_excerpt), ''), m.message), 500) AS raw_message,
+             m.timestamp AS message_timestamp, m.from_me, m.user_id
       FROM normalized_messages n
       INNER JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
       WHERE m.user_id = $1
@@ -1862,8 +1863,7 @@ const runPropertySearch = async (req) => {
       .slice(0, 80);
     params.push(fuzzySeed);
     const fuzzyIdx = params.length;
-    // Match structured AI fields AND raw WhatsApp text, across spelling variants
-    // (e.g. "phase VII" ↔ "phase 7", "clfton" ↔ "clifton", "beach st" ↔ "beach street").
+    // Prefer per-listing excerpt so multi-offer messages only match the relevant plot
     queryText += ` AND (
       n.area ILIKE ANY($${patternIdx})
       OR n.vicinity ILIKE ANY($${patternIdx})
@@ -1871,7 +1871,7 @@ const runPropertySearch = async (req) => {
       OR n.summary ILIKE ANY($${patternIdx})
       OR COALESCE(n.property_type, '') ILIKE ANY($${patternIdx})
       OR COALESCE(n.property_sub_type, '') ILIKE ANY($${patternIdx})
-      OR COALESCE(m.message, '') ILIKE ANY($${patternIdx})
+      OR COALESCE(n.listing_excerpt, m.message, '') ILIKE ANY($${patternIdx})
       OR COALESCE(m.sender, '') ILIKE ANY($${patternIdx})
       OR COALESCE(n.chat_jid, '') ILIKE ANY($${patternIdx})
       OR (
@@ -1908,7 +1908,7 @@ const runPropertySearch = async (req) => {
     }
   }
 
-  queryText += ` ORDER BY n.whatsapp_message_id DESC, n.id DESC
+  queryText += ` ORDER BY n.id DESC, n.whatsapp_message_id DESC, COALESCE(n.listing_index, 0) ASC
     ) uniq
     ORDER BY uniq.id DESC LIMIT $${params.length + 1}`;
   params.push(limit);
