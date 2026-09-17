@@ -159,8 +159,12 @@ async function runMigrationSteps(client) {
     `ALTER TABLE whatsapp_link_sessions ADD COLUMN IF NOT EXISTS whatsapp_jid TEXT`,
     `DO $$ BEGIN
        IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'normalized_messages') THEN
-         ALTER TABLE normalized_messages ADD COLUMN IF NOT EXISTS property_status VARCHAR(32) DEFAULT 'AVAILABLE';
-         CREATE INDEX IF NOT EXISTS idx_normalized_messages_property_status ON normalized_messages (property_status);
+         BEGIN
+           ALTER TABLE normalized_messages ADD COLUMN IF NOT EXISTS property_status VARCHAR(32) DEFAULT 'AVAILABLE';
+           CREATE INDEX IF NOT EXISTS idx_normalized_messages_property_status ON normalized_messages (property_status);
+         EXCEPTION WHEN insufficient_privilege THEN
+           RAISE NOTICE 'skip normalized_messages DDL: not table owner';
+         END;
        END IF;
      END $$`,
     `CREATE INDEX IF NOT EXISTS idx_link_sessions_updated ON whatsapp_link_sessions (updated_at DESC)`,
@@ -192,7 +196,20 @@ async function runMigrationSteps(client) {
     )`,
     `CREATE INDEX IF NOT EXISTS idx_complaints_user_id ON complaints (user_id)`,
     `CREATE INDEX IF NOT EXISTS idx_complaints_status ON complaints (status)`,
-    `CREATE INDEX IF NOT EXISTS idx_complaints_created_at ON complaints (created_at DESC)`
+    `CREATE INDEX IF NOT EXISTS idx_complaints_created_at ON complaints (created_at DESC)`,
+    // Fuzzy location search (typos against area / vicinity text)
+    `CREATE EXTENSION IF NOT EXISTS pg_trgm`,
+    `DO $$ BEGIN
+       IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'normalized_messages') THEN
+         BEGIN
+           CREATE INDEX IF NOT EXISTS idx_nm_area_trgm ON normalized_messages USING gin (area gin_trgm_ops);
+           CREATE INDEX IF NOT EXISTS idx_nm_vicinity_trgm ON normalized_messages USING gin (vicinity gin_trgm_ops);
+           CREATE INDEX IF NOT EXISTS idx_nm_city_trgm ON normalized_messages USING gin (city gin_trgm_ops);
+         EXCEPTION WHEN insufficient_privilege THEN
+           RAISE NOTICE 'skip normalized_messages trgm indexes: not table owner';
+         END;
+       END IF;
+     END $$`
   ];
 
   for (const sql of steps) {

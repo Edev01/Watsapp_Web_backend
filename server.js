@@ -7,9 +7,10 @@ require('dotenv').config();
 const db = require('./db');
 const { sendResponse } = require('./responseHelper');
 const { authenticateToken, isAdmin } = require('./middleware');
-const { filterAndSortProperties, PROPERTY_STATUSES, normalizePropertyStatus, isValidPropertyStatus } = require('./propertyHelper');
+const { filterAndSortProperties, PROPERTY_STATUSES, normalizePropertyStatus, isValidPropertyStatus, expandLocationQuery } = require('./propertyHelper');
+const { setExtraLocalities, correctLocalityTypos } = require('./pakistanLocalities');
 const { extractUserId } = require('./userMiddleware');
-const { findOrCreateCanonicalChat, cleanText, isSystemNotificationText, isCommonJunkMessage } = require('./contactHelper');
+const { findOrCreateCanonicalChat, upsertChatsBulk, cleanText, isSystemNotificationText, isCommonJunkMessage } = require('./contactHelper');
 const {
   DEFAULT_MODEL: NORMALIZE_MODEL,
   getNormalizeCounts,
@@ -19,7 +20,19 @@ const {
   notifyNormalizeBot,
   buildStatusPayload
 } = require('./normalizeHelper');
-const { sendComplaintEmail } = require('./mailHelper');
+
+let startPipelineWorker = () => ({ started: false, reason: 'ai module missing' });
+let wakePipeline = () => {};
+try {
+  ({ startPipelineWorker, wakePipeline } = require('./ai/pipelineWorker'));
+} catch (err) {
+  console.warn('[pipeline] module not loaded:', err.message);
+}
+
+let sendComplaintEmail = async () => ({ sent: false, reason: 'mailHelper not installed' });
+try {
+  sendComplaintEmail = require('./mailHelper').sendComplaintEmail;
+} catch (_) {}
 
 const COMPLAINT_STATUSES = ['submitted', 'read', 'reviewing', 'in_progress', 'resolved'];
 
@@ -38,7 +51,7 @@ const io = new Server(server, {
 });
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '8mb' }));
 app.use(extractUserId);
 
 // Broadcast QR events ONLY to that portal user's room (no global steal across tenants)
@@ -1091,7 +1104,7 @@ function buildChatListSql({ userId, type, search, pageSize, offset }) {
   return { sql, params, countSql, countParams };
 }
 
-// 7. Post Scraped Contacts List (Deduplicated by name & JID with canonical matching)
+// 7. Post scraped chat rooms (worker dumps full WhatsApp chat list)
 app.post('/api/scraped-chats/contacts', async (req, res) => {
   const { contacts } = req.body;
   const userId = resolveTenantUserId(req, 1);
@@ -1099,11 +1112,14 @@ app.post('/api/scraped-chats/contacts', async (req, res) => {
     return sendResponse(res, 400, true, null, 'Contacts array is required');
   }
   try {
-    for (const contact of contacts) {
-      if (!contact.name && !contact.id) continue;
-      await findOrCreateCanonicalChat(userId, contact.id, contact.name, contact.avatar);
-    }
-    return sendResponse(res, 200, false, null, 'Contacts updated successfully');
+    const result = await upsertChatsBulk(userId, contacts);
+    return sendResponse(
+      res,
+      200,
+      false,
+      { upserted: result.upserted, received: result.received },
+      'Contacts updated successfully'
+    );
   } catch (err) {
     console.error('Contacts update error:', err);
     return sendResponse(res, 500, true, null, err.message || 'Server error');
@@ -1255,6 +1271,9 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
     // Render Background Worker (auto_pipeline) or AI_BOT_URL picks it up.
     if (addedCount > 0) {
       queueNormalizeJob(userId, { embed: true }).then(({ job, alreadyActive }) => {
+        try {
+          wakePipeline(userId);
+        } catch (_) {}
         if (alreadyActive) return;
         return notifyNormalizeBot(userId, job).then((botNotify) => {
           if (!botNotify.notified) {
@@ -1761,112 +1780,158 @@ app.get('/api/ml/dataset', async (req, res) => {
 
 // 14. Property Filter Endpoint (Supports POST/GET /api/properties/filter and /api/properties)
 const runPropertySearch = async (req) => {
-  try {
-    const rawFilters = req.body?.filters || req.body || {};
-    const queryFilters = req.query || {};
+  const rawFilters = req.body?.filters || req.body || {};
+  const queryFilters = req.query || {};
 
-    const filters = {
-      purpose: rawFilters.purpose || queryFilters.purpose || '',
-      city: rawFilters.city || queryFilters.city || '',
-      location: rawFilters.location || queryFilters.location || rawFilters.query || queryFilters.query || rawFilters.vicinity || queryFilters.vicinity || rawFilters.area || queryFilters.area || '',
-      propertyType: rawFilters.propertyType || queryFilters.propertyType || rawFilters.property_type || queryFilters.property_type || '',
-      propertySubType: rawFilters.propertySubType || queryFilters.propertySubType || rawFilters.property_sub_type || queryFilters.property_sub_type || '',
-      sortBy: rawFilters.sortBy || queryFilters.sortBy || rawFilters.sort_by || queryFilters.sort_by || 'Newest First',
-      priceMin: rawFilters.priceMin ?? queryFilters.priceMin ?? '',
-      priceMax: rawFilters.priceMax ?? queryFilters.priceMax ?? '',
-      areaUnit: rawFilters.areaUnit || queryFilters.areaUnit || rawFilters.area_unit || queryFilters.area_unit || 'Marla',
-      areaMin: rawFilters.areaMin ?? queryFilters.areaMin ?? '',
-      areaMax: rawFilters.areaMax ?? queryFilters.areaMax ?? '',
-      status:
-        rawFilters.status ||
-        rawFilters.propertyStatus ||
-        rawFilters.property_status ||
-        queryFilters.status ||
-        queryFilters.propertyStatus ||
-        queryFilters.property_status ||
-        ''
-    };
+  const filters = {
+    purpose: rawFilters.purpose || queryFilters.purpose || '',
+    city: rawFilters.city || queryFilters.city || '',
+    location: rawFilters.location || queryFilters.location || rawFilters.query || queryFilters.query || rawFilters.vicinity || queryFilters.vicinity || rawFilters.area || queryFilters.area || '',
+    propertyType: rawFilters.propertyType || queryFilters.propertyType || rawFilters.property_type || queryFilters.property_type || '',
+    propertySubType: rawFilters.propertySubType || queryFilters.propertySubType || rawFilters.property_sub_type || queryFilters.property_sub_type || '',
+    sortBy: rawFilters.sortBy || queryFilters.sortBy || rawFilters.sort_by || queryFilters.sort_by || 'Newest First',
+    priceMin: rawFilters.priceMin ?? queryFilters.priceMin ?? '',
+    priceMax: rawFilters.priceMax ?? queryFilters.priceMax ?? '',
+    areaUnit: rawFilters.areaUnit || queryFilters.areaUnit || rawFilters.area_unit || queryFilters.area_unit || 'Marla',
+    areaMin: rawFilters.areaMin ?? queryFilters.areaMin ?? '',
+    areaMax: rawFilters.areaMax ?? queryFilters.areaMax ?? '',
+    status:
+      rawFilters.status ||
+      rawFilters.propertyStatus ||
+      rawFilters.property_status ||
+      queryFilters.status ||
+      queryFilters.propertyStatus ||
+      queryFilters.property_status ||
+      ''
+  };
 
-    const userId = req.userId || rawFilters.userId || rawFilters.user_id || queryFilters.userId || queryFilters.user_id || 1;
+  const userId = Number(
+    req.userId || rawFilters.userId || rawFilters.user_id || queryFilters.userId || queryFilters.user_id || 0
+  );
+  if (!userId) {
+    const err = new Error('userId is required');
+    err.statusCode = 400;
+    throw err;
+  }
 
-    let queryText = `
-      SELECT n.*, m.message as raw_message, m.timestamp as message_timestamp, m.from_me, m.user_id, c.name as chat_name
+  const requestedLimit = parseInt(rawFilters.limit || queryFilters.limit || '50', 10);
+  const limit = Math.min(Math.max(Number.isFinite(requestedLimit) ? requestedLimit : 50, 1), 100);
+
+  let queryText = `
+    SELECT * FROM (
+      SELECT DISTINCT ON (n.whatsapp_message_id)
+             n.id, n.whatsapp_message_id, n.chat_jid, n.purpose, n.city, n.area, n.vicinity,
+             n.property_type, n.property_sub_type, n.size, n.price, n.contact_number,
+             n.summary, n.property_status, n.created_at, n.category, n.intent, n.sentiment,
+             LEFT(m.message, 500) AS raw_message, m.timestamp AS message_timestamp, m.from_me, m.user_id
       FROM normalized_messages n
-      LEFT JOIN whatsapp_messages m ON n.whatsapp_message_id = m.id
-      LEFT JOIN whatsapp_chats c ON n.chat_jid = c.jid AND m.user_id = c.user_id
-      WHERE m.user_id = $1 AND (n.is_property = true OR n.purpose IS NOT NULL OR n.property_type IS NOT NULL)
-    `;
-    const params = [userId];
-    const whereClauses = [];
+      INNER JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
+      WHERE m.user_id = $1
+        AND (n.is_property IS TRUE OR n.purpose IS NOT NULL OR n.property_type IS NOT NULL)
+  `;
+  const params = [userId];
 
-    if (filters.purpose && String(filters.purpose).trim() !== '') {
-      const p = String(filters.purpose).trim().toLowerCase();
-      params.push(`%${p}%`);
-      const idx = `$${params.length}`;
-      if (p === 'buy' || p === 'sale' || p === 'sell') {
-        whereClauses.push(`(LOWER(n.purpose) IN ('buy', 'sale', 'sell') OR LOWER(m.message) LIKE ${idx} OR LOWER(n.summary) LIKE ${idx})`);
-      } else if (p === 'rent') {
-        whereClauses.push(`(LOWER(n.purpose) = 'rent' OR LOWER(m.message) LIKE ${idx} OR LOWER(n.summary) LIKE ${idx})`);
-      } else {
-        whereClauses.push(`(LOWER(n.purpose) LIKE ${idx} OR LOWER(m.message) LIKE ${idx} OR LOWER(n.summary) LIKE ${idx})`);
-      }
+  const purpose = String(filters.purpose || '').trim().toLowerCase();
+  if (purpose && purpose !== 'all') {
+    if (purpose === 'buy' || purpose === 'sale' || purpose === 'sell') {
+      params.push(['buy', 'sale', 'sell']);
+      queryText += ` AND LOWER(COALESCE(n.purpose, '')) = ANY($${params.length})`;
+    } else if (purpose === 'rent') {
+      queryText += ` AND LOWER(COALESCE(n.purpose, '')) = 'rent'`;
     }
+  }
 
-    if (filters.city && String(filters.city).trim() !== '') {
-      params.push(`%${String(filters.city).trim().toLowerCase()}%`);
-      const idx = `$${params.length}`;
-      whereClauses.push(`(LOWER(n.city) LIKE ${idx} OR LOWER(n.vicinity) LIKE ${idx} OR LOWER(n.area) LIKE ${idx} OR LOWER(m.message) LIKE ${idx})`);
+  const city = String(filters.city || '').trim();
+  if (city && city.toLowerCase() !== 'all cities') {
+    params.push(`%${city}%`);
+    queryText += ` AND (n.city ILIKE $${params.length} OR n.area ILIKE $${params.length} OR n.vicinity ILIKE $${params.length})`;
+  }
+
+  const location = String(filters.location || '').trim();
+  if (location) {
+    const variants = expandLocationQuery(location);
+    const patterns = (variants.length ? variants : [location]).map((v) => `%${v}%`);
+    params.push(patterns);
+    const patternIdx = params.length;
+    // Distinctive part only for trigram (strip street/st/ave so those don't false-match)
+    const fuzzySeed = correctLocalityTypos(location)
+      .replace(/\b(street|st|avenue|ave|road|rd|lane|block|sector|phase|extension|ext|commercial)\b/gi, ' ')
+      .replace(/[–—\-_/\\]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 80);
+    params.push(fuzzySeed);
+    const fuzzyIdx = params.length;
+    // Match structured AI fields AND raw WhatsApp text, across spelling variants
+    // (e.g. "phase VII" ↔ "phase 7", "clfton" ↔ "clifton", "beach st" ↔ "beach street").
+    queryText += ` AND (
+      n.area ILIKE ANY($${patternIdx})
+      OR n.vicinity ILIKE ANY($${patternIdx})
+      OR n.city ILIKE ANY($${patternIdx})
+      OR n.summary ILIKE ANY($${patternIdx})
+      OR COALESCE(n.property_type, '') ILIKE ANY($${patternIdx})
+      OR COALESCE(n.property_sub_type, '') ILIKE ANY($${patternIdx})
+      OR COALESCE(m.message, '') ILIKE ANY($${patternIdx})
+      OR COALESCE(m.sender, '') ILIKE ANY($${patternIdx})
+      OR COALESCE(n.chat_jid, '') ILIKE ANY($${patternIdx})
+      OR (
+        LENGTH($${fuzzyIdx}) >= 4
+        AND (
+          similarity(COALESCE(n.area, ''), $${fuzzyIdx}) > 0.42
+          OR similarity(COALESCE(n.vicinity, ''), $${fuzzyIdx}) > 0.42
+          OR similarity(COALESCE(n.city, ''), $${fuzzyIdx}) > 0.5
+        )
+      )
+    )`;
+  }
+
+  const propertyType = String(filters.propertyType || '').trim();
+  if (propertyType && propertyType.toLowerCase() !== 'all') {
+    params.push(`%${propertyType}%`);
+    queryText += ` AND COALESCE(n.property_type, '') ILIKE $${params.length}`;
+  }
+
+  const propertySubType = String(filters.propertySubType || '').trim();
+  if (propertySubType && !['any', 'standard', ''].includes(propertySubType.toLowerCase())) {
+    params.push(`%${propertySubType}%`);
+    queryText += ` AND COALESCE(n.property_sub_type, n.property_type, '') ILIKE $${params.length}`;
+  }
+
+  if (filters.status && String(filters.status).trim() !== '') {
+    const statusList = String(filters.status)
+      .split(',')
+      .map((s) => normalizePropertyStatus(s))
+      .filter(Boolean);
+    if (statusList.length) {
+      params.push(statusList);
+      queryText += ` AND UPPER(COALESCE(n.property_status, 'AVAILABLE')) = ANY($${params.length})`;
     }
+  }
 
-    if (filters.location && String(filters.location).trim() !== '') {
-      params.push(`%${String(filters.location).trim().toLowerCase()}%`);
-      const idx = `$${params.length}`;
-      whereClauses.push(`(LOWER(n.vicinity) LIKE ${idx} OR LOWER(n.area) LIKE ${idx} OR LOWER(n.summary) LIKE ${idx} OR LOWER(m.message) LIKE ${idx})`);
-    }
+  queryText += ` ORDER BY n.whatsapp_message_id DESC, n.id DESC
+    ) uniq
+    ORDER BY uniq.id DESC LIMIT $${params.length + 1}`;
+  params.push(limit);
 
-    if (filters.propertyType && String(filters.propertyType).trim() !== '') {
-      params.push(`%${String(filters.propertyType).trim().toLowerCase()}%`);
-      const idx = `$${params.length}`;
-      whereClauses.push(`(LOWER(n.property_type) LIKE ${idx} OR LOWER(n.summary) LIKE ${idx} OR LOWER(m.message) LIKE ${idx})`);
-    }
-
-    if (filters.propertySubType && String(filters.propertySubType).trim() !== '') {
-      params.push(`%${String(filters.propertySubType).trim().toLowerCase()}%`);
-      const idx = `$${params.length}`;
-      whereClauses.push(`(LOWER(n.property_type) LIKE ${idx} OR LOWER(n.summary) LIKE ${idx} OR LOWER(m.message) LIKE ${idx})`);
-    }
-
-    if (filters.status && String(filters.status).trim() !== '') {
-      const statusList = String(filters.status)
-        .split(',')
-        .map((s) => normalizePropertyStatus(s))
-        .filter(Boolean);
-      if (statusList.length) {
-        params.push(statusList);
-        const idx = `$${params.length}`;
-        whereClauses.push(
-          `UPPER(COALESCE(n.property_status, 'AVAILABLE')) = ANY(${idx})`
-        );
-      }
-    }
-
-    if (whereClauses.length > 0) {
-      queryText += ' AND ' + whereClauses.join(' AND ');
-    }
-
-    queryText += ' ORDER BY n.id DESC';
-
-    const dbResult = await db.query(queryText, params);
+  const client = await db.pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query("SET LOCAL statement_timeout = '8s'");
+    const dbResult = await client.query(queryText, params);
+    await client.query('COMMIT');
     return {
       filters,
       userId,
       properties: filterAndSortProperties(dbResult.rows, filters)
     };
   } catch (err) {
-    err.searchContext = 'runPropertySearch';
+    try { await client.query('ROLLBACK'); } catch (_) {}
     throw err;
+  } finally {
+    client.release();
   }
 };
+
 
 const handlePropertyFilter = async (req, res) => {
   try {
@@ -1916,7 +1981,8 @@ const handleDashboardSearch = async (req, res) => {
     return res.json({ success: true, count: results.length, results });
   } catch (err) {
     console.error('Dashboard search error:', err);
-    return res.status(500).json({ success: false, error: err.message || 'Server error', results: [] });
+    const code = err.statusCode || 500;
+    return res.status(code).json({ success: false, error: err.message || 'Server error', results: [] });
   }
 };
 
@@ -2308,12 +2374,94 @@ app.get('/', (req, res) => {
   return sendResponse(res, 200, false, { service: 'whatsapp-scraper-backend' }, 'API service running');
 });
 
+app.get('/health', async (req, res) => {
+  let dbStatus = 'ok';
+  try {
+    await db.query('SELECT 1');
+  } catch (err) {
+    dbStatus = 'error';
+  }
+
+  const pipeline = getPipelineStats();
+  const cfg = getConfigSafe();
+  const healthy = dbStatus === 'ok';
+
+  return sendResponse(
+    res,
+    healthy ? 200 : 503,
+    !healthy,
+    {
+      service: 'whatsapp-scraper-backend',
+      db: dbStatus,
+      ai: {
+        pipelineMode: cfg.pipelineMode || process.env.AI_PIPELINE || 'local',
+        model: cfg.defaultModel || process.env.DEFAULT_MODEL || null,
+        llmConfigured: Boolean(cfg.llmConfigured),
+        embeddingBaseUrl: cfg.embeddingBaseUrl || process.env.EMBEDDING_BASE_URL || null
+      },
+      pipeline: {
+        running: pipeline.running,
+        lastRun: pipeline.lastRun,
+        lastNormalized: pipeline.lastNormalized,
+        lastEmbedded: pipeline.lastEmbedded,
+        totalNormalized: pipeline.totalNormalized,
+        totalEmbedded: pipeline.totalEmbedded,
+        lastError: pipeline.lastError,
+        currentUserId: pipeline.currentUserId,
+        model: pipeline.model,
+        concurrency: pipeline.concurrency,
+        workerStarted: pipeline.workerStarted,
+        shuttingDown: pipeline.shuttingDown,
+        pipelineMode: pipeline.pipelineMode
+      },
+      worker: {
+        baseUrl: process.env.WORKER_BASE_URL || null,
+        configured: Boolean(process.env.WORKER_BASE_URL && process.env.WORKER_API_KEY)
+      }
+    },
+    healthy ? 'Healthy' : 'Database unavailable'
+  );
+});
+
 // Start Server (await DB migration so monitored_at exists before traffic)
+async function refreshLocalityGazetteer() {
+  try {
+    const { rows } = await db.query(`
+      SELECT DISTINCT LOWER(TRIM(name)) AS name
+      FROM (
+        SELECT area AS name FROM normalized_messages WHERE area IS NOT NULL AND TRIM(area) <> ''
+        UNION ALL
+        SELECT vicinity FROM normalized_messages WHERE vicinity IS NOT NULL AND TRIM(vicinity) <> ''
+        UNION ALL
+        SELECT city FROM normalized_messages WHERE city IS NOT NULL AND TRIM(city) <> ''
+      ) t
+      WHERE LENGTH(TRIM(name)) BETWEEN 3 AND 60
+      LIMIT 8000
+    `);
+    setExtraLocalities(rows.map((r) => r.name));
+    console.log(`[search] locality gazetteer loaded: ${rows.length} names from DB`);
+  } catch (err) {
+    console.warn('[search] locality gazetteer refresh failed:', err.message);
+  }
+}
+
 (async () => {
   try {
     await db.initializeDb();
   } catch (err) {
     console.error('Database init failed on startup:', err.message);
+  }
+
+  await refreshLocalityGazetteer();
+  setInterval(() => {
+    refreshLocalityGazetteer().catch(() => {});
+  }, 30 * 60 * 1000);
+
+  try {
+    const started = startPipelineWorker();
+    console.log('[pipeline] start result:', started);
+  } catch (err) {
+    console.error('[pipeline] Failed to start AI worker:', err.message);
   }
 
   server.listen(PORT, () => {

@@ -37,6 +37,200 @@ function isValidPropertyStatus(raw) {
   return normalizePropertyStatus(raw) != null;
 }
 
+const {
+  correctLocalityTypos,
+  localityVariants,
+  matchLocality
+} = require('./pakistanLocalities');
+
+/** Roman / English word ↔ Arabic for DHA-style phase queries. */
+const ROMAN_TO_INT = Object.freeze({
+  i: 1, ii: 2, iii: 3, iv: 4, v: 5, vi: 6, vii: 7, viii: 8, ix: 9, x: 10,
+  xi: 11, xii: 12, xiii: 13, xiv: 14, xv: 15, xvi: 16, xvii: 17, xviii: 18, xix: 19, xx: 20
+});
+const WORD_TO_INT = Object.freeze({
+  one: 1, two: 2, three: 3, four: 4, five: 5,
+  six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
+  eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15,
+  sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19, twenty: 20
+});
+const INT_TO_ROMAN = Object.freeze(
+  Object.fromEntries(Object.entries(ROMAN_TO_INT).map(([k, v]) => [String(v), k]))
+);
+const INT_TO_WORD = Object.freeze(
+  Object.fromEntries(Object.entries(WORD_TO_INT).map(([k, v]) => [String(v), k]))
+);
+
+/** Levenshtein edit distance (case-insensitive). */
+function editDistance(a, b) {
+  const s = String(a || '').toLowerCase();
+  const t = String(b || '').toLowerCase();
+  if (s === t) return 0;
+  const n = s.length;
+  const m = t.length;
+  if (!n) return m;
+  if (!m) return n;
+  const prev = new Array(m + 1);
+  const cur = new Array(m + 1);
+  for (let j = 0; j <= m; j++) prev[j] = j;
+  for (let i = 1; i <= n; i++) {
+    cur[0] = i;
+    for (let j = 1; j <= m; j++) {
+      const cost = s[i - 1] === t[j - 1] ? 0 : 1;
+      cur[j] = Math.min(cur[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost);
+    }
+    for (let j = 0; j <= m; j++) prev[j] = cur[j];
+  }
+  return prev[m];
+}
+
+/** Canonical location keywords we fuzzy-correct toward. */
+const LOCATION_CANONICALS = Object.freeze([
+  'phase', 'sector', 'block', 'street', 'avenue', 'road',
+  'building', 'extension', 'plaza', 'boulevard', 'lane', 'society'
+]);
+
+/**
+ * Map near-miss tokens (phse, fase, setor, …) onto canonical keywords.
+ * Max distance scales with word length so short typos still resolve.
+ */
+function correctLocationTypos(text) {
+  return String(text || '').replace(/[A-Za-z]+/g, (word) => {
+    const lower = word.toLowerCase();
+    if (lower.length < 3 || lower.length > 14) return word;
+    let best = null;
+    let bestDist = Infinity;
+    for (const canon of LOCATION_CANONICALS) {
+      const lenDiff = Math.abs(lower.length - canon.length);
+      if (lenDiff > 2) continue;
+      const maxDist = canon.length <= 5 ? 2 : 3;
+      const d = editDistance(lower, canon);
+      if (d > 0 && d <= maxDist && d < bestDist) {
+        best = canon;
+        bestDist = d;
+      }
+    }
+    if (!best) return word;
+    // Preserve original casing style loosely (all-caps / title / lower)
+    if (word === word.toUpperCase()) return best.toUpperCase();
+    if (word[0] === word[0].toUpperCase()) {
+      return best.charAt(0).toUpperCase() + best.slice(1);
+    }
+    return best;
+  });
+}
+
+/**
+ * Expand a free-text location query into equivalent spellings so
+ * "phase one" / "phase 1" / "phase I" / "phase-1" / "phse 8" hit the same listings.
+ * Returns unique ILIKE patterns (without surrounding %).
+ */
+function expandLocationQuery(raw) {
+  const input = String(raw || '').trim();
+  if (!input) return [];
+
+  const variants = new Set();
+  const push = (s) => {
+    const t = String(s || '').trim();
+    if (t) variants.add(t);
+  };
+
+  push(input);
+  // Fuzzy-fix structural keywords (phse→phase) then Pakistan area names (clfton→clifton)
+  const keywordFixed = correctLocationTypos(input.replace(/\bphasee\b/gi, 'phase'));
+  const deTypo = correctLocalityTypos(keywordFixed);
+  push(keywordFixed);
+  push(deTypo);
+  const spaced = deTypo.replace(/[–—\-_/\\]+/g, ' ').replace(/\s+/g, ' ').trim();
+  push(spaced);
+  push(spaced.toLowerCase());
+
+  // Expand matched localities into hyphen/space/alias forms
+  const words = spaced.toLowerCase().split(/\s+/).filter(Boolean);
+  for (let n = Math.min(4, words.length); n >= 1; n -= 1) {
+    for (let i = 0; i + n <= words.length; i += 1) {
+      const phrase = words.slice(i, i + n).join(' ');
+      const hit = matchLocality(phrase);
+      if (hit) {
+        for (const v of localityVariants(hit)) push(v);
+      }
+    }
+  }
+
+  const wordAlt = Object.keys(WORD_TO_INT).join('|');
+  const phaseRe = new RegExp(
+    `\\bphase\\s*([ivxlcdm]{1,6}|\\d{1,2}|${wordAlt})\\b`,
+    'gi'
+  );
+  let m;
+  const phaseHits = [];
+  while ((m = phaseRe.exec(spaced)) !== null) {
+    phaseHits.push({ full: m[0], token: m[1] });
+  }
+
+  for (const hit of phaseHits) {
+    const token = hit.token.toLowerCase();
+    let num = null;
+    if (/^\d+$/.test(token)) {
+      num = parseInt(token, 10);
+    } else if (ROMAN_TO_INT[token]) {
+      num = ROMAN_TO_INT[token];
+    } else if (WORD_TO_INT[token]) {
+      num = WORD_TO_INT[token];
+    }
+    if (!num) continue;
+
+    const roman = INT_TO_ROMAN[String(num)] || null;
+    const word = INT_TO_WORD[String(num)] || null;
+
+    const forms = [
+      `phase ${num}`,
+      `phase${num}`,
+      `phase-${num}`
+    ];
+    if (roman) {
+      forms.push(
+        `phase ${roman}`,
+        `phase ${roman.toUpperCase()}`,
+        `phase-${roman}`,
+        `phase${roman}`
+      );
+    }
+    if (word) {
+      forms.push(`phase ${word}`, `phase-${word}`, `phase${word}`);
+    }
+    for (const form of forms) {
+      push(form);
+      push(spaced.replace(new RegExp(hit.full.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'), form));
+    }
+  }
+
+  // Common street / building abbreviations
+  const abbrPairs = [
+    [/\bstreet\b/gi, 'st'],
+    [/\bst\b/gi, 'street'],
+    [/\bavenue\b/gi, 'ave'],
+    [/\bave\b/gi, 'avenue'],
+    [/\broad\b/gi, 'rd'],
+    [/\brd\b/gi, 'road'],
+    [/\bbuilding\b/gi, 'bldg'],
+    [/\bbldg\b/gi, 'building'],
+    [/\bextension\b/gi, 'ext'],
+    [/\bext\b/gi, 'extension'],
+  ];
+  for (const v of [...variants]) {
+    for (const [re, repl] of abbrPairs) {
+      const copy = new RegExp(re.source, re.flags);
+      if (copy.test(v)) {
+        push(v.replace(new RegExp(re.source, re.flags), repl));
+      }
+    }
+  }
+
+  // Keep patterns reasonably short (locality + phase variants)
+  return [...variants].filter((v) => v.length >= 1 && v.length <= 80).slice(0, 48);
+}
+
 /**
  * Parses real estate price strings (e.g. "PKR 1.8 Cr", "85 Lac", "45,000 / month", "15000000") into numeric PKR.
  */
@@ -130,9 +324,50 @@ function parseAreaInUnit(sizeStr, rawMsg, targetUnit = 'Marla') {
   return marlaVal;
 }
 
+function collapseRepeatedText(raw) {
+  let t = String(raw || '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (t.length < 40) return t;
+  const half = Math.floor(t.length / 2);
+  if (t.slice(0, half).trim() === t.slice(half).trim()) {
+    return t.slice(0, half).trim();
+  }
+  const noPunct = t.replace(/[.,!?;:]+/g, ' ').replace(/\s+/g, ' ').trim();
+  const h2 = Math.floor(noPunct.length / 2);
+  if (h2 >= 20 && noPunct.slice(0, h2).trim() === noPunct.slice(h2).trim()) {
+    return noPunct.slice(0, h2).trim();
+  }
+  return t;
+}
+
 /**
- * Filter & sort properties array based on criteria.
+ * Collapse doubled paste ("hellohello") and whitespace so duplicate scrapes match.
  */
+function listingFingerprint(row) {
+  const raw = collapseRepeatedText(row.rawMessage || row.raw_message || row.summary || '');
+  return [raw.slice(0, 200), String(row.purpose || '').toLowerCase()].join('|');
+}
+
+function dedupeListings(items) {
+  const seenMsg = new Set();
+  const seenFp = new Set();
+  const out = [];
+  for (const item of items) {
+    const mid = item.whatsappMessageId || item.whatsapp_message_id;
+    if (mid != null) {
+      const key = String(mid);
+      if (seenMsg.has(key)) continue;
+      seenMsg.add(key);
+    }
+    const fp = listingFingerprint(item);
+    if (fp && seenFp.has(fp)) continue;
+    if (fp) seenFp.add(fp);
+    out.push(item);
+  }
+  return out;
+}
 function filterAndSortProperties(rawRows, filters = {}) {
   const targetUnit = filters.areaUnit || 'Marla';
 
@@ -216,13 +451,14 @@ function filterAndSortProperties(rawRows, filters = {}) {
     items.sort((a, b) => b.id - a.id);
   }
 
-  return items;
+  return dedupeListings(items);
 }
 
 module.exports = {
   PROPERTY_STATUSES,
   normalizePropertyStatus,
   isValidPropertyStatus,
+  expandLocationQuery,
   parsePriceInPKR,
   parseAreaInUnit,
   filterAndSortProperties

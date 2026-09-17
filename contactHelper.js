@@ -251,8 +251,9 @@ async function findOrCreateCanonicalChat(userId, rawJid, rawName, avatar = null)
     }
   }
 
-  // 3. Try matching by clean name
-  if (cleanedName) {
+  // 3. Name match only when there is no real WhatsApp JID.
+  // Matching every chat by display name collapses distinct rooms ("Ahmed", "Group") into one.
+  if (cleanedName && (!cleanedJid || jidIsJunk)) {
     const matchByName = await db.query(
       `SELECT id, jid, name FROM whatsapp_chats 
        WHERE user_id = $1 AND LOWER(TRIM(regexp_replace(name, '[\\u200B-\\u200D\\u200E\\u200F\\u202A-\\u202E\\u2066-\\u2069\\uFEFF]', '', 'g'))) = LOWER(TRIM($2)) LIMIT 1`,
@@ -285,6 +286,74 @@ async function findOrCreateCanonicalChat(userId, rawJid, rawName, avatar = null)
   return insertRes.rows[0].jid;
 }
 
+/**
+ * Fast path for worker chat-list dumps. One INSERT per chunk, keyed by (user_id, jid)
+ * so two rooms with the same name still both persist.
+ */
+async function upsertChatsBulk(userId, contacts) {
+  const uid = Number(userId);
+  const seen = new Set();
+  const rows = [];
+  for (const contact of contacts || []) {
+    const cleanedJid = cleanText(contact.id || contact.jid);
+    const cleanedName = cleanText(contact.name);
+    if (!cleanedJid && !cleanedName) continue;
+    const nameIsJunk = !cleanedName || isSystemNotificationText(cleanedName);
+    const jidIsJunk =
+      !cleanedJid ||
+      isSystemNotificationText(cleanedJid) ||
+      cleanedJid === '@c.us' ||
+      cleanedJid === '@lid';
+    if (nameIsJunk && jidIsJunk) continue;
+
+    const phoneDigits = normalizePhoneDigits(cleanedJid) || normalizePhoneDigits(cleanedName);
+    let canonicalJid = cleanedJid;
+    if (phoneDigits && phoneDigits.length >= 10 && phoneDigits.length <= 15 && !cleanedJid.includes('@lid')) {
+      canonicalJid = `${phoneDigits}@c.us`;
+    }
+    if (!canonicalJid || canonicalJid === '@c.us' || jidIsJunk) {
+      const slug = (cleanedName || 'unknown')
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '_')
+        .replace(/^_+|_+$/g, '')
+        .slice(0, 40);
+      canonicalJid = `${slug || 'unknown'}@c.us`;
+    }
+    if (seen.has(canonicalJid)) continue;
+    seen.add(canonicalJid);
+    const initialName =
+      cleanedName && !isPhoneLikeName(cleanedName) && !isSystemNotificationText(cleanedName)
+        ? cleanedName
+        : jidLocalPart(canonicalJid);
+    rows.push({ jid: canonicalJid, name: initialName, avatar: contact.avatar || null });
+  }
+
+  let upserted = 0;
+  const CHUNK = 150;
+  for (let i = 0; i < rows.length; i += CHUNK) {
+    const chunk = rows.slice(i, i + CHUNK);
+    const params = [];
+    const values = chunk.map((r, idx) => {
+      const b = idx * 4;
+      params.push(uid, r.jid, r.name, r.avatar);
+      return `($${b + 1}, $${b + 2}, $${b + 3}, $${b + 4})`;
+    });
+    const result = await db.query(
+      `INSERT INTO whatsapp_chats (user_id, jid, name, avatar)
+       VALUES ${values.join(',')}
+       ON CONFLICT (user_id, jid) DO UPDATE SET
+         name = CASE
+           WHEN whatsapp_chats.name IS NULL OR BTRIM(whatsapp_chats.name) = '' THEN EXCLUDED.name
+           ELSE whatsapp_chats.name
+         END,
+         avatar = COALESCE(EXCLUDED.avatar, whatsapp_chats.avatar)`,
+      params
+    );
+    upserted += result.rowCount || chunk.length;
+  }
+  return { upserted, received: rows.length };
+}
+
 module.exports = {
   cleanText,
   isSystemNotificationText,
@@ -292,5 +361,6 @@ module.exports = {
   normalizePhoneDigits,
   isPhoneLikeName,
   pickBetterChatName,
-  findOrCreateCanonicalChat
+  findOrCreateCanonicalChat,
+  upsertChatsBulk
 };
