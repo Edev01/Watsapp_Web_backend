@@ -30,7 +30,9 @@ const INT_TO_WORD = Object.freeze(
 
 const STOP = new Set([
   'the', 'a', 'an', 'in', 'at', 'of', 'for', 'and', 'or', 'near', 'to', 'on',
-  'by', 'from', 'with', 'area', 'plot', 'house', 'main', 'new', 'old', 'ph'
+  'by', 'from', 'with', 'area', 'plot', 'house', 'main', 'new', 'old', 'ph',
+  'street', 'st', 'avenue', 'ave', 'road', 'rd', 'lane', 'ln', 'belt', 'zone',
+  'tower', 'towers', 'commercial', 'between', 'corner'
 ]);
 
 function correctPhaseTypos(text) {
@@ -48,6 +50,23 @@ function correctPhaseTypos(text) {
 
 function normalizeSpaces(s) {
   return String(s || '')
+    .replace(/[–—\-_/\\]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** Strip commas/ampersands so "coral," / "5," never become must-tokens. */
+function cleanToken(tok) {
+  return String(tok || '')
+    .toLowerCase()
+    .replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '')
+    .trim();
+}
+
+function normalizeLoose(s) {
+  return String(s || '')
+    .toLowerCase()
+    .replace(/[&,./\\|]+/g, ' ')
     .replace(/[–—\-_/\\]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -127,7 +146,14 @@ function khayabanForms(name) {
 function parseSmartLocationQuery(raw) {
   const input = String(raw || '').trim();
   if (!input) {
-    return { isId: null, isMessageId: null, mustGroups: [], phaseNumber: null, displayQuery: '' };
+    return {
+      isId: null,
+      isMessageId: null,
+      mustGroups: [],
+      phaseNumber: null,
+      displayQuery: '',
+      rawQuery: ''
+    };
   }
 
   // msg:123 / message:123 → WhatsApp message id; bare digits → listing id
@@ -138,7 +164,8 @@ function parseSmartLocationQuery(raw) {
       isMessageId: parseInt(msgId[1], 10),
       mustGroups: [],
       phaseNumber: null,
-      displayQuery: input
+      displayQuery: input,
+      rawQuery: input
     };
   }
   if (/^\d{1,12}$/.test(input)) {
@@ -147,7 +174,8 @@ function parseSmartLocationQuery(raw) {
       isMessageId: null,
       mustGroups: [],
       phaseNumber: null,
-      displayQuery: input
+      displayQuery: input,
+      rawQuery: input
     };
   }
 
@@ -186,11 +214,13 @@ function parseSmartLocationQuery(raw) {
     ['khayaban', 'khyaban', 'khy', 'kh', 'e'].forEach((w) => consumed.add(w));
   }
 
-  const tokens = lower.split(/\s+/).filter(Boolean);
+  const tokens = lower.split(/[\s,&/|]+/).map(cleanToken).filter(Boolean);
   for (const tok of tokens) {
     if (STOP.has(tok) || consumed.has(tok)) continue;
     if (/^\d{1,2}$/.test(tok) && phaseNumber != null) continue;
     if (tok === 'phase' || ROMAN_TO_INT[tok] || WORD_TO_INT[tok]) continue;
+    // ordinals like 25th / 4th are weak alone — keep only with street context via direct match
+    if (/^\d{1,3}(st|nd|rd|th)$/i.test(tok)) continue;
 
     const forms = societyForms(tok);
     if (forms.length) {
@@ -224,17 +254,22 @@ function parseSmartLocationQuery(raw) {
     ])
     .filter((g) => g.length > 0);
 
+  // Cap AND fan-out so long street strings don't over-constrain
+  const capped = cleaned.slice(0, phaseNumber != null ? 2 : 3);
+
   return {
     isId: null,
     isMessageId: null,
-    mustGroups: cleaned.slice(0, 6),
+    mustGroups: capped,
     phaseNumber,
-    displayQuery: text
+    displayQuery: text,
+    rawQuery: input
   };
 }
 
 /**
  * Build SQL fragment + params for smart location match.
+ * Always OR-match exact/substring area|vicinity|city so every DB place name is searchable.
  */
 function buildSmartLocationSql(parsed, searchableExpr, params) {
   if (parsed.isMessageId != null) {
@@ -276,10 +311,47 @@ function buildSmartLocationSql(parsed, searchableExpr, params) {
     parts.push(`${searchableExpr} ILIKE ANY($${params.length})`);
   }
 
-  if (!parts.length) {
+  // Direct place-name match: raw query against area / vicinity / city
+  const directParts = [];
+  const raw = String(parsed.rawQuery || '').trim();
+  if (raw.length >= 3) {
+    const exact = raw.toLowerCase();
+    const loose = normalizeLoose(raw);
+    params.push(exact);
+    const exactIdx = params.length;
+    directParts.push(`LOWER(TRIM(COALESCE(n.area, ''))) = $${exactIdx}`);
+    directParts.push(`LOWER(TRIM(COALESCE(n.vicinity, ''))) = $${exactIdx}`);
+    directParts.push(`LOWER(TRIM(COALESCE(n.city, ''))) = $${exactIdx}`);
+    params.push(`%${exact}%`);
+    const likeIdx = params.length;
+    directParts.push(`LOWER(COALESCE(n.area, '')) LIKE $${likeIdx}`);
+    directParts.push(`LOWER(COALESCE(n.vicinity, '')) LIKE $${likeIdx}`);
+    directParts.push(`LOWER(COALESCE(n.city, '')) LIKE $${likeIdx}`);
+    if (loose && loose !== exact) {
+      params.push(`%${loose}%`);
+      const looseIdx = params.length;
+      directParts.push(
+        `regexp_replace(LOWER(COALESCE(n.area, '')), '[,&/|]+', ' ', 'g') LIKE $${looseIdx}`
+      );
+      directParts.push(
+        `regexp_replace(LOWER(COALESCE(n.vicinity, '')), '[,&/|]+', ' ', 'g') LIKE $${looseIdx}`
+      );
+    }
+  }
+
+  if (!parts.length && !directParts.length) {
     return { sql: '', parsed };
   }
 
+  if (parts.length && directParts.length) {
+    return {
+      sql: ` AND ((${parts.join(' AND ')}) OR (${directParts.join(' OR ')})) `,
+      parsed
+    };
+  }
+  if (directParts.length) {
+    return { sql: ` AND (${directParts.join(' OR ')}) `, parsed };
+  }
   return {
     sql: ` AND (${parts.join(' AND ')}) `,
     parsed
@@ -300,7 +372,7 @@ function textHasPhase(text, num) {
 }
 
 function scoreLocationMatch(row, parsed) {
-  if (!parsed || parsed.isId != null) return 0;
+  if (!parsed || parsed.isId != null || parsed.isMessageId != null) return 0;
   const text = [
     row.area,
     row.vicinity,
@@ -313,9 +385,16 @@ function scoreLocationMatch(row, parsed) {
     .join(' ');
 
   let score = 0;
+  const raw = String(parsed.rawQuery || '').toLowerCase().trim();
+  const area = String(row.area || '').toLowerCase().trim();
+  const vicinity = String(row.vicinity || '').toLowerCase().trim();
+  const city = String(row.city || '').toLowerCase().trim();
+  if (raw && (area === raw || vicinity === raw || city === raw)) score += 120;
+  else if (raw && (area.includes(raw) || vicinity.includes(raw) || city.includes(raw))) score += 80;
+
   if (parsed.phaseNumber != null) {
     if (textHasPhase(text, parsed.phaseNumber)) score += 50;
-    else score -= 100;
+    else if (score < 80) score -= 100;
     // Penalize other phases dominating vicinity/area
     for (let p = 1; p <= 12; p += 1) {
       if (p === parsed.phaseNumber) continue;
