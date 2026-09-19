@@ -1935,15 +1935,15 @@ const runPropertySearch = async (req) => {
       });
     }
 
-    // Street N guard — reject budget/phone false hits from bare "%10%"
+    // Street N guard — place fields only; reject budget/phone/raw-dump false hits
     if (parsedLocation && parsedLocation.streetNumber != null) {
       const wantStreet = parsedLocation.streetNumber;
-      rows = rows.filter((r) => {
-        const local = [r.area, r.vicinity, r.listing_excerpt, r.summary, r.raw_message]
-          .map((x) => String(x || ''))
-          .join(' ');
-        return textHasStreet(local, wantStreet);
-      });
+      rows = rows.filter((r) =>
+        textHasStreet(
+          [r.area, r.vicinity, r.listing_excerpt, r.summary].map((x) => String(x || '')).join(' '),
+          wantStreet
+        )
+      );
     }
 
     if (

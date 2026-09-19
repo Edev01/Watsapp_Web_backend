@@ -113,17 +113,25 @@ function societyForms(token) {
   return [...forms];
 }
 
-/** Boundary-safe "street 10" / "st 10" (not 100, not 10th, not 1,100). */
+/** Boundary-safe "street 10" / "st 10" (not 100, not 10th, not St 10.60 sizes). */
 function buildStreetRegex(num) {
   const n = String(parseInt(num, 10));
-  return `(^|[^a-z0-9])(street|st\\.?)[[:space:]\\-#]*${n}([^0-9]|$)`;
+  // Negative lookahead: reject Street 100 and St 10.60 (size decimals)
+  return `(^|[^a-z0-9])(street|st\\.?)[[:space:]\\-#]*${n}(?![0-9.])`;
 }
 
 function textHasStreet(text, num) {
   const t = String(text || '').toLowerCase();
   const n = String(parseInt(num, 10));
-  const re = new RegExp(`(^|[^a-z0-9])(street|st\\.?)[\\s\\-#]*${n}([^0-9]|$)`, 'i');
+  const re = new RegExp(`(^|[^a-z0-9])(street|st\\.?)[\\s\\-#]*${n}(?![0-9.])`, 'i');
   return re.test(t);
+}
+
+/** Prefer structured place fields — raw dumps often list many streets. */
+function streetMatchText(row) {
+  return [row.area, row.vicinity, row.listing_excerpt, row.summary]
+    .map((x) => String(x || ''))
+    .join(' ');
 }
 
 function khayabanForms(name) {
@@ -334,27 +342,16 @@ function buildSmartLocationSql(parsed, searchableExpr, params) {
     };
   }
 
-  // Street N: boundary-safe only (never bare %10%)
+  // Street N: boundary-safe only on place fields (never bare %10%, never raw dump)
   if (parsed.streetNumber != null) {
     const n = parsed.streetNumber;
+    const placeExpr =
+      `LOWER(CONCAT_WS(' ', COALESCE(n.area,''), COALESCE(n.vicinity,''), ` +
+      `COALESCE(n.summary,''), COALESCE(n.listing_excerpt,'')))`;
     params.push(buildStreetRegex(n));
     const reIdx = params.length;
-    const streetLikes = [
-      `%street ${n}%`,
-      `%street${n}%`,
-      `%st ${n}%`,
-      `%st. ${n}%`,
-      `%st-${n}%`,
-      `%street-${n}%`
-    ];
-    params.push(streetLikes);
-    const likeIdx = params.length;
     return {
-      sql: ` AND (
-        ${searchableExpr} ~* $${reIdx}
-        OR LOWER(COALESCE(n.area, '')) LIKE ANY($${likeIdx})
-        OR LOWER(COALESCE(n.vicinity, '')) LIKE ANY($${likeIdx})
-      ) `,
+      sql: ` AND (${placeExpr} ~* $${reIdx}) `,
       parsed
     };
   }
@@ -455,7 +452,7 @@ function scoreLocationMatch(row, parsed) {
   else if (raw && (area.includes(raw) || vicinity.includes(raw) || city.includes(raw))) score += 80;
 
   if (parsed.streetNumber != null) {
-    if (textHasStreet(text, parsed.streetNumber)) score += 80;
+    if (textHasStreet(streetMatchText(row), parsed.streetNumber)) score += 80;
     else score -= 100;
   }
 
@@ -483,6 +480,7 @@ module.exports = {
   buildStreetRegex,
   textHasPhase,
   textHasStreet,
+  streetMatchText,
   scoreLocationMatch,
   khayabanForms,
   correctPhaseTypos
