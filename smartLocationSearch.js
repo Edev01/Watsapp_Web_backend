@@ -102,6 +102,8 @@ function buildPhaseRegex(num) {
 function societyForms(token) {
   const t = String(token || '').toLowerCase().trim();
   if (!t) return [];
+  // Bare numbers are too noisy ("%10%" hits 1,100 / phones / 10th)
+  if (/^\d+$/.test(t)) return [];
   const forms = new Set([t]);
   if (t === 'dha' || t === 'defence' || t === 'defense') {
     ['dha', 'defence', 'defense', 'defance'].forEach((x) => forms.add(x));
@@ -109,6 +111,19 @@ function societyForms(token) {
   const hit = matchLocality(t);
   if (hit) localityVariants(hit).forEach((v) => forms.add(v.toLowerCase()));
   return [...forms];
+}
+
+/** Boundary-safe "street 10" / "st 10" (not 100, not 10th, not 1,100). */
+function buildStreetRegex(num) {
+  const n = String(parseInt(num, 10));
+  return `(^|[^a-z0-9])(street|st\\.?)[[:space:]\\-#]*${n}([^0-9]|$)`;
+}
+
+function textHasStreet(text, num) {
+  const t = String(text || '').toLowerCase();
+  const n = String(parseInt(num, 10));
+  const re = new RegExp(`(^|[^a-z0-9])(street|st\\.?)[\\s\\-#]*${n}([^0-9]|$)`, 'i');
+  return re.test(t);
 }
 
 function khayabanForms(name) {
@@ -151,6 +166,7 @@ function parseSmartLocationQuery(raw) {
       isMessageId: null,
       mustGroups: [],
       phaseNumber: null,
+      streetNumber: null,
       displayQuery: '',
       rawQuery: ''
     };
@@ -164,6 +180,7 @@ function parseSmartLocationQuery(raw) {
       isMessageId: parseInt(msgId[1], 10),
       mustGroups: [],
       phaseNumber: null,
+      streetNumber: null,
       displayQuery: input,
       rawQuery: input
     };
@@ -174,7 +191,25 @@ function parseSmartLocationQuery(raw) {
       isMessageId: null,
       mustGroups: [],
       phaseNumber: null,
+      streetNumber: null,
       displayQuery: input,
+      rawQuery: input
+    };
+  }
+
+  // "street 10" / "st 10" / "st-10" — dedicated matcher (never bare %10%)
+  const streetOnly = input.match(
+    /^\s*(?:street|st\.?)\s*[#\-:]?\s*(\d{1,3})\s*$/i
+  );
+  if (streetOnly) {
+    const streetNumber = parseInt(streetOnly[1], 10);
+    return {
+      isId: null,
+      isMessageId: null,
+      mustGroups: [],
+      phaseNumber: null,
+      streetNumber,
+      displayQuery: `street ${streetNumber}`,
       rawQuery: input
     };
   }
@@ -217,6 +252,7 @@ function parseSmartLocationQuery(raw) {
   const tokens = lower.split(/[\s,&/|]+/).map(cleanToken).filter(Boolean);
   for (const tok of tokens) {
     if (STOP.has(tok) || consumed.has(tok)) continue;
+    if (/^\d{1,3}$/.test(tok)) continue; // bare nums never become ILIKE %10%
     if (/^\d{1,2}$/.test(tok) && phaseNumber != null) continue;
     if (tok === 'phase' || ROMAN_TO_INT[tok] || WORD_TO_INT[tok]) continue;
     // ordinals like 25th / 4th are weak alone — keep only with street context via direct match
@@ -262,6 +298,7 @@ function parseSmartLocationQuery(raw) {
     isMessageId: null,
     mustGroups: capped,
     phaseNumber,
+    streetNumber: null,
     displayQuery: text,
     rawQuery: input
   };
@@ -292,6 +329,31 @@ function buildSmartLocationSql(parsed, searchableExpr, params) {
           NOT EXISTS (SELECT 1 FROM normalized_messages nx WHERE nx.id = $${idx})
           AND n.whatsapp_message_id = $${idx}
         )
+      ) `,
+      parsed
+    };
+  }
+
+  // Street N: boundary-safe only (never bare %10%)
+  if (parsed.streetNumber != null) {
+    const n = parsed.streetNumber;
+    params.push(buildStreetRegex(n));
+    const reIdx = params.length;
+    const streetLikes = [
+      `%street ${n}%`,
+      `%street${n}%`,
+      `%st ${n}%`,
+      `%st. ${n}%`,
+      `%st-${n}%`,
+      `%street-${n}%`
+    ];
+    params.push(streetLikes);
+    const likeIdx = params.length;
+    return {
+      sql: ` AND (
+        ${searchableExpr} ~* $${reIdx}
+        OR LOWER(COALESCE(n.area, '')) LIKE ANY($${likeIdx})
+        OR LOWER(COALESCE(n.vicinity, '')) LIKE ANY($${likeIdx})
       ) `,
       parsed
     };
@@ -392,6 +454,11 @@ function scoreLocationMatch(row, parsed) {
   if (raw && (area === raw || vicinity === raw || city === raw)) score += 120;
   else if (raw && (area.includes(raw) || vicinity.includes(raw) || city.includes(raw))) score += 80;
 
+  if (parsed.streetNumber != null) {
+    if (textHasStreet(text, parsed.streetNumber)) score += 80;
+    else score -= 100;
+  }
+
   if (parsed.phaseNumber != null) {
     if (textHasPhase(text, parsed.phaseNumber)) score += 50;
     else if (score < 80) score -= 100;
@@ -413,7 +480,9 @@ module.exports = {
   parseSmartLocationQuery,
   buildSmartLocationSql,
   buildPhaseRegex,
+  buildStreetRegex,
   textHasPhase,
+  textHasStreet,
   scoreLocationMatch,
   khayabanForms,
   correctPhaseTypos

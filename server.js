@@ -9,7 +9,7 @@ const { sendResponse } = require('./responseHelper');
 const { authenticateToken, isAdmin } = require('./middleware');
 const { filterAndSortProperties, PROPERTY_STATUSES, normalizePropertyStatus, isValidPropertyStatus, expandLocationQuery } = require('./propertyHelper');
 const { setExtraLocalities, correctLocalityTypos } = require('./pakistanLocalities');
-const { parseSmartLocationQuery, buildSmartLocationSql, scoreLocationMatch, textHasPhase } = require('./smartLocationSearch');
+const { parseSmartLocationQuery, buildSmartLocationSql, scoreLocationMatch, textHasPhase, textHasStreet } = require('./smartLocationSearch');
 const { extractUserId } = require('./userMiddleware');
 const { findOrCreateCanonicalChat, upsertChatsBulk, cleanText, isSystemNotificationText, isCommonJunkMessage } = require('./contactHelper');
 const {
@@ -1935,7 +1935,23 @@ const runPropertySearch = async (req) => {
       });
     }
 
-    if (parsedLocation && (parsedLocation.phaseNumber != null || (parsedLocation.mustGroups || []).length)) {
+    // Street N guard — reject budget/phone false hits from bare "%10%"
+    if (parsedLocation && parsedLocation.streetNumber != null) {
+      const wantStreet = parsedLocation.streetNumber;
+      rows = rows.filter((r) => {
+        const local = [r.area, r.vicinity, r.listing_excerpt, r.summary, r.raw_message]
+          .map((x) => String(x || ''))
+          .join(' ');
+        return textHasStreet(local, wantStreet);
+      });
+    }
+
+    if (
+      parsedLocation &&
+      (parsedLocation.phaseNumber != null ||
+        parsedLocation.streetNumber != null ||
+        (parsedLocation.mustGroups || []).length)
+    ) {
       rows = rows
         .map((r) => ({ ...r, _score: scoreLocationMatch(r, parsedLocation) }))
         .filter((r) => r._score >= 0)
