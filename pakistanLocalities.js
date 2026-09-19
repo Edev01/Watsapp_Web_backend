@@ -30,7 +30,8 @@ const SEED_LOCALITIES = [
   'khayaban-e-saadi',
   'khayaban-e-iqbal', 'khayaban-e-badar', 'khayaban-e-hilal', 'khayaban-e-sehar',
   'khayaban-e-qasim', 'khayaban-e-jami', 'khayaban-e-shujaat', 'khayaban-e-tanzeem',
-  'khayaban-e-roomi', 'khayaban-e-saba', 'saba avenue', 'beach avenue', 'coastal avenue',
+  'khayaban-e-roomi', 'khayaban-e-saba', 'khayaban-e-rizwan',
+  'rizwan', 'saba avenue', 'beach avenue', 'coastal avenue',
   'jami commercial', 'muslim commercial', 'khalid commercial', 'babar commercial',
   'ayubi commercial', 'badar commercial', 'nishat commercial', 'bukhari commercial',
   'tauheed commercial', 'toheed commercial', 'al murtaza', 'al-murtaza commercial',
@@ -73,6 +74,13 @@ const ALIASES = Object.freeze({
   gizry: 'gizri',
   'khayaban ittehad': 'khayaban-e-ittehad',
   'khy ittehad': 'khayaban-e-ittehad',
+  'khy-e-rizwan': 'khayaban-e-rizwan',
+  'khy e rizwan': 'khayaban-e-rizwan',
+  'kh-e-rizwan': 'khayaban-e-rizwan',
+  'kh e rizwan': 'khayaban-e-rizwan',
+  'khayaban rizwan': 'khayaban-e-rizwan',
+  'khayaban e rizwan': 'khayaban-e-rizwan',
+  rizwan: 'khayaban-e-rizwan',
   bukhri: 'bukhari',
   bukharii: 'bukhari',
   nishaat: 'nishat',
@@ -205,10 +213,16 @@ function matchLocality(phrase) {
   const maxD = maxEditFor(key.length);
   let best = null;
   let bestDist = Infinity;
+  const keyTail = key.split(/\s+/).pop();
   for (const k of keys) {
     if (Math.abs(k.length - key.length) > maxD) continue;
     // Prefer same starting letter to cut false positives (bahria ≠ baldia)
     if (k[0] !== key[0]) continue;
+    // For multi-word / khayaban names, last token must be very close (rizwan ≠ rahat)
+    const kTail = k.split(/\s+/).pop();
+    if (key.includes(' ') || key.length >= 10) {
+      if (editDistance(keyTail, kTail) > 1) continue;
+    }
     const d = editDistance(key, k);
     const rel = d / Math.max(key.length, k.length, 1);
     if (d > 0 && d <= maxD && rel <= 0.28 && d < bestDist) {

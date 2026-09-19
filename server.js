@@ -9,6 +9,7 @@ const { sendResponse } = require('./responseHelper');
 const { authenticateToken, isAdmin } = require('./middleware');
 const { filterAndSortProperties, PROPERTY_STATUSES, normalizePropertyStatus, isValidPropertyStatus, expandLocationQuery } = require('./propertyHelper');
 const { setExtraLocalities, correctLocalityTypos } = require('./pakistanLocalities');
+const { parseSmartLocationQuery, buildSmartLocationSql, scoreLocationMatch, textHasPhase } = require('./smartLocationSearch');
 const { extractUserId } = require('./userMiddleware');
 const { findOrCreateCanonicalChat, upsertChatsBulk, cleanText, isSystemNotificationText, isCommonJunkMessage } = require('./contactHelper');
 const {
@@ -1815,14 +1816,23 @@ const runPropertySearch = async (req) => {
   }
 
   const requestedLimit = parseInt(rawFilters.limit || queryFilters.limit || '50', 10);
-  const limit = Math.min(Math.max(Number.isFinite(requestedLimit) ? requestedLimit : 50, 1), 100);
+  const locationEarly = String(
+    rawFilters.location || queryFilters.location || rawFilters.query || queryFilters.query || ''
+  ).trim();
+  // Location searches need higher cap so older matching listings aren't truncated away
+  const maxLimit = locationEarly ? 500 : 100;
+  const defaultLimit = locationEarly ? 200 : 50;
+  const limit = Math.min(
+    Math.max(Number.isFinite(requestedLimit) ? requestedLimit : defaultLimit, 1),
+    maxLimit
+  );
 
   let queryText = `
     SELECT * FROM (
       SELECT n.id, n.whatsapp_message_id, n.chat_jid, n.purpose, n.city, n.area, n.vicinity,
              n.property_type, n.property_sub_type, n.size, n.price, n.contact_number,
              n.summary, n.property_status, n.created_at, n.category, n.intent, n.sentiment,
-             n.listing_index,
+             n.listing_index, n.listing_excerpt,
              LEFT(COALESCE(NULLIF(TRIM(n.listing_excerpt), ''), m.message), 500) AS raw_message,
              m.timestamp AS message_timestamp, m.from_me, m.user_id
       FROM normalized_messages n
@@ -1848,41 +1858,29 @@ const runPropertySearch = async (req) => {
     queryText += ` AND (n.city ILIKE $${params.length} OR n.area ILIKE $${params.length} OR n.vicinity ILIKE $${params.length})`;
   }
 
+  let parsedLocation = null;
   const location = String(filters.location || '').trim();
   if (location) {
-    const variants = expandLocationQuery(location);
-    const patterns = (variants.length ? variants : [location]).map((v) => `%${v}%`);
-    params.push(patterns);
-    const patternIdx = params.length;
-    // Distinctive part only for trigram (strip street/st/ave so those don't false-match)
-    const fuzzySeed = correctLocalityTypos(location)
-      .replace(/\b(street|st|avenue|ave|road|rd|lane|block|sector|phase|extension|ext|commercial)\b/gi, ' ')
-      .replace(/[–—\-_/\\]+/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .slice(0, 80);
-    params.push(fuzzySeed);
-    const fuzzyIdx = params.length;
-    // Prefer per-listing excerpt so multi-offer messages only match the relevant plot
-    queryText += ` AND (
-      n.area ILIKE ANY($${patternIdx})
-      OR n.vicinity ILIKE ANY($${patternIdx})
-      OR n.city ILIKE ANY($${patternIdx})
-      OR n.summary ILIKE ANY($${patternIdx})
-      OR COALESCE(n.property_type, '') ILIKE ANY($${patternIdx})
-      OR COALESCE(n.property_sub_type, '') ILIKE ANY($${patternIdx})
-      OR COALESCE(n.listing_excerpt, m.message, '') ILIKE ANY($${patternIdx})
-      OR COALESCE(m.sender, '') ILIKE ANY($${patternIdx})
-      OR COALESCE(n.chat_jid, '') ILIKE ANY($${patternIdx})
-      OR (
-        LENGTH($${fuzzyIdx}) >= 4
-        AND (
-          similarity(COALESCE(n.area, ''), $${fuzzyIdx}) > 0.42
-          OR similarity(COALESCE(n.vicinity, ''), $${fuzzyIdx}) > 0.42
-          OR similarity(COALESCE(n.city, ''), $${fuzzyIdx}) > 0.5
-        )
-      )
-    )`;
+    // Prefer listing-local text. Only use raw message when excerpt is missing,
+    // and keep it short to avoid multi-offer sibling leakage.
+    const searchable =
+      `LOWER(CONCAT_WS(' ', COALESCE(n.area,''), COALESCE(n.vicinity,''), COALESCE(n.city,''), ` +
+      `COALESCE(n.summary,''), COALESCE(n.listing_excerpt,''), ` +
+      `CASE WHEN NULLIF(TRIM(COALESCE(n.listing_excerpt,'')), '') IS NULL ` +
+      `THEN LEFT(COALESCE(m.message,''), 600) ELSE '' END))`;
+
+    parsedLocation = parseSmartLocationQuery(location);
+    const built = buildSmartLocationSql(parsedLocation, searchable, params);
+
+    if (built.sql) {
+      queryText += built.sql;
+    } else {
+      const variants = expandLocationQuery(location);
+      const patterns = (variants.length ? variants : [location]).map((v) => `%${v}%`);
+      params.push(patterns);
+      const patternIdx = params.length;
+      queryText += ` AND ${searchable} ILIKE ANY($${patternIdx})`;
+    }
   }
 
   const propertyType = String(filters.propertyType || '').trim();
@@ -1908,21 +1906,52 @@ const runPropertySearch = async (req) => {
     }
   }
 
+  // Fetch a wider pool then relevance-rank (location searches)
+  const fetchLimit = parsedLocation && parsedLocation.phaseNumber != null
+    ? Math.min(Math.max(limit * 3, limit), 800)
+    : limit;
   queryText += ` ORDER BY n.id DESC, n.whatsapp_message_id DESC, COALESCE(n.listing_index, 0) ASC
     ) uniq
     ORDER BY uniq.id DESC LIMIT $${params.length + 1}`;
-  params.push(limit);
+  params.push(fetchLimit);
 
   const client = await db.pool.connect();
   try {
     await client.query('BEGIN');
-    await client.query("SET LOCAL statement_timeout = '8s'");
+    await client.query("SET LOCAL statement_timeout = '20s'");
     const dbResult = await client.query(queryText, params);
     await client.query('COMMIT');
+
+    let rows = dbResult.rows;
+
+    // Hard accuracy guard for phase queries (roman substring + multi-offer leftovers)
+    if (parsedLocation && parsedLocation.phaseNumber != null) {
+      const want = parsedLocation.phaseNumber;
+      rows = rows.filter((r) => {
+        const local = [r.area, r.vicinity, r.listing_excerpt, r.summary, r.raw_message]
+          .map((x) => String(x || ''))
+          .join(' ');
+        return textHasPhase(local, want);
+      });
+    }
+
+    if (parsedLocation && (parsedLocation.phaseNumber != null || (parsedLocation.mustGroups || []).length)) {
+      rows = rows
+        .map((r) => ({ ...r, _score: scoreLocationMatch(r, parsedLocation) }))
+        .filter((r) => r._score >= 0)
+        .sort((a, b) => b._score - a._score || b.id - a.id)
+        .slice(0, limit);
+    } else if (rows.length > limit) {
+      rows = rows.slice(0, limit);
+    }
+
     return {
       filters,
       userId,
-      properties: filterAndSortProperties(dbResult.rows, filters)
+      properties: filterAndSortProperties(rows, {
+        ...filters,
+        sortBy: parsedLocation ? 'Relevance' : filters.sortBy
+      })
     };
   } catch (err) {
     try { await client.query('ROLLBACK'); } catch (_) {}
@@ -1936,10 +1965,18 @@ const runPropertySearch = async (req) => {
 const handlePropertyFilter = async (req, res) => {
   try {
     const { filters, properties } = await runPropertySearch(req);
+    const enriched = properties.map((p) => ({
+      ...p,
+      // Stable IDs for scrap verification: search by these numbers in the location box
+      id: p.id,
+      listingId: p.id,
+      messageId: p.whatsappMessageId || p.whatsapp_message_id || null,
+      whatsappMessageId: p.whatsappMessageId || p.whatsapp_message_id || null
+    }));
     return sendResponse(res, 200, false, {
-      total: properties.length,
+      total: enriched.length,
       filters,
-      properties
+      properties: enriched
     }, 'Properties retrieved successfully');
   } catch (err) {
     console.error('Property filter error:', err);
@@ -1949,7 +1986,10 @@ const handlePropertyFilter = async (req, res) => {
 
 function toDashboardSearchResult(p) {
   return {
-    message_id: p.whatsappMessageId || p.id,
+    id: p.id,
+    listing_id: p.id,
+    message_id: p.whatsappMessageId || p.whatsapp_message_id || null,
+    listing_index: p.listingIndex ?? p.listing_index ?? 0,
     raw_message: p.rawMessage || p.raw_message || '',
     summary: p.summary || '',
     city: p.city || '',

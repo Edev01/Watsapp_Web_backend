@@ -479,7 +479,9 @@ function filterAndSortProperties(rawRows, filters = {}) {
 
   // Sorting
   const sort = (filters.sortBy || 'Newest First').toLowerCase();
-  if (sort.includes('price') && (sort.includes('low') || sort.includes('asc'))) {
+  if (sort.includes('relevance') || sort.includes('best') || sort.includes('match')) {
+    // Keep caller order (already relevance-ranked)
+  } else if (sort.includes('price') && (sort.includes('low') || sort.includes('asc'))) {
     items.sort((a, b) => (a.parsedPricePKR || 0) - (b.parsedPricePKR || 0));
   } else if (sort.includes('price') && (sort.includes('high') || sort.includes('desc'))) {
     items.sort((a, b) => (b.parsedPricePKR || 0) - (a.parsedPricePKR || 0));
