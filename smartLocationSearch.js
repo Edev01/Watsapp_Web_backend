@@ -129,9 +129,11 @@ function textHasStreet(text, num) {
 
 /** Prefer structured place fields — raw dumps often list many streets. */
 function streetMatchText(row) {
+  // Join with a barrier so "...Street" + "10)..." cannot form "Street 10"
   return [row.area, row.vicinity, row.listing_excerpt, row.summary]
-    .map((x) => String(x || ''))
-    .join(' ');
+    .map((x) => String(x || '').trim())
+    .filter(Boolean)
+    .join(' | ');
 }
 
 function khayabanForms(name) {
@@ -346,8 +348,10 @@ function buildSmartLocationSql(parsed, searchableExpr, params) {
   if (parsed.streetNumber != null) {
     const n = parsed.streetNumber;
     const placeExpr =
-      `LOWER(CONCAT_WS(' ', COALESCE(n.area,''), COALESCE(n.vicinity,''), ` +
-      `COALESCE(n.summary,''), COALESCE(n.listing_excerpt,'')))`;
+      `LOWER(CONCAT_WS(' | ', NULLIF(TRIM(COALESCE(n.area,'')), ''), ` +
+      `NULLIF(TRIM(COALESCE(n.vicinity,'')), ''), ` +
+      `NULLIF(TRIM(COALESCE(n.summary,'')), ''), ` +
+      `NULLIF(TRIM(COALESCE(n.listing_excerpt,'')), '')))`;
     params.push(buildStreetRegex(n));
     const reIdx = params.length;
     return {

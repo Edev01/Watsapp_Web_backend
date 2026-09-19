@@ -1940,7 +1940,10 @@ const runPropertySearch = async (req) => {
       const wantStreet = parsedLocation.streetNumber;
       rows = rows.filter((r) =>
         textHasStreet(
-          [r.area, r.vicinity, r.listing_excerpt, r.summary].map((x) => String(x || '')).join(' '),
+          [r.area, r.vicinity, r.listing_excerpt, r.summary]
+            .map((x) => String(x || '').trim())
+            .filter(Boolean)
+            .join(' | '),
           wantStreet
         )
       );
