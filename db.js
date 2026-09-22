@@ -109,6 +109,12 @@ async function runMigrationSteps(client) {
     )`,
     `ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS user_id INTEGER`,
     `ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS from_me BOOLEAN DEFAULT FALSE`,
+    `ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS seq_in_chat INTEGER`,
+    `CREATE INDEX IF NOT EXISTS idx_whatsapp_messages_chat_seq
+       ON whatsapp_messages (user_id, chat_jid, seq_in_chat)`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS uniq_whatsapp_messages_chat_seq
+       ON whatsapp_messages (user_id, chat_jid, seq_in_chat)
+       WHERE seq_in_chat IS NOT NULL`,
     `ALTER TABLE whatsapp_messages DROP CONSTRAINT IF EXISTS unique_message`,
     `ALTER TABLE whatsapp_messages DROP CONSTRAINT IF EXISTS unique_user_message`,
     `DO $$ BEGIN
@@ -172,6 +178,16 @@ async function runMigrationSteps(client) {
      END $$`,
     `CREATE INDEX IF NOT EXISTS idx_link_sessions_updated ON whatsapp_link_sessions (updated_at DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_link_sessions_wa_jid ON whatsapp_link_sessions (whatsapp_jid)`,
+    `CREATE TABLE IF NOT EXISTS whatsapp_scrape_health (
+      user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      worker_status VARCHAR(32) DEFAULT 'unknown',
+      scrape_ok BOOLEAN DEFAULT FALSE,
+      warning TEXT,
+      last_heartbeat_at TIMESTAMPTZ,
+      last_inbound_at TIMESTAMPTZ,
+      last_posted_at TIMESTAMPTZ,
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )`,
     `CREATE TABLE IF NOT EXISTS normalize_jobs (
       user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
       status VARCHAR(32) NOT NULL DEFAULT 'idle',

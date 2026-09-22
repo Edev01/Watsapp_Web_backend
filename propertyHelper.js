@@ -416,6 +416,8 @@ function filterAndSortProperties(rawRows, filters = {}) {
       id: r.id,
       whatsappMessageId: r.whatsapp_message_id,
       listingIndex: r.listing_index ?? 0,
+      seqInChat: r.seq_in_chat ?? r.seqInChat ?? null,
+      seq_in_chat: r.seq_in_chat ?? r.seqInChat ?? null,
       chatJid: r.chat_jid,
       chatName: r.chat_name,
       sender: r.sender,

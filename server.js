@@ -205,6 +205,14 @@ async function resolveWhatsAppConnectionForUser(userId) {
   const linked = link?.status === 'linked';
   const status = link?.status || (boundJid ? 'waiting' : 'none');
 
+  const scrape = await getScrapeHealth(id);
+  const scraping = Boolean(linked && scrape.scrapeOk);
+  const message = !linked
+    ? boundJid
+      ? `Waiting to link bound WhatsApp${boundPhone ? ` ${boundPhone}` : ''}`
+      : 'No WhatsApp linked yet — scan QR to bind the first number'
+    : scrape.warning || `WhatsApp connected${boundPhone ? ` (${boundPhone})` : ''}`;
+
   return {
     whatsappConnected: linked,
     linked,
@@ -213,12 +221,74 @@ async function resolveWhatsAppConnectionForUser(userId) {
     boundWhatsappJid: boundJid,
     boundPhone: boundPhone || null,
     canLinkOtherNumbers: !boundJid,
-    message: linked
-      ? `WhatsApp connected${boundPhone ? ` (${boundPhone})` : ''}`
-      : boundJid
-        ? `Waiting to link bound WhatsApp${boundPhone ? ` ${boundPhone}` : ''}`
-        : 'No WhatsApp linked yet — scan QR to bind the first number'
+    scraping,
+    scrapeOk: scrape.scrapeOk,
+    needsRescan: Boolean(linked && !scrape.scrapeOk),
+    workerStatus: scrape.workerStatus,
+    lastInboundAt: scrape.lastInboundAt,
+    lastPostedAt: scrape.lastPostedAt,
+    message
   };
+}
+
+const WORKER_HEARTBEAT_STALE_MS = 90 * 1000;
+
+async function getScrapeHealth(userId) {
+  const id = parseInt(userId, 10);
+  const empty = {
+    scrapeOk: false,
+    workerStatus: 'unknown',
+    warning: null,
+    lastInboundAt: null,
+    lastPostedAt: null,
+    lastHeartbeatAt: null
+  };
+  if (!id) return empty;
+  try {
+    const res = await db.query(
+      `SELECT worker_status, scrape_ok, warning, last_heartbeat_at, last_inbound_at, last_posted_at
+       FROM whatsapp_scrape_health WHERE user_id = $1`,
+      [id]
+    );
+    const row = res.rows[0];
+    if (!row) {
+      return {
+        ...empty,
+        warning: 'Scraper has not reported in — new messages may not be saving. Scan QR if WhatsApp is not linked.'
+      };
+    }
+    const hb = row.last_heartbeat_at ? Date.parse(row.last_heartbeat_at) : 0;
+    const stale = !hb || Date.now() - hb > WORKER_HEARTBEAT_STALE_MS;
+    if (stale) {
+      return {
+        scrapeOk: false,
+        workerStatus: 'offline',
+        warning:
+          'Scraper worker stopped reporting. New WhatsApp messages are not being saved. Keep this tab open or re-link WhatsApp.',
+        lastInboundAt: row.last_inbound_at || null,
+        lastPostedAt: row.last_posted_at || null,
+        lastHeartbeatAt: row.last_heartbeat_at || null
+      };
+    }
+    return {
+      scrapeOk: row.scrape_ok === true,
+      workerStatus: row.worker_status || 'unknown',
+      warning: row.warning || null,
+      lastInboundAt: row.last_inbound_at || null,
+      lastPostedAt: row.last_posted_at || null,
+      lastHeartbeatAt: row.last_heartbeat_at || null
+    };
+  } catch (err) {
+    console.error('getScrapeHealth error:', err.message);
+    return empty;
+  }
+}
+
+function emitScrapeStatus(userId, payload) {
+  const uid = Number(userId);
+  if (!uid) return;
+  io.to(`user_${uid}`).emit('whatsapp_connection_status', payload);
+  io.to(`user_${uid}`).emit('scrape_health', payload);
 }
 
 async function claimLinkSession(userId) {
@@ -962,6 +1032,7 @@ app.get('/api/qr/latest', async (req, res) => {
       const boundJid = userBound.rows[0]?.bound_whatsapp_jid || link.whatsapp_jid || null;
       const boundPhone =
         userBound.rows[0]?.bound_whatsapp_phone || formatBoundPhone(boundJid);
+      const scrape = await getScrapeHealth(resolvedUserId);
       return sendResponse(
         res,
         200,
@@ -974,9 +1045,14 @@ app.get('/api/qr/latest', async (req, res) => {
           whatsappJid: link.whatsapp_jid || boundJid,
           boundWhatsappJid: boundJid,
           boundPhone,
-          url: null
+          url: null,
+          scraping: scrape.scrapeOk,
+          scrapeOk: scrape.scrapeOk,
+          needsRescan: !scrape.scrapeOk,
+          workerStatus: scrape.workerStatus,
+          message: scrape.warning || 'WhatsApp already connected — QR not shown'
         },
-        'WhatsApp already connected — QR not shown'
+        scrape.warning || 'WhatsApp already connected — QR not shown'
       );
     }
 
@@ -1027,7 +1103,7 @@ app.get('/api/qr/connection-status', async (req, res) => {
         userId: Number(userId),
         ...whatsapp
       },
-      whatsapp.linked ? 'WhatsApp connected' : 'WhatsApp not connected'
+      whatsapp.message || (whatsapp.linked ? 'WhatsApp connected' : 'WhatsApp not connected')
     );
   } catch (err) {
     console.error('Get connection status error:', err);
@@ -1035,22 +1111,91 @@ app.get('/api/qr/connection-status', async (req, res) => {
   }
 });
 
-function resolveTenantUserId(req, fallback = null) {
-  const force = String(req.headers['x-force-user-id'] || '') === '1';
-  const headerId = req.headers['x-user-id'];
-  if (force && headerId != null && !isNaN(parseInt(headerId, 10))) {
-    return parseInt(headerId, 10);
+// Worker heartbeat: phone can look linked while scrape is dead (Bad MAC / no inbound).
+app.post('/api/qr/scrape-health', async (req, res) => {
+  const userId = resolveTenantUserId(req, null);
+  if (!userId) {
+    return sendResponse(res, 401, true, null, 'userId is required');
   }
-  const raw =
-    req.userId ||
-    req.body?.userId ||
-    req.body?.user_id ||
-    req.query?.userId ||
-    req.query?.user_id ||
-    headerId ||
-    fallback;
-  if (raw == null || String(raw).trim() === '' || isNaN(parseInt(raw, 10))) return fallback;
-  return parseInt(raw, 10);
+  const body = req.body || {};
+  const workerStatus = String(body.status || body.workerStatus || 'unknown').slice(0, 32);
+  const scrapeOk = body.scrapeOk === true || body.scrape_ok === true;
+  const warning = body.warning ? String(body.warning).slice(0, 500) : null;
+  const lastInboundAt = body.lastInboundAt || body.last_inbound_at || null;
+  const lastPostedAt = body.lastPostedAt || body.last_posted_at || null;
+  try {
+    const prev = await db.query(
+      'SELECT scrape_ok, warning FROM whatsapp_scrape_health WHERE user_id = $1',
+      [userId]
+    );
+    await db.query(
+      `INSERT INTO whatsapp_scrape_health (
+         user_id, worker_status, scrape_ok, warning, last_heartbeat_at, last_inbound_at, last_posted_at, updated_at
+       ) VALUES ($1, $2, $3, $4, NOW(), $5, $6, NOW())
+       ON CONFLICT (user_id) DO UPDATE SET
+         worker_status = EXCLUDED.worker_status,
+         scrape_ok = EXCLUDED.scrape_ok,
+         warning = EXCLUDED.warning,
+         last_heartbeat_at = NOW(),
+         last_inbound_at = COALESCE(EXCLUDED.last_inbound_at, whatsapp_scrape_health.last_inbound_at),
+         last_posted_at = COALESCE(EXCLUDED.last_posted_at, whatsapp_scrape_health.last_posted_at),
+         updated_at = NOW()`,
+      [
+        userId,
+        workerStatus,
+        scrapeOk,
+        warning,
+        lastInboundAt,
+        lastPostedAt
+      ]
+    );
+    const prevOk = prev.rows[0]?.scrape_ok === true;
+    const prevWarn = prev.rows[0]?.warning || null;
+    if (prevOk !== scrapeOk || prevWarn !== warning) {
+      const whatsapp = await resolveWhatsAppConnectionForUser(userId);
+      emitScrapeStatus(userId, {
+        userId,
+        ...whatsapp
+      });
+    }
+    return sendResponse(res, 200, false, { userId, scrapeOk, workerStatus }, 'Scrape health saved');
+  } catch (err) {
+    console.error('scrape-health error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
+function parsePositiveInt(value) {
+  if (value == null || String(value).trim() === '') return null;
+  const n = parseInt(value, 10);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function isWorkerRequest(req) {
+  return (
+    String(req.headers['x-force-user-id'] || '') === '1' ||
+    String(req.headers['x-wa-worker'] || '') === '1'
+  );
+}
+
+function resolveTenantUserId(req, fallback = null) {
+  const headerId = parsePositiveInt(req.headers['x-user-id']);
+  const bodyId = parsePositiveInt(req.body?.userId || req.body?.user_id);
+  const queryId = parsePositiveInt(req.query?.userId || req.query?.user_id);
+  const jwtId = req.authFromJwt
+    ? parsePositiveInt(req.userId || req.user?.id || req.user?.userId)
+    : null;
+
+  // Worker posts are authoritative (never remap onto another portal user).
+  if (isWorkerRequest(req)) {
+    return headerId || bodyId || jwtId || fallback;
+  }
+
+  // Logged-in portal user: always their own tenant. Query/header cannot
+  // sneak in another account's chatrooms.
+  if (jwtId) return jwtId;
+
+  return bodyId || queryId || headerId || fallback;
 }
 
 /** Stamp last_scraped_at on all monitored chats (WhatsApp logout / session pause). */
@@ -1066,7 +1211,7 @@ async function stampMonitoredScrapePause(userId) {
 }
 
 function parseChatListQuery(req) {
-  const userId = resolveTenantUserId(req, 1);
+  const userId = resolveTenantUserId(req, null);
   const rawType = String(req.query.type || req.query.filter || 'all').toLowerCase();
   const type = ['monitored', 'chats', 'all'].includes(rawType) ? rawType : 'all';
   const search = String(req.query.search || req.query.q || '').trim();
@@ -1099,7 +1244,7 @@ function buildChatListSql({ userId, type, search, pageSize, offset }) {
     SELECT jid, name, avatar, is_monitored, user_id, created_at, monitored_at, last_scraped_at
     FROM whatsapp_chats
     ${where}
-    ORDER BY name ASC NULLS LAST, jid ASC
+    ORDER BY created_at DESC NULLS LAST, name ASC NULLS LAST, jid ASC
     LIMIT $${params.length - 1} OFFSET $${params.length}`;
 
   return { sql, params, countSql, countParams };
@@ -1108,7 +1253,10 @@ function buildChatListSql({ userId, type, search, pageSize, offset }) {
 // 7. Post scraped chat rooms (worker dumps full WhatsApp chat list)
 app.post('/api/scraped-chats/contacts', async (req, res) => {
   const { contacts } = req.body;
-  const userId = resolveTenantUserId(req, 1);
+  const userId = resolveTenantUserId(req, null);
+  if (!userId) {
+    return sendResponse(res, 401, true, null, 'userId is required');
+  }
   if (!Array.isArray(contacts)) {
     return sendResponse(res, 400, true, null, 'Contacts array is required');
   }
@@ -1129,7 +1277,10 @@ app.post('/api/scraped-chats/contacts', async (req, res) => {
 
 // 8. Get Monitored Chats list (Includes last_scraped_timestamp for incremental sync)
 app.get('/api/scraped-chats/monitored', async (req, res) => {
-  const userId = req.userId || req.query.userId || req.query.user_id || 1;
+  const userId = resolveTenantUserId(req, null);
+  if (!userId) {
+    return sendResponse(res, 401, true, null, 'Login required');
+  }
   try {
     const result = await db.query(
       `SELECT c.jid, c.name, c.avatar, c.is_monitored, c.user_id, c.created_at,
@@ -1150,7 +1301,10 @@ app.get('/api/scraped-chats/monitored', async (req, res) => {
 // 9. Post Scraped Chat Messages (Canonical JID matching to prevent duplicate recipient creation)
 app.post('/api/scraped-chats/messages', async (req, res) => {
   const { chatId, chatName, messages, jid, name } = req.body;
-  const userId = resolveTenantUserId(req, 1);
+  const userId = resolveTenantUserId(req, null);
+  if (!userId) {
+    return sendResponse(res, 401, true, null, 'userId is required');
+  }
   const resolvedChatId = chatId || jid || null;
   const resolvedChatName = chatName || name || null;
 
@@ -1174,6 +1328,8 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
     let skippedCount = 0;
     const insertErrors = [];
     let maxMessageEpoch = null;
+    let seqFrom = null;
+    let seqTo = null;
     const toInsert = [];
 
     for (const msg of messages) {
@@ -1207,7 +1363,14 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
     }
 
     if (toInsert.length) {
+      const client = await db.pool.connect();
       try {
+        await client.query('BEGIN');
+        await client.query(
+          `SELECT id FROM whatsapp_chats WHERE user_id = $1 AND jid = $2 FOR UPDATE`,
+          [userId, canonicalJid]
+        );
+
         const params = [];
         const values = [];
         let p = 1;
@@ -1222,18 +1385,44 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
             row.isFromMe
           );
         }
-        const result = await db.query(
+        const result = await client.query(
           `INSERT INTO whatsapp_messages (user_id, chat_jid, sender, timestamp, message, from_me)
            VALUES ${values.join(',')}
            ON CONFLICT (user_id, chat_jid, sender, timestamp, message)
-           DO UPDATE SET from_me = EXCLUDED.from_me
-           RETURNING id, (xmax = 0) AS inserted`,
+           DO NOTHING
+           RETURNING id`,
           params
         );
-        for (const r of result.rows) {
-          if (r.inserted) addedCount++;
-          else skippedCount++;
+        addedCount = result.rows.length;
+        skippedCount += toInsert.length - addedCount;
+
+        if (addedCount > 0) {
+          const newIds = result.rows.map((r) => r.id);
+          const numbered = await client.query(
+            `UPDATE whatsapp_messages m
+             SET seq_in_chat = s.seq
+             FROM (
+               SELECT x.id,
+                      COALESCE((
+                        SELECT MAX(seq_in_chat)
+                        FROM whatsapp_messages
+                        WHERE user_id = $1 AND chat_jid = $2 AND seq_in_chat IS NOT NULL
+                      ), -1) + ROW_NUMBER() OVER (ORDER BY x.id) AS seq
+               FROM unnest($3::int[]) AS x(id)
+             ) s
+             WHERE m.id = s.id
+             RETURNING m.id, m.seq_in_chat`,
+            [userId, canonicalJid, newIds]
+          );
+          const seqs = numbered.rows.map((r) => r.seq_in_chat).filter((n) => n != null);
+          if (seqs.length) {
+            seqFrom = Math.min(...seqs);
+            seqTo = Math.max(...seqs);
+          }
         }
+
+        await client.query('COMMIT');
+
         for (const row of toInsert) {
           if (row.messageEpoch != null) {
             maxMessageEpoch =
@@ -1244,9 +1433,12 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
         }
         if (addedCount === 0) maxMessageEpoch = null;
       } catch (insertErr) {
+        try { await client.query('ROLLBACK'); } catch (_) {}
         skippedCount += toInsert.length;
         insertErrors.push(insertErr.message);
         console.error('Message insert error:', insertErr.message);
+      } finally {
+        client.release();
       }
     }
 
@@ -1265,7 +1457,9 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
       chatJid: canonicalJid,
       chatName: resolvedChatName,
       addedCount,
-      skippedCount
+      skippedCount,
+      seqFrom,
+      seqTo
     });
 
     // Auto-queue AI normalization for this tenant (no PC / manual step).
@@ -1290,7 +1484,7 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
       res,
       201,
       false,
-      { addedCount, skippedCount, targetJid: canonicalJid, userId, insertErrors: insertErrors.slice(0, 3) },
+      { addedCount, skippedCount, targetJid: canonicalJid, userId, seqFrom, seqTo, insertErrors: insertErrors.slice(0, 3) },
       addedCount > 0 ? 'Messages saved successfully' : 'No new messages (duplicates skipped)'
     );
   } catch (err) {
@@ -1302,7 +1496,10 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
 // 10. Toggle Monitored Status for Chats
 app.post('/api/scraped-chats/monitor', async (req, res) => {
   const body = req.body || {};
-  const userId = req.userId || body.userId || body.user_id || 1;
+  const userId = resolveTenantUserId(req, null);
+  if (!userId) {
+    return sendResponse(res, 401, true, null, 'Login required to monitor chats');
+  }
 
   // Accept jids[], or a single jid / chatId / id
   const rawJids = Array.isArray(body.jids)
@@ -1412,6 +1609,9 @@ app.post('/api/scraped-chats/monitor', async (req, res) => {
 // 11. Get chats (type=monitored|chats|all — paginated, supports search)
 app.get('/api/scraped-chats', async (req, res) => {
   const { userId, type, search, page, pageSize, offset } = parseChatListQuery(req);
+  if (!userId) {
+    return sendResponse(res, 401, true, null, 'Login required to list your chatrooms');
+  }
   try {
     const { sql, params, countSql, countParams } = buildChatListSql({
       userId,
@@ -1448,7 +1648,10 @@ app.get('/api/scraped-chats', async (req, res) => {
 
 // 11a. Lightweight chat counts for dashboard stats
 app.get('/api/scraped-chats/stats', async (req, res) => {
-  const userId = resolveTenantUserId(req, 1);
+  const userId = resolveTenantUserId(req, null);
+  if (!userId) {
+    return sendResponse(res, 401, true, null, 'Login required');
+  }
   try {
     const result = await db.query(
       `SELECT
@@ -1464,7 +1667,15 @@ app.get('/api/scraped-chats/stats', async (req, res) => {
        WHERE user_id = $1`,
       [userId]
     );
-    return sendResponse(res, 200, false, result.rows[0], 'Chat stats retrieved');
+    const scrape = await getScrapeHealth(userId);
+    return sendResponse(res, 200, false, {
+      ...result.rows[0],
+      scraping: scrape.scrapeOk,
+      scrapeOk: scrape.scrapeOk,
+      needsRescan: !scrape.scrapeOk,
+      workerStatus: scrape.workerStatus,
+      message: scrape.warning
+    }, scrape.warning || 'Chat stats retrieved');
   } catch (err) {
     console.error('Get chat stats error:', err);
     return sendResponse(res, 500, true, null, err.message || 'Server error');
@@ -1479,6 +1690,16 @@ app.post('/api/scraped-chats/pause-scraping', async (req, res) => {
   }
   try {
     const pausedCount = await stampMonitoredScrapePause(userId);
+    emitScrapeStatus(userId, {
+      userId,
+      linked: false,
+      whatsappConnected: false,
+      scraping: false,
+      scrapeOk: false,
+      needsRescan: true,
+      workerStatus: 'disconnected',
+      message: 'WhatsApp disconnected — new messages are not being scraped. Scan QR to reconnect.'
+    });
     return sendResponse(
       res,
       200,
@@ -1494,7 +1715,10 @@ app.post('/api/scraped-chats/pause-scraping', async (req, res) => {
 
 // 11b. Get All Realtors List (Includes total message counts & identifiers for user)
 app.get('/api/realtors', async (req, res) => {
-  const userId = req.userId || req.query.userId || req.query.user_id || 1;
+  const userId = resolveTenantUserId(req, null);
+  if (!userId) {
+    return sendResponse(res, 401, true, null, 'Login required');
+  }
   try {
     const result = await db.query(
       `SELECT c.id, c.jid, c.name, c.avatar, c.is_monitored, c.user_id, c.created_at,
@@ -1516,7 +1740,10 @@ app.get('/api/realtors', async (req, res) => {
 // 12. Get Messages for a Specific Chat / Realtor (Supports chatId, jid, or name query params)
 // If no chat filter is provided, returns all messages for the user (multi-tenant safe).
 app.get('/api/scraped-chats/messages', async (req, res) => {
-  const userId = req.userId || req.query.userId || req.query.user_id || 1;
+  const userId = resolveTenantUserId(req, null);
+  if (!userId) {
+    return sendResponse(res, 401, true, null, 'Login required');
+  }
   const { chatId, jid, name, limit, offset, countOnly } = req.query;
   const targetId = chatId || jid;
   const pageLimit = Math.min(parseInt(limit, 10) || 5000, 10000);
@@ -1534,7 +1761,7 @@ app.get('/api/scraped-chats/messages', async (req, res) => {
     let result;
     if (targetId) {
       result = await db.query(
-        `SELECT m.id, m.chat_jid, c.name as chat_name, m.sender, m.timestamp, m.message, m.from_me, m.from_me as "fromMe", m.user_id, m.created_at 
+        `SELECT m.id, m.chat_jid, c.name as chat_name, m.sender, m.timestamp, m.message, m.from_me, m.from_me as "fromMe", m.user_id, m.created_at, m.seq_in_chat, m.seq_in_chat as "seqInChat" 
          FROM whatsapp_messages m
          LEFT JOIN whatsapp_chats c ON m.chat_jid = c.jid AND m.user_id = c.user_id
          WHERE m.user_id = $1 AND (m.chat_jid = $2 OR LOWER(COALESCE(c.name, '')) LIKE LOWER($3))
@@ -1544,7 +1771,7 @@ app.get('/api/scraped-chats/messages', async (req, res) => {
       );
     } else if (name) {
       result = await db.query(
-        `SELECT m.id, m.chat_jid, c.name as chat_name, m.sender, m.timestamp, m.message, m.from_me, m.from_me as "fromMe", m.user_id, m.created_at 
+        `SELECT m.id, m.chat_jid, c.name as chat_name, m.sender, m.timestamp, m.message, m.from_me, m.from_me as "fromMe", m.user_id, m.created_at, m.seq_in_chat, m.seq_in_chat as "seqInChat" 
          FROM whatsapp_messages m
          LEFT JOIN whatsapp_chats c ON m.chat_jid = c.jid AND m.user_id = c.user_id
          WHERE m.user_id = $1 AND LOWER(COALESCE(c.name, '')) LIKE LOWER($2)
@@ -1555,7 +1782,7 @@ app.get('/api/scraped-chats/messages', async (req, res) => {
     } else {
       // No chat filter: return this user's messages only (fixes frontend 400)
       result = await db.query(
-        `SELECT m.id, m.chat_jid, c.name as chat_name, m.sender, m.timestamp, m.message, m.from_me, m.from_me as "fromMe", m.user_id, m.created_at 
+        `SELECT m.id, m.chat_jid, c.name as chat_name, m.sender, m.timestamp, m.message, m.from_me, m.from_me as "fromMe", m.user_id, m.created_at, m.seq_in_chat, m.seq_in_chat as "seqInChat" 
          FROM whatsapp_messages m
          LEFT JOIN whatsapp_chats c ON m.chat_jid = c.jid AND m.user_id = c.user_id
          WHERE m.user_id = $1
@@ -1834,7 +2061,7 @@ const runPropertySearch = async (req) => {
              n.summary, n.property_status, n.created_at, n.category, n.intent, n.sentiment,
              n.listing_index, n.listing_excerpt,
              LEFT(COALESCE(NULLIF(TRIM(n.listing_excerpt), ''), m.message), 500) AS raw_message,
-             m.timestamp AS message_timestamp, m.from_me, m.user_id
+             m.timestamp AS message_timestamp, m.from_me, m.user_id, m.seq_in_chat
       FROM normalized_messages n
       INNER JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
       WHERE m.user_id = $1
@@ -1990,7 +2217,9 @@ const handlePropertyFilter = async (req, res) => {
       id: p.id,
       listingId: p.id,
       messageId: p.whatsappMessageId || p.whatsapp_message_id || null,
-      whatsappMessageId: p.whatsappMessageId || p.whatsapp_message_id || null
+      whatsappMessageId: p.whatsappMessageId || p.whatsapp_message_id || null,
+      seqInChat: p.seqInChat ?? p.seq_in_chat ?? null,
+      seq_in_chat: p.seqInChat ?? p.seq_in_chat ?? null
     }));
     return sendResponse(res, 200, false, {
       total: enriched.length,
@@ -2009,6 +2238,8 @@ function toDashboardSearchResult(p) {
     listing_id: p.id,
     message_id: p.whatsappMessageId || p.whatsapp_message_id || null,
     listing_index: p.listingIndex ?? p.listing_index ?? 0,
+    seq_in_chat: p.seqInChat ?? p.seq_in_chat ?? null,
+    seqInChat: p.seqInChat ?? p.seq_in_chat ?? null,
     raw_message: p.rawMessage || p.raw_message || '',
     summary: p.summary || '',
     city: p.city || '',

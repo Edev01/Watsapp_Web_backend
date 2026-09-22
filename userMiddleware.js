@@ -19,8 +19,10 @@ const extractUserId = (req, res, next) => {
 
   if (token) {
     jwt.verify(token, process.env.JWT_SECRET || 'super_secret_jwt_key_123!', (err, user) => {
-      if (!err && user && user.id) {
-        req.userId = parseInt(user.id, 10);
+      if (!err && user && (user.id || user.userId)) {
+        req.user = user;
+        req.authFromJwt = true;
+        req.userId = parseInt(user.id || user.userId, 10);
       } else if (customHeader) {
         req.userId = parseInt(customHeader, 10);
       } else if (bodyId) {
