@@ -35,8 +35,23 @@ const STOP = new Set([
   'the', 'a', 'an', 'in', 'at', 'of', 'for', 'and', 'or', 'near', 'to', 'on',
   'by', 'from', 'with', 'area', 'plot', 'house', 'main', 'new', 'old', 'ph',
   'street', 'st', 'avenue', 'ave', 'road', 'rd', 'lane', 'ln', 'belt', 'zone',
-  'tower', 'towers', 'commercial', 'between', 'corner'
+  'tower', 'towers', 'commercial', 'between', 'corner',
+  // Urdu "in" (میں) — often written mein/main/mai; must not become a place
+  'mein', 'mai', 'meny', 'mayn', 'me'
 ]);
+
+/** True when every token is noise (main/mein/new/…) — not a real place query. */
+function isWeakOnlyLocationQuery(raw) {
+  const toks = normalizeSpaces(raw)
+    .toLowerCase()
+    .split(/\s+/)
+    .map(cleanToken)
+    .filter(Boolean);
+  if (!toks.length) return true;
+  return toks.every(
+    (t) => STOP.has(t) || t === 'phase' || ROMAN_TO_INT[t] != null || WORD_TO_INT[t] != null || /^\d{1,2}$/.test(t)
+  );
+}
 
 function correctPhaseTypos(text) {
   return String(text || '').replace(/[A-Za-z]+/g, (word) => {
@@ -183,7 +198,8 @@ function parseSmartLocationQuery(raw) {
       phaseNumber: null,
       streetNumber: null,
       displayQuery: '',
-      rawQuery: ''
+      rawQuery: '',
+      rejectAll: false
     };
   }
 
@@ -197,7 +213,8 @@ function parseSmartLocationQuery(raw) {
       phaseNumber: null,
       streetNumber: null,
       displayQuery: input,
-      rawQuery: input
+      rawQuery: input,
+      rejectAll: false
     };
   }
   if (/^\d{1,12}$/.test(input)) {
@@ -208,7 +225,8 @@ function parseSmartLocationQuery(raw) {
       phaseNumber: null,
       streetNumber: null,
       displayQuery: input,
-      rawQuery: input
+      rawQuery: input,
+      rejectAll: false
     };
   }
 
@@ -225,7 +243,8 @@ function parseSmartLocationQuery(raw) {
       phaseNumber: null,
       streetNumber,
       displayQuery: `street ${streetNumber}`,
-      rawQuery: input
+      rawQuery: input,
+      rejectAll: false
     };
   }
 
@@ -312,9 +331,12 @@ function parseSmartLocationQuery(raw) {
 
   if (!mustGroups.length && phaseNumber == null) {
     const spaced = normalizeSpaces(lower);
-    mustGroups.push(
-      [spaced, spaced.replace(/\s+/g, '-'), spaced.replace(/\s+/g, '')].filter(Boolean)
-    );
+    // Do not fall back to ILIKE %main%/%mein% — weak-only queries match nothing useful
+    if (!isWeakOnlyLocationQuery(spaced)) {
+      mustGroups.push(
+        [spaced, spaced.replace(/\s+/g, '-'), spaced.replace(/\s+/g, '')].filter(Boolean)
+      );
+    }
   }
 
   const cleaned = mustGroups
@@ -330,6 +352,11 @@ function parseSmartLocationQuery(raw) {
   // Cap AND fan-out so long street strings don't over-constrain
   const capped = cleaned.slice(0, phaseNumber != null ? 2 : 3);
 
+  const rejectAll =
+    !capped.length &&
+    phaseNumber == null &&
+    isWeakOnlyLocationQuery(input);
+
   return {
     isId: null,
     isMessageId: null,
@@ -337,7 +364,8 @@ function parseSmartLocationQuery(raw) {
     phaseNumber,
     streetNumber: null,
     displayQuery: text,
-    rawQuery: input
+    rawQuery: input,
+    rejectAll
   };
 }
 
@@ -346,6 +374,10 @@ function parseSmartLocationQuery(raw) {
  * Always OR-match exact/substring area|vicinity|city so every DB place name is searchable.
  */
 function buildSmartLocationSql(parsed, searchableExpr, params) {
+  if (parsed.rejectAll) {
+    return { sql: ' AND FALSE ', parsed };
+  }
+
   if (parsed.isMessageId != null) {
     params.push(parsed.isMessageId);
     const idx = params.length;
@@ -404,7 +436,7 @@ function buildSmartLocationSql(parsed, searchableExpr, params) {
   // Direct place-name match: raw query against area / vicinity / city
   const directParts = [];
   const raw = String(parsed.rawQuery || '').trim();
-  if (raw.length >= 3) {
+  if (raw.length >= 3 && !isWeakOnlyLocationQuery(raw)) {
     const exact = raw.toLowerCase();
     const loose = normalizeLoose(raw);
     params.push(exact);
@@ -488,7 +520,7 @@ function scoreLocationMatch(row, parsed) {
   }
 
   if (parsed.phaseNumber != null) {
-    if (textHasPhase(text, parsed.phaseNumber)) score += 50;
+    if (textHasPhase(text, parsed.phaseNumber)) score += 100;
     else if (score < 80) score -= 100;
     // Penalize other phases dominating vicinity/area
     for (let p = 1; p <= 12; p += 1) {
@@ -497,6 +529,11 @@ function scoreLocationMatch(row, parsed) {
         score -= 40;
       }
     }
+  }
+  // Weak token "main" alone in area should not outrank real phase hits
+  const areaVic = `${area} ${vicinity}`;
+  if (/\bmain\b/i.test(areaVic) && !/\bphase\b/i.test(areaVic) && parsed.phaseNumber != null) {
+    score -= 30;
   }
   for (const group of parsed.mustGroups || []) {
     if (group.some((g) => text.includes(String(g).toLowerCase()))) score += 20;

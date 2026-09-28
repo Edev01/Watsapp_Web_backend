@@ -59,10 +59,12 @@ Rules:
    - Use "RENT" when property is advertised FOR RENT / TO RENT / FOR LEASE / RENTAL
    - NEVER use "BUY" - use "SALE" instead
 6. Location hierarchy:
-   - "area" = Major housing society/neighborhood (DHA, Bahria Town, Clifton, North Nazimabad, etc.)
-   - "vicinity" = Sub-location (Phase 6, Block H, Scheme 33, Street 3, etc.)
+   - "area" = Major housing society/neighborhood (DHA, Bahria Town, Clifton, North Nazimabad, Korangi, etc.)
+   - "vicinity" = Sub-location (Phase 6, Block H, Scheme 33, Street 3, Main Street 5, etc.)
+   - Roman Urdu "mein" / "mai" / bare "main" usually means "in" (e.g. "Korangi mein" = in Korangi). Do NOT store "main" or "mein" as area or vicinity by itself.
+   - For "Main DHA Phase 8", area="DHA", vicinity="Phase 8" (phase is the strong signal; do not use area="Main" or "Main DHA").
 7. Normalize city names: "Karachi", "Lahore", "Islamabad", "Rawalpindi", "Faisalabad", etc.
-8. Handle spelling variations: "Cliftn" -> "Clifton", "Krachi" -> "Karachi"
+8. Handle spelling variations: "Cliftn" -> "Clifton", "Krachi" -> "Karachi", "kroangi/korngi" -> "Korangi"
 9. CRITICAL NUMERIC RULES:
    - size_value and price_value MUST be a single number or null. NEVER an array.
    - property_type must be ONE value (e.g. "HOUSE"), never "HOUSE | PLOT".

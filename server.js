@@ -10,6 +10,7 @@ const { authenticateToken, isAdmin } = require('./middleware');
 const { filterAndSortProperties, PROPERTY_STATUSES, normalizePropertyStatus, isValidPropertyStatus, expandLocationQuery } = require('./propertyHelper');
 const { setExtraLocalities, correctLocalityTypos, canonicalizePlaceText, normalizePlaceKey, isKhayabanFamilyToken, khayabanSearchPatterns } = require('./pakistanLocalities');
 const { parseSmartLocationQuery, buildSmartLocationSql, scoreLocationMatch, textHasPhase, textHasStreet } = require('./smartLocationSearch');
+const { isWeakLocation } = require('./ai/cascadeMerge');
 const { extractUserId } = require('./userMiddleware');
 const { findOrCreateCanonicalChat, upsertChatsBulk, cleanText, isSystemNotificationText, isCommonJunkMessage } = require('./contactHelper');
 const {
@@ -2474,6 +2475,7 @@ app.get('/api/places/suggest', authenticateToken, async (req, res) => {
     const addSuggestion = (rawName, kind, hits = 0, { parent = false } = {}) => {
       const cleaned = String(rawName || '').trim();
       if (!cleaned) return;
+      if (!parent && isWeakLocation(cleaned)) return;
       const canon = canonicalizePlaceText(cleaned) || cleaned;
       const key = normalizePlaceKey(canon);
       if (!key || key.length < 2) return;

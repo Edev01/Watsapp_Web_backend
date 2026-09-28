@@ -1,14 +1,18 @@
 const db = require('../db');
 const { getConfig } = require('./config');
 const { LLMClient, expandListingSchemas } = require('./llmClient');
+const { GeminiClient } = require('./geminiClient');
+const { fillGapsOnly, scrubWeakLocations } = require('./cascadeMerge');
 const { splitPropertyOffers, extractSharedContacts } = require('./listingSplitter');
-const { LOCAL_MODEL, extractMessageSchema } = require('./localNer');
+const { extractMessageSchema } = require('./localNer');
 const { canonicalizePlaceText } = require('../pakistanLocalities');
 const {
   loadSkippedIds,
   logNormalizationFailure,
   getSkippedIds
 } = require('./failureLog');
+
+const CASCADE_MODEL = 'cascade';
 
 function tenantId(userId) {
   return userId == null ? 1 : Number(userId);
@@ -239,53 +243,106 @@ async function loadPendingJobs(targetModel, userId, window, { ignoreSkips = true
   }));
 }
 
-async function normalizeOne(job, llmClient, targetModel) {
+/**
+ * Gemini (primary) → Qwen (fill gaps) → local NER (fill gaps).
+ * Later stages never overwrite non-empty fields from earlier stages.
+ */
+async function cascadeNormalizeText(text, sender, llmClient, qwenModel, geminiClient) {
+  const stages = [];
+  let schema = null;
+
+  // 1) Gemini
+  if (geminiClient && geminiClient.isConfigured()) {
+    const g = await geminiClient.normalizeMessage(text, sender);
+    if (g.isValid && g.schema) {
+      schema = scrubWeakLocations(g.schema);
+      stages.push(`gemini:${g.modelUsed || 'ok'}`);
+    } else if (g.errorReason && g.errorReason !== 'GEMINI_NOT_CONFIGURED') {
+      stages.push(`gemini:miss:${String(g.errorReason).slice(0, 40)}`);
+    }
+  } else {
+    stages.push('gemini:skip');
+  }
+
+  // 2) Qwen — fill only what Gemini left empty
+  const q = await llmClient.normalizeMessage(text, sender, qwenModel);
+  if (q.isValid && q.schema) {
+    if (!schema) {
+      schema = scrubWeakLocations(q.schema);
+      stages.push('qwen:primary');
+    } else {
+      schema = fillGapsOnly(schema, q.schema);
+      stages.push('qwen:fill');
+    }
+  } else if (q.errorReason) {
+    stages.push(`qwen:miss:${String(q.errorReason).slice(0, 40)}`);
+    if (/RATE_LIMIT/i.test(String(q.errorReason))) {
+      return { schema, stages, rateLimited: true };
+    }
+  }
+
+  // 3) Local NER — fill only remaining gaps
+  const local = await extractMessageSchema(text, sender);
+  if (local) {
+    if (!schema) {
+      schema = scrubWeakLocations(local);
+      stages.push('ner:primary');
+    } else {
+      schema = fillGapsOnly(schema, local);
+      stages.push('ner:fill');
+    }
+  } else {
+    stages.push('ner:miss');
+  }
+
+  return { schema, stages, rateLimited: false };
+}
+
+async function normalizeOne(job, llmClient, targetModel, geminiClient) {
   try {
     const sharedContact = extractSharedContacts(job.message);
-    const localSchema = await extractMessageSchema(job.message, job.sender);
-    if (localSchema) {
-      if (sharedContact && !localSchema.contact_number) {
-        localSchema.contact_number = sharedContact;
-      }
-      const saved = await saveNormalized(job, localSchema, LOCAL_MODEL);
-      console.info(
-        `[ai] Message ${job.id} (user ${tenantId(job.user_id)}) NER → ${saved} row(s)`
-      );
-      return { id: job.id, ok: true, listings: saved };
-    }
-
+    const gemini = geminiClient || new GeminiClient();
     const chunks = splitPropertyOffers(job.message);
     const useChunks = chunks.length >= 2;
 
     let listingSchemas = [];
 
     if (useChunks) {
-      // Normalize each offer slice separately (reliable for agent multi-dumps)
       for (let i = 0; i < chunks.length; i += 1) {
         const chunk = chunks[i];
-        const result = await llmClient.normalizeMessage(chunk, job.sender, targetModel);
-        if (!result.isValid || !result.schema) {
+        const { schema, stages, rateLimited } = await cascadeNormalizeText(
+          chunk,
+          job.sender,
+          llmClient,
+          targetModel,
+          gemini
+        );
+        if (rateLimited) {
+          return { id: job.id, ok: false, rateLimited: true };
+        }
+        if (!schema) {
           console.warn(
-            `[ai] Chunk ${i + 1}/${chunks.length} failed for message ${job.id}: ${(result.errorReason || '').slice(0, 120)}`
+            `[ai] Chunk ${i + 1}/${chunks.length} cascade miss for message ${job.id}: ${stages.join(' → ')}`
           );
           continue;
         }
-        const rows = expandListingSchemas(result.schema);
+        const rows = expandListingSchemas(schema);
         for (const row of rows) {
           row.listing_excerpt = chunk.slice(0, 2000);
           row.listing_index = listingSchemas.length;
           if (!row.contact_number && sharedContact) row.contact_number = sharedContact;
-          // Prefer SALE/RENT from chunk; keep is_property true if chunk looks like a listing
           if (row.is_property_listing_or_inquiry == null) {
             row.is_property_listing_or_inquiry = true;
           }
           listingSchemas.push(row);
         }
+        console.info(
+          `[ai] Message ${job.id} chunk ${i + 1}/${chunks.length}: ${stages.join(' → ')}`
+        );
       }
       if (!listingSchemas.length) {
         return { id: job.id, ok: false };
       }
-      // Wrap as synthetic schema for saveNormalized
       const envelope = {
         ...listingSchemas[0],
         is_property_listing_or_inquiry: true,
@@ -306,55 +363,49 @@ async function normalizeOne(job, llmClient, targetModel) {
           listing_excerpt: r.listing_excerpt
         }))
       };
-      const saved = await saveNormalized(job, envelope, LOCAL_MODEL);
+      const saved = await saveNormalized(job, envelope, CASCADE_MODEL);
       console.info(
-        `[ai] Message ${job.id} (user ${tenantId(job.user_id)}) split → ${saved} listing(s) from ${chunks.length} chunks`
+        `[ai] Message ${job.id} (user ${tenantId(job.user_id)}) cascade-split → ${saved} listing(s)`
       );
       return { id: job.id, ok: true, listings: saved };
     }
 
-    const result = await llmClient.normalizeMessage(
+    const { schema, stages, rateLimited } = await cascadeNormalizeText(
       job.message,
       job.sender,
-      targetModel
+      llmClient,
+      targetModel,
+      gemini
     );
 
-    if (result.isValid && result.schema) {
-      if (sharedContact && Array.isArray(result.schema.listings)) {
-        for (const L of result.schema.listings) {
-          if (L && !L.contact_number) L.contact_number = sharedContact;
-        }
-      }
-      if (sharedContact && !result.schema.contact_number) {
-        result.schema.contact_number = sharedContact;
-      }
-      const saved = await saveNormalized(job, result.schema, LOCAL_MODEL);
-      console.info(
-        `[ai] Message ${job.id} (user ${tenantId(job.user_id)}) → ${saved} listing(s) in ${result.latency.toFixed(2)}s`
-      );
-      return { id: job.id, ok: true, listings: saved };
-    }
-
-    const reason = result.errorReason || 'Unknown parse/validation failure';
-    if (
-      reason.startsWith('RATE_LIMIT') ||
-      /rate.?limit/i.test(reason)
-    ) {
+    if (rateLimited) {
       console.warn(`[ai] Rate-limited on message ${job.id}; will retry later.`);
       return { id: job.id, ok: false, rateLimited: true };
     }
 
-    const transient =
-      /JSONDecodeError|Unexpected end of JSON|RATE_LIMIT|timeout|ECONNRESET/i.test(reason);
-    if (!transient) {
-      logNormalizationFailure({
-        messageId: job.id,
-        modelName: targetModel,
-        reason,
-        rawSnippet: result.rawOutput
-      });
+    if (schema) {
+      if (sharedContact && Array.isArray(schema.listings)) {
+        for (const L of schema.listings) {
+          if (L && !L.contact_number) L.contact_number = sharedContact;
+        }
+      }
+      if (sharedContact && !schema.contact_number) {
+        schema.contact_number = sharedContact;
+      }
+      const saved = await saveNormalized(job, schema, CASCADE_MODEL);
+      console.info(
+        `[ai] Message ${job.id} (user ${tenantId(job.user_id)}) cascade [${stages.join(' → ')}] → ${saved} listing(s)`
+      );
+      return { id: job.id, ok: true, listings: saved };
     }
-    console.warn(`[ai] Failed to normalize message ${job.id}: ${reason.slice(0, 200)}`);
+
+    const reason = `cascade miss: ${stages.join(' → ')}`;
+    logNormalizationFailure({
+      messageId: job.id,
+      modelName: CASCADE_MODEL,
+      reason
+    });
+    console.warn(`[ai] Failed to normalize message ${job.id}: ${reason}`);
     return { id: job.id, ok: false };
   } catch (err) {
     const reason = `${err.name || 'Error'}: ${err.message}`;
@@ -386,6 +437,7 @@ async function processUnnormalizedMessages({
 } = {}) {
   const cfg = getConfig();
   const client = llmClient || new LLMClient();
+  const gemini = new GeminiClient();
   const targetModel = modelName || client.defaultModel || cfg.defaultModel;
   const workers = concurrency || cfg.normalizeConcurrency;
   const perUser = cfg.normalizePerUser;
@@ -409,13 +461,14 @@ async function processUnnormalizedMessages({
   }
 
   console.info(
-    `[ai] Processing ${claimed.length} messages with ${workers} parallel NER ` +
-      `(engine '${LOCAL_MODEL}', tenants=${JSON.stringify(tenantCounts)})`
+    `[ai] Processing ${claimed.length} messages cascade ` +
+      `(gemini=${gemini.isConfigured() ? 'on' : 'off'} → qwen → ner, ` +
+      `workers=${workers}, tenants=${JSON.stringify(tenantCounts)})`
   );
 
   const started = Date.now();
   const outcomes = await mapPool(claimed, workers, (job) =>
-    normalizeOne(job, client, targetModel)
+    normalizeOne(job, client, targetModel, gemini)
   );
 
   let successCount = 0;
@@ -438,5 +491,7 @@ module.exports = {
   saveNormalized,
   fairPick,
   releaseStaleClaims,
-  tenantId
+  tenantId,
+  CASCADE_MODEL,
+  cascadeNormalizeText
 };
