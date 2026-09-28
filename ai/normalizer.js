@@ -3,6 +3,7 @@ const { getConfig } = require('./config');
 const { LLMClient, expandListingSchemas } = require('./llmClient');
 const { splitPropertyOffers, extractSharedContacts } = require('./listingSplitter');
 const { LOCAL_MODEL, extractMessageSchema } = require('./localNer');
+const { canonicalizePlaceText } = require('../pakistanLocalities');
 const {
   loadSkippedIds,
   logNormalizationFailure,
@@ -136,6 +137,8 @@ async function saveNormalized(job, schema, targetModel) {
   let saved = 0;
   for (const row of listingRows) {
     const isProp = Boolean(row.is_property_listing_or_inquiry);
+    const areaCanon = isProp && row.area ? canonicalizePlaceText(row.area) : null;
+    const vicinityCanon = isProp && row.vicinity ? canonicalizePlaceText(row.vicinity) : null;
     await db.query(
       `INSERT INTO normalized_messages (
          whatsapp_message_id, chat_jid, sender, category, intent, sentiment, language,
@@ -163,8 +166,8 @@ async function saveNormalized(job, schema, targetModel) {
         isProp ? row.purpose : null,
         isProp ? row.property_type : null,
         isProp ? row.property_sub_type : null,
-        isProp ? row.area : null,
-        isProp ? row.vicinity : null,
+        areaCanon,
+        vicinityCanon,
         isProp ? row.size : null,
         isProp ? row.size_value : null,
         isProp ? row.size_unit : null,

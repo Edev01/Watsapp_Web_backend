@@ -69,20 +69,37 @@ const ALIASES = Object.freeze({
   'gulistan johar': 'gulistan-e-johar',
   'gulistan e johar': 'gulistan-e-johar',
   'bahria twn': 'bahria town',
+  bahriaa: 'bahria',
+  bahriya: 'bahria',
   'north nazimabd': 'north nazimabad',
   nazimabd: 'nazimabad',
   korngi: 'korangi',
+  korangi: 'korangi',
   maler: 'malir',
   gizree: 'gizri',
   gizry: 'gizri',
+  // Khayaban family (typos + shorthand → canonical stem)
+  khybn: 'khayaban',
+  khaybn: 'khayaban',
+  khayabn: 'khayaban',
+  khayban: 'khayaban',
+  khyaban: 'khayaban',
+  khyabn: 'khayaban',
+  khayaben: 'khayaban',
+  khayabaan: 'khayaban',
+  khayyaban: 'khayaban',
+  khyyaban: 'khayaban',
   'khayaban ittehad': 'khayaban-e-ittehad',
   'khy ittehad': 'khayaban-e-ittehad',
+  'khybn ittehad': 'khayaban-e-ittehad',
+  'khaybn ittehad': 'khayaban-e-ittehad',
   'khy-e-rizwan': 'khayaban-e-rizwan',
   'khy e rizwan': 'khayaban-e-rizwan',
   'kh-e-rizwan': 'khayaban-e-rizwan',
   'kh e rizwan': 'khayaban-e-rizwan',
   'khayaban rizwan': 'khayaban-e-rizwan',
   'khayaban e rizwan': 'khayaban-e-rizwan',
+  'khybn rizwan': 'khayaban-e-rizwan',
   rizwan: 'khayaban-e-rizwan',
   bukhri: 'bukhari',
   bukharii: 'bukhari',
@@ -92,6 +109,60 @@ const ALIASES = Object.freeze({
   'defance phase': 'defence',
   'defense phase': 'defence'
 });
+
+/** Common misspellings of the word "khayaban" itself. */
+const KHAYABAN_TYPOS = Object.freeze([
+  'khayaban', 'khyaban', 'khybn', 'khaybn', 'khayabn', 'khayban',
+  'khyabn', 'khayaben', 'khayabaan', 'khayyaban', 'khyyaban', 'khayybn'
+]);
+
+/**
+ * True when a token is "khayaban" or a close typo / shorthand (khybn, khaybn, …).
+ */
+function isKhayabanFamilyToken(tok) {
+  const t = String(tok || '')
+    .toLowerCase()
+    .replace(/[–—\-_/\\.,]+/g, '')
+    .trim();
+  if (!t || t.length < 4) return false;
+  if (KHAYABAN_TYPOS.includes(t)) return true;
+  if (t.startsWith('khayaban') || t.startsWith('khyaban')) return true;
+  if (t[0] !== 'k') return false;
+  if (t.length < 5 || t.length > 12) return false;
+  return editDistance(t, 'khayaban') <= 3;
+}
+
+/** ILIKE patterns that catch every Khayaban street spelling in listings / chat text. */
+function khayabanSearchPatterns() {
+  return [
+    'khayaban',
+    'khyaban',
+    'khayaban-e',
+    'khyaban-e',
+    'khy-e-',
+    'kh-e-',
+    'khybn',
+    'khaybn',
+    'khayabn',
+    'khayban',
+    'khyabn',
+    'khayaben'
+  ];
+}
+
+/**
+ * Canonicalize free-text place strings before save / search
+ * (khybn → khayaban, khy-e-X → khayaban-e-X, locality typos via gazetteer).
+ */
+function canonicalizePlaceText(text) {
+  let out = String(text || '').trim();
+  if (!out) return out;
+
+  out = out.replace(/\b(khybn|khaybn|khayabn|khayban|khyaban|khyabn|khayaben|khayabaan|khayyaban|khyyaban)\b/gi, 'khayaban');
+  out = out.replace(/\b(khy|kh)\s*[-.]?\s*e\s*[-.]?\s*/gi, 'khayaban-e-');
+  out = correctLocalityTypos(out);
+  return out;
+}
 
 /** Runtime extras from DB (lowercased). */
 let extraLocalities = [];
@@ -318,5 +389,8 @@ module.exports = {
   correctLocalityTypos,
   localityVariants,
   normalizePlaceKey,
-  editDistance
+  editDistance,
+  isKhayabanFamilyToken,
+  khayabanSearchPatterns,
+  canonicalizePlaceText
 };

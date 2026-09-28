@@ -40,7 +40,8 @@ function isValidPropertyStatus(raw) {
 const {
   correctLocalityTypos,
   localityVariants,
-  matchLocality
+  matchLocality,
+  canonicalizePlaceText
 } = require('./pakistanLocalities');
 
 /** Roman / English word ↔ Arabic for DHA-style phase queries. */
@@ -138,7 +139,7 @@ function expandLocationQuery(raw) {
   push(input);
   // Fuzzy-fix structural keywords (phse→phase) then Pakistan area names (clfton→clifton)
   const keywordFixed = correctLocationTypos(input.replace(/\bphasee\b/gi, 'phase'));
-  const deTypo = correctLocalityTypos(keywordFixed);
+  const deTypo = canonicalizePlaceText(keywordFixed);
   push(keywordFixed);
   push(deTypo);
   const spaced = deTypo.replace(/[–—\-_/\\]+/g, ' ').replace(/\s+/g, ' ').trim();

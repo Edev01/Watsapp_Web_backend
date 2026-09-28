@@ -6,7 +6,7 @@
 
 const db = require('../db');
 const { parsePriceInPKR } = require('../propertyHelper');
-const { SEED_LOCALITIES, setExtraLocalities, matchLocality } = require('../pakistanLocalities');
+const { SEED_LOCALITIES, setExtraLocalities, matchLocality, canonicalizePlaceText } = require('../pakistanLocalities');
 const { splitPropertyOffers, extractSharedContacts, looksLikeOffer } = require('./listingSplitter');
 
 const LOCAL_MODEL = 'local-ner';
@@ -399,8 +399,10 @@ function isPropertyText(text) {
 function extractChunk(text, sender, sharedContact) {
   let area = findArea(text);
   if (isPhaseLikePlace(area)) area = null;
+  if (area) area = canonicalizePlaceText(area);
   const city = inferCity(text, area);
-  const vicinity = findVicinity(text);
+  let vicinity = findVicinity(text);
+  if (vicinity) vicinity = canonicalizePlaceText(vicinity);
   const types = findType(text);
   const size = findSize(text);
   const purpose = findPurpose(text);

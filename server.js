@@ -8,7 +8,7 @@ const db = require('./db');
 const { sendResponse } = require('./responseHelper');
 const { authenticateToken, isAdmin } = require('./middleware');
 const { filterAndSortProperties, PROPERTY_STATUSES, normalizePropertyStatus, isValidPropertyStatus, expandLocationQuery } = require('./propertyHelper');
-const { setExtraLocalities, correctLocalityTypos } = require('./pakistanLocalities');
+const { setExtraLocalities, correctLocalityTypos, canonicalizePlaceText, normalizePlaceKey, SEED_LOCALITIES, isKhayabanFamilyToken } = require('./pakistanLocalities');
 const { parseSmartLocationQuery, buildSmartLocationSql, scoreLocationMatch, textHasPhase, textHasStreet } = require('./smartLocationSearch');
 const { extractUserId } = require('./userMiddleware');
 const { findOrCreateCanonicalChat, upsertChatsBulk, cleanText, isSystemNotificationText, isCommonJunkMessage } = require('./contactHelper');
@@ -2133,13 +2133,12 @@ const runPropertySearch = async (req) => {
   let parsedLocation = null;
   const location = String(filters.location || '').trim();
   if (location) {
-    // Prefer listing-local text. Only use raw message when excerpt is missing,
-    // and keep it short to avoid multi-offer sibling leakage.
+    // Prefer listing-local text PLUS raw WhatsApp body so place names in chat
+    // (e.g. khayaban typos) are searchable even when excerpt/area omitted them.
     const searchable =
       `LOWER(CONCAT_WS(' ', COALESCE(n.area,''), COALESCE(n.vicinity,''), COALESCE(n.city,''), ` +
       `COALESCE(n.summary,''), COALESCE(n.listing_excerpt,''), ` +
-      `CASE WHEN NULLIF(TRIM(COALESCE(n.listing_excerpt,'')), '') IS NULL ` +
-      `THEN LEFT(COALESCE(m.message,''), 600) ELSE '' END))`;
+      `LEFT(COALESCE(m.message,''), 800)))`;
 
     parsedLocation = parseSmartLocationQuery(location);
     const built = buildSmartLocationSql(parsedLocation, searchable, params);
@@ -2341,6 +2340,180 @@ app.get('/api/properties/statuses', (req, res) => {
     'Property statuses retrieved'
   );
 });
+
+/**
+ * Live place autocomplete for Search Properties location field.
+ * GET /api/places/suggest?q=khay
+ * Returns deduped canonical names from the user's saved properties + gazetteer.
+ */
+app.get('/api/places/suggest', authenticateToken, async (req, res) => {
+  const userId = resolveTenantUserId(req, null);
+  if (!userId) {
+    return sendResponse(res, 401, true, null, 'Login required');
+  }
+
+  const rawQ = String(req.query.q || req.query.query || '').trim();
+  if (rawQ.length < 1) {
+    return sendResponse(res, 200, false, { suggestions: [] }, 'OK');
+  }
+
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 18, 1), 40);
+  const canonQ = canonicalizePlaceText(rawQ);
+  const searchTerms = [...new Set(
+    [rawQ, canonQ]
+      .map((t) => String(t || '').trim().toLowerCase())
+      .filter((t) => t.length >= 1)
+  )];
+
+  if (searchTerms.some((t) => isKhayabanFamilyToken(t))) {
+    searchTerms.push('khayaban');
+  }
+
+  const uniqTerms = [...new Set(searchTerms)];
+
+  try {
+    const params = [userId];
+    const likeParts = [];
+    for (const term of uniqTerms) {
+      params.push(`%${term}%`);
+      const idx = params.length;
+      likeParts.push(
+        `(LOWER(COALESCE(n.city,'')) LIKE $${idx} OR LOWER(COALESCE(n.area,'')) LIKE $${idx} OR LOWER(COALESCE(n.vicinity,'')) LIKE $${idx})`
+      );
+    }
+
+    const sql = `
+      SELECT name, kind, hits FROM (
+        SELECT LOWER(TRIM(n.city)) AS name, 'city' AS kind, COUNT(*)::int AS hits
+        FROM normalized_messages n
+        INNER JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
+        WHERE m.user_id = $1 AND n.is_property IS TRUE
+          AND n.city IS NOT NULL AND TRIM(n.city) <> ''
+          AND (${likeParts.join(' OR ')})
+        GROUP BY LOWER(TRIM(n.city))
+        UNION ALL
+        SELECT LOWER(TRIM(n.area)) AS name, 'area' AS kind, COUNT(*)::int AS hits
+        FROM normalized_messages n
+        INNER JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
+        WHERE m.user_id = $1 AND n.is_property IS TRUE
+          AND n.area IS NOT NULL AND TRIM(n.area) <> ''
+          AND (${likeParts.join(' OR ')})
+        GROUP BY LOWER(TRIM(n.area))
+        UNION ALL
+        SELECT LOWER(TRIM(n.vicinity)) AS name, 'street' AS kind, COUNT(*)::int AS hits
+        FROM normalized_messages n
+        INNER JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
+        WHERE m.user_id = $1 AND n.is_property IS TRUE
+          AND n.vicinity IS NOT NULL AND TRIM(n.vicinity) <> ''
+          AND (${likeParts.join(' OR ')})
+        GROUP BY LOWER(TRIM(n.vicinity))
+      ) t
+      WHERE LENGTH(name) BETWEEN 2 AND 80
+      ORDER BY hits DESC, name ASC
+      LIMIT 120
+    `;
+
+    const dbResult = await db.query(sql, params);
+    const byKey = new Map();
+
+    const addSuggestion = (rawName, kind, hits = 0, source = 'db') => {
+      const cleaned = String(rawName || '').trim();
+      if (!cleaned) return;
+      const canon = canonicalizePlaceText(cleaned) || cleaned;
+      const key = normalizePlaceKey(canon);
+      if (!key || key.length < 2) return;
+
+      // Collapse bare khayaban typos into one stem entry
+      const stemKey = isKhayabanFamilyToken(key) && !key.includes(' ') && !/-e-/.test(canon.replace(/\s+/g, '-'))
+        ? 'khayaban'
+        : key;
+      const label = stemKey === 'khayaban' && !/-e-| e /i.test(canon)
+        ? 'Khayaban'
+        : titlePlaceLabel(canon);
+
+      const existing = byKey.get(stemKey);
+      if (existing) {
+        existing.hits += Number(hits) || 0;
+        if ((Number(hits) || 0) > existing.bestHits) {
+          existing.label = label;
+          existing.kind = kind || existing.kind;
+          existing.bestHits = Number(hits) || 0;
+        }
+        return;
+      }
+      byKey.set(stemKey, {
+        id: stemKey,
+        label,
+        kind: kind || 'area',
+        hits: Number(hits) || 0,
+        bestHits: Number(hits) || 0,
+        source
+      });
+    };
+
+    for (const row of dbResult.rows) {
+      addSuggestion(row.name, row.kind, row.hits, 'db');
+    }
+
+    // Gazetteer fill-in (cities / DHA / known streets) so typing still helps before DB has volume
+    const qLower = uniqTerms[0];
+    for (const seed of SEED_LOCALITIES) {
+      const seedLower = String(seed).toLowerCase();
+      const seedCanon = canonicalizePlaceText(seedLower);
+      const matches = uniqTerms.some(
+        (t) => seedLower.includes(t) || seedCanon.includes(t) || normalizePlaceKey(seedCanon).includes(normalizePlaceKey(t))
+      );
+      if (!matches) continue;
+      let kind = 'area';
+      if (/^(karachi|lahore|islamabad|rawalpindi|faisalabad|multan|peshawar|hyderabad|quetta)$/i.test(seed)) {
+        kind = 'city';
+      } else if (/khayaban|street|avenue|road|commercial/i.test(seed)) {
+        kind = 'street';
+      } else if (/phase|block|sector|scheme/i.test(seed)) {
+        kind = 'phase';
+      }
+      addSuggestion(seed, kind, 0, 'gazetteer');
+    }
+
+    const scored = [...byKey.values()].map((s) => {
+      const labelLower = s.label.toLowerCase();
+      const prefix = uniqTerms.some((t) => labelLower.startsWith(t) || normalizePlaceKey(labelLower).startsWith(normalizePlaceKey(t)));
+      return { ...s, score: (prefix ? 1000 : 0) + s.hits };
+    });
+
+    scored.sort((a, b) => b.score - a.score || a.label.localeCompare(b.label));
+
+    const suggestions = scored.slice(0, limit).map(({ id, label, kind, hits }) => ({
+      id,
+      label,
+      kind,
+      hits
+    }));
+
+    return sendResponse(res, 200, false, { suggestions, query: rawQ }, 'Place suggestions');
+  } catch (err) {
+    console.error('places suggest error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
+function titlePlaceLabel(value) {
+  const s = String(value || '').trim();
+  if (!s) return s;
+  // Keep short acronyms (DHA, PECHS)
+  if (/^[a-z0-9-]{2,6}$/i.test(s) && !/\s/.test(s) && s.length <= 5) {
+    return s.toUpperCase();
+  }
+  return s
+    .split(/(\s+|-)/)
+    .map((part) => {
+      if (part === '-' || /^\s+$/.test(part)) return part;
+      if (/^(e|of|the|and)$/i.test(part)) return part.toLowerCase();
+      if (/^(dha|pechs|pwd)$/i.test(part)) return part.toUpperCase();
+      return part.charAt(0).toUpperCase() + part.slice(1).toLowerCase();
+    })
+    .join('');
+}
 
 /**
  * Update property listing status by whatsapp_messages.id (message id from portal/search).

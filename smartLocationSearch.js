@@ -8,7 +8,10 @@ const {
   correctLocalityTypos,
   localityVariants,
   matchLocality,
-  editDistance
+  editDistance,
+  isKhayabanFamilyToken,
+  khayabanSearchPatterns,
+  canonicalizePlaceText
 } = require('./pakistanLocalities');
 
 const ROMAN_TO_INT = Object.freeze({
@@ -144,15 +147,17 @@ function khayabanForms(name) {
     `khayaban-e-${n}`,
     `khayaban e ${n}`,
     `khayaban ${n}`,
+    `khyaban-e-${n}`,
+    `khyaban e ${n}`,
     `khy-e-${n}`,
     `khy e ${n}`,
     `khy-${n}`,
     `kh-e-${n}`,
     `kh e ${n}`,
     `kh ${n}`,
-    `khyaban-e-${n}`,
-    `khyaban e ${n}`,
-    `kh rizwan`.includes(n) ? null : null,
+    `khybn ${n}`,
+    `khaybn ${n}`,
+    `khayabn ${n}`,
     n
   ]
     .filter(Boolean)
@@ -225,7 +230,7 @@ function parseSmartLocationQuery(raw) {
   }
 
   let text = correctPhaseTypos(input);
-  text = correctLocalityTypos(text);
+  text = canonicalizePlaceText(text);
   text = normalizeSpaces(text);
   const lower = text.toLowerCase();
 
@@ -249,17 +254,38 @@ function parseSmartLocationQuery(raw) {
     }
   }
 
-  // Khayaban / Khy-e-X
-  const khyRe =
-    /\b(?:khayaban|khyaban|khy|kh)\s*-?\s*e?\s*-?\s*([a-z][a-z0-9]{2,})\b/i;
-  const khyMatch = lower.match(khyRe);
+  // Khayaban-e-X / typo forms — require a real street name after the stem.
+  // Short "kh"/"khy" ONLY match when "e" is present (khy-e-ittehad), so bare
+  // "khayaban" is not eaten as kh + ayaban.
+  const khyFullRe =
+    /\b(?:khayaban|khyaban|khybn|khaybn|khayabn|khayban|khyabn|khayaben)\s*(?:-?\s*e\s*-?\s*|\s+)([a-z][a-z0-9]{2,})\b/i;
+  const khyShortRe =
+    /\b(?:khy|kh)\s*-?\s*e\s*-?\s*([a-z][a-z0-9]{2,})\b/i;
+  const khyMatch = lower.match(khyFullRe) || lower.match(khyShortRe);
   if (khyMatch) {
     mustGroups.push(khayabanForms(khyMatch[1]));
     consumed.add(khyMatch[1].toLowerCase());
-    ['khayaban', 'khyaban', 'khy', 'kh', 'e'].forEach((w) => consumed.add(w));
+    [
+      'khayaban', 'khyaban', 'khybn', 'khaybn', 'khayabn', 'khayban', 'khyabn',
+      'khayaben', 'khy', 'kh', 'e'
+    ].forEach((w) => consumed.add(w));
   }
 
   const tokens = lower.split(/[\s,&/|]+/).map(cleanToken).filter(Boolean);
+
+  // Bare "khayaban" / "khybn" (no street name) → match entire Khayaban family
+  if (!khyMatch) {
+    const bareKhy = tokens.find((tok) => isKhayabanFamilyToken(tok));
+    if (bareKhy) {
+      mustGroups.push(khayabanSearchPatterns());
+      consumed.add(bareKhy);
+      [
+        'khayaban', 'khyaban', 'khybn', 'khaybn', 'khayabn', 'khayban', 'khyabn',
+        'khayaben', 'khy', 'kh', 'e'
+      ].forEach((w) => consumed.add(w));
+    }
+  }
+
   for (const tok of tokens) {
     if (STOP.has(tok) || consumed.has(tok)) continue;
     if (/^\d{1,3}$/.test(tok)) continue; // bare nums never become ILIKE %10%
@@ -267,6 +293,7 @@ function parseSmartLocationQuery(raw) {
     if (tok === 'phase' || ROMAN_TO_INT[tok] || WORD_TO_INT[tok]) continue;
     // ordinals like 25th / 4th are weak alone — keep only with street context via direct match
     if (/^\d{1,3}(st|nd|rd|th)$/i.test(tok)) continue;
+    if (isKhayabanFamilyToken(tok)) continue;
 
     const forms = societyForms(tok);
     if (forms.length) {
