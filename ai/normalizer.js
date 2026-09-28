@@ -3,6 +3,7 @@ const { getConfig } = require('./config');
 const { LLMClient, expandListingSchemas } = require('./llmClient');
 const { GeminiClient } = require('./geminiClient');
 const { fillGapsOnly, scrubWeakLocations } = require('./cascadeMerge');
+const { refineWithGeocode } = require('./geocodeClient');
 const { splitPropertyOffers, extractSharedContacts } = require('./listingSplitter');
 const { extractMessageSchema } = require('./localNer');
 const { canonicalizePlaceText } = require('../pakistanLocalities');
@@ -244,8 +245,9 @@ async function loadPendingJobs(targetModel, userId, window, { ignoreSkips = true
 }
 
 /**
- * Gemini (primary) → Qwen (fill gaps) → local NER (fill gaps).
- * Later stages never overwrite non-empty fields from earlier stages.
+ * Gemini (primary) → Qwen (fill) → local NER (fill) → Photon/Nominatim (best-match refine).
+ * Geocode may only fill gaps or replace a field when it matches the message MORE
+ * strongly than the current LLM value — never blindly overwrite Gemini.
  */
 async function cascadeNormalizeText(text, sender, llmClient, qwenModel, geminiClient) {
   const stages = [];
@@ -293,6 +295,17 @@ async function cascadeNormalizeText(text, sender, llmClient, qwenModel, geminiCl
     }
   } else {
     stages.push('ner:miss');
+  }
+
+  // 4) Free geocode (Photon + Nominatim) — best relevance wins per field
+  if (schema) {
+    try {
+      const geo = await refineWithGeocode(schema, text);
+      schema = scrubWeakLocations(geo.schema || schema);
+      stages.push(...(geo.stages || []));
+    } catch (err) {
+      stages.push(`geocode:err:${String(err.message || err).slice(0, 40)}`);
+    }
   }
 
   return { schema, stages, rateLimited: false };
@@ -462,7 +475,7 @@ async function processUnnormalizedMessages({
 
   console.info(
     `[ai] Processing ${claimed.length} messages cascade ` +
-      `(gemini=${gemini.isConfigured() ? 'on' : 'off'} → qwen → ner, ` +
+      `(gemini=${gemini.isConfigured() ? 'on' : 'off'} → qwen → ner → geocode, ` +
       `workers=${workers}, tenants=${JSON.stringify(tenantCounts)})`
   );
 
