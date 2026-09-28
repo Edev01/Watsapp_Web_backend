@@ -155,6 +155,14 @@ function khayabanWordPatterns() {
 }
 
 /**
+ * Short "kh-e-X" / "khy-e-X" forms (real Khayaban streets).
+ * Use as Postgres ~* regex — requires a street name after e, not bare noise.
+ */
+function khayabanShortERegex() {
+  return '(^|[^a-z0-9])(kh|khy)[[:space:]._-]*e[[:space:]._-]+[a-z]{2,}';
+}
+
+/**
  * Street names under the Khayaban corridor that often omit the word "khayaban".
  * Match these ONLY on city/area/vicinity — never on raw chat (too many false hits).
  */
@@ -162,7 +170,7 @@ function khayabanStreetPatterns() {
   return ['main central drive', 'central drive'];
 }
 
-/** @deprecated use khayabanWordPatterns + khayabanStreetPatterns */
+/** Combined list for callers that still expect one array. */
 function khayabanSearchPatterns() {
   return [...khayabanWordPatterns(), ...khayabanStreetPatterns()];
 }
@@ -411,5 +419,6 @@ module.exports = {
   khayabanSearchPatterns,
   khayabanWordPatterns,
   khayabanStreetPatterns,
+  khayabanShortERegex,
   canonicalizePlaceText
 };

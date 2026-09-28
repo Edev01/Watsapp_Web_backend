@@ -8,7 +8,7 @@ const db = require('./db');
 const { sendResponse } = require('./responseHelper');
 const { authenticateToken, isAdmin } = require('./middleware');
 const { filterAndSortProperties, PROPERTY_STATUSES, normalizePropertyStatus, isValidPropertyStatus, expandLocationQuery } = require('./propertyHelper');
-const { setExtraLocalities, correctLocalityTypos, canonicalizePlaceText, normalizePlaceKey, isKhayabanFamilyToken, khayabanSearchPatterns, khayabanWordPatterns, khayabanStreetPatterns } = require('./pakistanLocalities');
+const { setExtraLocalities, correctLocalityTypos, canonicalizePlaceText, normalizePlaceKey, isKhayabanFamilyToken } = require('./pakistanLocalities');
 const { parseSmartLocationQuery, buildSmartLocationSql, scoreLocationMatch, textHasPhase, textHasStreet } = require('./smartLocationSearch');
 const { isWeakLocation } = require('./ai/cascadeMerge');
 const { extractUserId } = require('./userMiddleware');
@@ -2052,68 +2052,20 @@ app.get('/api/ml/dataset', async (req, res) => {
 });
 
 // 14. Property Filter Endpoint (Supports POST/GET /api/properties/filter and /api/properties)
-const runPropertySearch = async (req) => {
-  const rawFilters = req.body?.filters || req.body || {};
-  const queryFilters = req.query || {};
 
-  const filters = {
-    purpose: rawFilters.purpose || queryFilters.purpose || '',
-    city: rawFilters.city || queryFilters.city || '',
-    location: rawFilters.location || queryFilters.location || rawFilters.query || queryFilters.query || rawFilters.vicinity || queryFilters.vicinity || rawFilters.area || queryFilters.area || '',
-    propertyType: rawFilters.propertyType || queryFilters.propertyType || rawFilters.property_type || queryFilters.property_type || '',
-    propertySubType: rawFilters.propertySubType || queryFilters.propertySubType || rawFilters.property_sub_type || queryFilters.property_sub_type || '',
-    sortBy: rawFilters.sortBy || queryFilters.sortBy || rawFilters.sort_by || queryFilters.sort_by || 'Newest First',
-    priceMin: rawFilters.priceMin ?? queryFilters.priceMin ?? '',
-    priceMax: rawFilters.priceMax ?? queryFilters.priceMax ?? '',
-    areaUnit: rawFilters.areaUnit || queryFilters.areaUnit || rawFilters.area_unit || queryFilters.area_unit || 'Marla',
-    areaMin: rawFilters.areaMin ?? queryFilters.areaMin ?? '',
-    areaMax: rawFilters.areaMax ?? queryFilters.areaMax ?? '',
-    status:
-      rawFilters.status ||
-      rawFilters.propertyStatus ||
-      rawFilters.property_status ||
-      queryFilters.status ||
-      queryFilters.propertyStatus ||
-      queryFilters.property_status ||
-      ''
-  };
-
-  const userId = Number(
-    req.userId || rawFilters.userId || rawFilters.user_id || queryFilters.userId || queryFilters.user_id || 0
-  );
-  if (!userId) {
-    const err = new Error('userId is required');
-    err.statusCode = 400;
-    throw err;
-  }
-
-  const requestedLimit = parseInt(rawFilters.limit || queryFilters.limit || '50', 10);
-  const locationEarly = String(
-    rawFilters.location || queryFilters.location || rawFilters.query || queryFilters.query || ''
-  ).trim();
-  // Location searches need higher cap so parent places (Khayaban/DHA) aren't truncated
-  const maxLimit = locationEarly ? 5000 : 100;
-  const defaultLimit = locationEarly ? 2000 : 50;
-  const limit = Math.min(
-    Math.max(Number.isFinite(requestedLimit) ? requestedLimit : defaultLimit, 1),
-    maxLimit
-  );
-
+/**
+ * Shared filter + location WHERE builder used by search AND suggest counts
+ * so dropdown hits always equal properties returned for the same query.
+ */
+function buildPropertySearchWhere(filters, userId) {
   let queryText = `
-    SELECT * FROM (
-      SELECT n.id, n.whatsapp_message_id, n.chat_jid, n.purpose, n.city, n.area, n.vicinity,
-             n.property_type, n.property_sub_type, n.size, n.price, n.contact_number,
-             n.summary, n.property_status, n.created_at, n.category, n.intent, n.sentiment,
-             n.listing_index, n.listing_excerpt,
-             LEFT(COALESCE(NULLIF(TRIM(n.listing_excerpt), ''), m.message), 500) AS raw_message,
-             m.timestamp AS message_timestamp, m.from_me, m.user_id,
-             m.seq_in_chat, m.seq_in_chat AS "seqInChat"
       FROM normalized_messages n
       INNER JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
       WHERE m.user_id = $1
         AND n.is_property IS TRUE
   `;
   const params = [userId];
+  let parsedLocation = null;
 
   const purpose = String(filters.purpose || '').trim().toLowerCase();
   if (purpose && purpose !== 'all') {
@@ -2131,11 +2083,8 @@ const runPropertySearch = async (req) => {
     queryText += ` AND (n.city ILIKE $${params.length} OR n.area ILIKE $${params.length} OR n.vicinity ILIKE $${params.length})`;
   }
 
-  let parsedLocation = null;
   const location = String(filters.location || '').trim();
   if (location) {
-    // Prefer listing-local text PLUS raw WhatsApp body so place names in chat
-    // (e.g. khayaban typos) are searchable even when excerpt/area omitted them.
     const searchable =
       `LOWER(CONCAT_WS(' ', COALESCE(n.area,''), COALESCE(n.vicinity,''), COALESCE(n.city,''), ` +
       `COALESCE(n.summary,''), COALESCE(n.listing_excerpt,''), ` +
@@ -2178,25 +2127,139 @@ const runPropertySearch = async (req) => {
     }
   }
 
-  // Fetch a wider pool then relevance-rank (location searches)
-  const fetchLimit = parsedLocation && parsedLocation.phaseNumber != null
-    ? Math.min(Math.max(limit * 3, limit), 800)
-    : limit;
-  queryText += ` ORDER BY n.id DESC, n.whatsapp_message_id DESC, COALESCE(n.listing_index, 0) ASC
+  return { queryText, params, parsedLocation };
+}
+
+function resolveSearchFilters(req) {
+  const rawFilters = req.body?.filters || req.body || {};
+  const queryFilters = req.query || {};
+
+  const filters = {
+    purpose: rawFilters.purpose || queryFilters.purpose || '',
+    city: rawFilters.city || queryFilters.city || '',
+    location:
+      rawFilters.location ||
+      queryFilters.location ||
+      rawFilters.query ||
+      queryFilters.query ||
+      rawFilters.vicinity ||
+      queryFilters.vicinity ||
+      rawFilters.area ||
+      queryFilters.area ||
+      '',
+    propertyType:
+      rawFilters.propertyType ||
+      queryFilters.propertyType ||
+      rawFilters.property_type ||
+      queryFilters.property_type ||
+      '',
+    propertySubType:
+      rawFilters.propertySubType ||
+      queryFilters.propertySubType ||
+      rawFilters.property_sub_type ||
+      queryFilters.property_sub_type ||
+      '',
+    sortBy:
+      rawFilters.sortBy ||
+      queryFilters.sortBy ||
+      rawFilters.sort_by ||
+      queryFilters.sort_by ||
+      'Newest First',
+    priceMin: rawFilters.priceMin ?? queryFilters.priceMin ?? '',
+    priceMax: rawFilters.priceMax ?? queryFilters.priceMax ?? '',
+    areaUnit:
+      rawFilters.areaUnit ||
+      queryFilters.areaUnit ||
+      rawFilters.area_unit ||
+      queryFilters.area_unit ||
+      'Marla',
+    areaMin: rawFilters.areaMin ?? queryFilters.areaMin ?? '',
+    areaMax: rawFilters.areaMax ?? queryFilters.areaMax ?? '',
+    status:
+      rawFilters.status ||
+      rawFilters.propertyStatus ||
+      rawFilters.property_status ||
+      queryFilters.status ||
+      queryFilters.propertyStatus ||
+      queryFilters.property_status ||
+      ''
+  };
+
+  const userId = Number(
+    req.userId ||
+      rawFilters.userId ||
+      rawFilters.user_id ||
+      queryFilters.userId ||
+      queryFilters.user_id ||
+      0
+  );
+
+  const requestedLimit = parseInt(rawFilters.limit || queryFilters.limit || '50', 10);
+  const locationEarly = String(filters.location || '').trim();
+  const maxLimit = locationEarly ? 10000 : 100;
+  const defaultLimit = locationEarly ? 5000 : 50;
+  const limit = Math.min(
+    Math.max(Number.isFinite(requestedLimit) ? requestedLimit : defaultLimit, 1),
+    maxLimit
+  );
+
+  return { filters, userId, limit, rawFilters, queryFilters };
+}
+
+/** Exact match count — same WHERE as property search (no LIMIT). */
+async function countPropertySearch(filters, userId) {
+  const { queryText, params } = buildPropertySearchWhere(filters, userId);
+  const sql = `SELECT COUNT(*)::int AS hits ${queryText}`;
+  const result = await db.query(sql, params);
+  return result.rows[0]?.hits || 0;
+}
+
+const runPropertySearch = async (req) => {
+  const { filters, userId, limit } = resolveSearchFilters(req);
+  if (!userId) {
+    const err = new Error('userId is required');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const { queryText: whereSql, params, parsedLocation } = buildPropertySearchWhere(
+    filters,
+    userId
+  );
+
+  // Exact total before limit — this is what autosuggest must show
+  const countResult = await db.query(`SELECT COUNT(*)::int AS hits ${whereSql}`, params);
+  const totalMatched = countResult.rows[0]?.hits || 0;
+
+  const fetchLimit =
+    parsedLocation && parsedLocation.phaseNumber != null
+      ? Math.min(Math.max(limit * 3, limit), Math.max(limit, 2000))
+      : limit;
+
+  let queryText = `
+    SELECT * FROM (
+      SELECT n.id, n.whatsapp_message_id, n.chat_jid, n.purpose, n.city, n.area, n.vicinity,
+             n.property_type, n.property_sub_type, n.size, n.price, n.contact_number,
+             n.summary, n.property_status, n.created_at, n.category, n.intent, n.sentiment,
+             n.listing_index, n.listing_excerpt,
+             LEFT(COALESCE(NULLIF(TRIM(n.listing_excerpt), ''), m.message), 500) AS raw_message,
+             m.timestamp AS message_timestamp, m.from_me, m.user_id,
+             m.seq_in_chat, m.seq_in_chat AS "seqInChat"
+      ${whereSql}
+      ORDER BY n.id DESC, n.whatsapp_message_id DESC, COALESCE(n.listing_index, 0) ASC
     ) uniq
     ORDER BY uniq.id DESC LIMIT $${params.length + 1}`;
-  params.push(fetchLimit);
+  const fetchParams = [...params, fetchLimit];
 
   const client = await db.pool.connect();
   try {
     await client.query('BEGIN');
-    await client.query("SET LOCAL statement_timeout = '20s'");
-    const dbResult = await client.query(queryText, params);
+    await client.query("SET LOCAL statement_timeout = '30s'");
+    const dbResult = await client.query(queryText, fetchParams);
     await client.query('COMMIT');
 
     let rows = dbResult.rows;
 
-    // Hard accuracy guard for phase queries (roman substring + multi-offer leftovers)
     if (parsedLocation && parsedLocation.phaseNumber != null) {
       const want = parsedLocation.phaseNumber;
       rows = rows.filter((r) => {
@@ -2207,7 +2270,6 @@ const runPropertySearch = async (req) => {
       });
     }
 
-    // Street N guard — place fields only; reject budget/phone/raw-dump false hits
     if (parsedLocation && parsedLocation.streetNumber != null) {
       const wantStreet = parsedLocation.streetNumber;
       rows = rows.filter((r) =>
@@ -2221,28 +2283,35 @@ const runPropertySearch = async (req) => {
       );
     }
 
+    // Relevance sort only — do NOT drop SQL matches (keeps suggest count = result count)
     if (
       parsedLocation &&
       (parsedLocation.phaseNumber != null ||
         parsedLocation.streetNumber != null ||
-        (parsedLocation.mustGroups || []).length)
+        (parsedLocation.mustGroups || []).length ||
+        (parsedLocation.placeOnlyGroups || []).length ||
+        (parsedLocation.searchRegexes || []).length)
     ) {
       rows = rows
         .map((r) => ({ ...r, _score: scoreLocationMatch(r, parsedLocation) }))
-        .filter((r) => r._score >= 0)
         .sort((a, b) => b._score - a._score || b.id - a.id)
         .slice(0, limit);
     } else if (rows.length > limit) {
       rows = rows.slice(0, limit);
     }
 
+    const properties = filterAndSortProperties(rows, {
+      ...filters,
+      sortBy: parsedLocation ? 'Relevance' : filters.sortBy
+    });
+
     return {
       filters,
       userId,
-      properties: filterAndSortProperties(rows, {
-        ...filters,
-        sortBy: parsedLocation ? 'Relevance' : filters.sortBy
-      })
+      totalMatched,
+      // If post-filters trimmed rows, surface returned count separately
+      totalReturned: properties.length,
+      properties
     };
   } catch (err) {
     try { await client.query('ROLLBACK'); } catch (_) {}
@@ -2255,10 +2324,9 @@ const runPropertySearch = async (req) => {
 
 const handlePropertyFilter = async (req, res) => {
   try {
-    const { filters, properties } = await runPropertySearch(req);
+    const { filters, properties, totalMatched, totalReturned } = await runPropertySearch(req);
     const enriched = properties.map((p) => ({
       ...p,
-      // Stable IDs for scrap verification: search by these numbers in the location box
       id: p.id,
       listingId: p.id,
       messageId: p.whatsappMessageId || p.whatsapp_message_id || null,
@@ -2267,7 +2335,9 @@ const handlePropertyFilter = async (req, res) => {
       seq_in_chat: p.seqInChat ?? p.seq_in_chat ?? null
     }));
     return sendResponse(res, 200, false, {
-      total: enriched.length,
+      total: totalMatched != null ? totalMatched : enriched.length,
+      totalMatched: totalMatched != null ? totalMatched : enriched.length,
+      totalReturned: totalReturned != null ? totalReturned : enriched.length,
       filters,
       properties: enriched
     }, 'Properties retrieved successfully');
@@ -2311,9 +2381,15 @@ function toDashboardSearchResult(p) {
 /** Same JSON shape the portal expects from FastAPI POST /api/dashboard-search */
 const handleDashboardSearch = async (req, res) => {
   try {
-    const { properties } = await runPropertySearch(req);
+    const { properties, totalMatched, totalReturned } = await runPropertySearch(req);
     const results = properties.map(toDashboardSearchResult);
-    return res.json({ success: true, count: results.length, results });
+    return res.json({
+      success: true,
+      count: totalMatched != null ? totalMatched : results.length,
+      totalMatched: totalMatched != null ? totalMatched : results.length,
+      totalReturned: totalReturned != null ? totalReturned : results.length,
+      results
+    });
   } catch (err) {
     console.error('Dashboard search error:', err);
     const code = err.statusCode || 500;
@@ -2521,53 +2597,31 @@ app.get('/api/places/suggest', authenticateToken, async (req, res) => {
     }
 
     if (queryWantsKhayaban || queryWantsDha) {
-      // Same match rules as search for "Khayaban":
-      // - word/typo forms may match searchable text
-      // - corridor streets (Main Central Drive) only on city/area/vicinity
-      const searchable = `LOWER(CONCAT_WS(' ', COALESCE(n.area,''), COALESCE(n.vicinity,''), COALESCE(n.city,''), ` +
-        `COALESCE(n.summary,''), COALESCE(n.listing_excerpt,''), ` +
-        `LEFT(COALESCE(m.message,''), 800)))`;
-      const placeOnly = `LOWER(CONCAT_WS(' ', COALESCE(n.city,''), COALESCE(n.area,''), COALESCE(n.vicinity,'')))`;
+      // Parent hits MUST equal search totals for the same filters + location label
+      const baseFilters = {
+        purpose: String(req.query.purpose || ''),
+        city: String(req.query.city || ''),
+        propertyType: String(req.query.propertyType || req.query.property_type || ''),
+        propertySubType: String(req.query.propertySubType || req.query.property_sub_type || ''),
+        status: String(req.query.status || req.query.propertyStatus || req.query.property_status || '')
+      };
 
       if (queryWantsKhayaban) {
-        const khyParams = [userId];
-        const khyFilter = appendCommonFilters(khyParams);
-        khyParams.push(khayabanWordPatterns().map((p) => `%${p}%`));
-        const wordIdx = khyParams.length;
-        khyParams.push(khayabanStreetPatterns().map((p) => `%${p}%`));
-        const streetIdx = khyParams.length;
-        const khyCount = await db.query(
-          `SELECT COUNT(*)::int AS hits
-           FROM normalized_messages n
-           INNER JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
-           WHERE m.user_id = $1 AND n.is_property IS TRUE
-           ${khyFilter}
-           AND (
-             ${searchable} ILIKE ANY($${wordIdx})
-             OR ${placeOnly} ILIKE ANY($${streetIdx})
-           )`,
-          khyParams
-        );
-        const hits = khyCount.rows[0]?.hits || 0;
-        if (hits > 0) addSuggestion('Khayaban', 'group', hits, { parent: true });
+        try {
+          const hits = await countPropertySearch({ ...baseFilters, location: 'Khayaban' }, userId);
+          if (hits > 0) addSuggestion('Khayaban', 'group', hits, { parent: true });
+        } catch (err) {
+          console.warn('khayaban suggest count failed:', err.message);
+        }
       }
 
       if (queryWantsDha || queryWantsKhayaban) {
-        const dhaParams = [userId];
-        const dhaFilter = appendCommonFilters(dhaParams);
-        dhaParams.push(['%dha%', '%defence%', '%defense%', '%defance%']);
-        const dhaIdx = dhaParams.length;
-        const dhaCount = await db.query(
-          `SELECT COUNT(*)::int AS hits
-           FROM normalized_messages n
-           INNER JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
-           WHERE m.user_id = $1 AND n.is_property IS TRUE
-           ${dhaFilter}
-           AND ${placeOnly} ILIKE ANY($${dhaIdx})`,
-          dhaParams
-        );
-        const hits = dhaCount.rows[0]?.hits || 0;
-        if (hits > 0) addSuggestion('DHA', 'group', hits, { parent: true });
+        try {
+          const hits = await countPropertySearch({ ...baseFilters, location: 'DHA' }, userId);
+          if (hits > 0) addSuggestion('DHA', 'group', hits, { parent: true });
+        } catch (err) {
+          console.warn('dha suggest count failed:', err.message);
+        }
       }
     }
 

@@ -13,6 +13,7 @@ const {
   khayabanSearchPatterns,
   khayabanWordPatterns,
   khayabanStreetPatterns,
+  khayabanShortERegex,
   canonicalizePlaceText
 } = require('./pakistanLocalities');
 
@@ -257,6 +258,7 @@ function parseSmartLocationQuery(raw) {
 
   const mustGroups = [];
   let placeOnlyGroups = [];
+  let searchRegexes = [];
   let phaseNumber = null;
   const consumed = new Set();
 
@@ -296,12 +298,13 @@ function parseSmartLocationQuery(raw) {
   const tokens = lower.split(/[\s,&/|]+/).map(cleanToken).filter(Boolean);
 
   // Bare "khayaban" / "khybn" (no street name) → match Khayaban word family
-  // + known corridor streets on place fields only (not raw chat false positives)
+  // + kh-e-X short forms (regex) + known corridor streets on place fields only
   if (!khyMatch) {
     const bareKhy = tokens.find((tok) => isKhayabanFamilyToken(tok));
     if (bareKhy) {
       mustGroups.push(khayabanWordPatterns());
       placeOnlyGroups.push(khayabanStreetPatterns());
+      searchRegexes.push(khayabanShortERegex());
       consumed.add(bareKhy);
       [
         'khayaban', 'khyaban', 'khybn', 'khaybn', 'khayabn', 'khayban', 'khyabn',
@@ -360,6 +363,7 @@ function parseSmartLocationQuery(raw) {
   const rejectAll =
     !capped.length &&
     !placeOnlyGroups.length &&
+    !searchRegexes.length &&
     phaseNumber == null &&
     isWeakOnlyLocationQuery(input);
 
@@ -368,6 +372,7 @@ function parseSmartLocationQuery(raw) {
     isMessageId: null,
     mustGroups: capped,
     placeOnlyGroups,
+    searchRegexes,
     phaseNumber,
     streetNumber: null,
     displayQuery: text,
@@ -450,9 +455,13 @@ function buildSmartLocationSql(parsed, searchableExpr, params) {
     params.push(patterns);
     placeClauses.push(`${placeExpr} ILIKE ANY($${params.length})`);
   }
+  for (const re of parsed.searchRegexes || []) {
+    params.push(re);
+    placeClauses.push(`${searchableExpr} ~* $${params.length}`);
+  }
 
   if (mustClauses.length && placeClauses.length) {
-    // Bare Khayaban: (word hits in text) OR (known corridor streets in place fields)
+    // Bare Khayaban: (word hits) OR (corridor streets / kh-e-X regex)
     parts.push(
       `((${mustClauses.join(' AND ')}) OR (${placeClauses.join(' OR ')}))`
     );
