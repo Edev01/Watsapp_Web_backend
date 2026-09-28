@@ -2091,9 +2091,9 @@ const runPropertySearch = async (req) => {
   const locationEarly = String(
     rawFilters.location || queryFilters.location || rawFilters.query || queryFilters.query || ''
   ).trim();
-  // Location searches need higher cap so older matching listings aren't truncated away
-  const maxLimit = locationEarly ? 500 : 100;
-  const defaultLimit = locationEarly ? 200 : 50;
+  // Location searches need higher cap so parent places (Khayaban/DHA) aren't truncated
+  const maxLimit = locationEarly ? 5000 : 100;
+  const defaultLimit = locationEarly ? 2000 : 50;
   const limit = Math.min(
     Math.max(Number.isFinite(requestedLimit) ? requestedLimit : defaultLimit, 1),
     maxLimit
@@ -2521,11 +2521,15 @@ app.get('/api/places/suggest', authenticateToken, async (req, res) => {
     }
 
     if (queryWantsKhayaban || queryWantsDha) {
-      const placeText = `LOWER(CONCAT_WS(' ', COALESCE(n.city,''), COALESCE(n.area,''), COALESCE(n.vicinity,'')))`;
+      // Same searchable corpus as runPropertySearch — so parent hits match search totals
+      const searchable = `LOWER(CONCAT_WS(' ', COALESCE(n.area,''), COALESCE(n.vicinity,''), COALESCE(n.city,''), ` +
+        `COALESCE(n.summary,''), COALESCE(n.listing_excerpt,''), ` +
+        `LEFT(COALESCE(m.message,''), 800)))`;
 
       if (queryWantsKhayaban) {
         const khyParams = [userId];
         const khyFilter = appendCommonFilters(khyParams);
+        // Mirror bare "Khayaban" search patterns (incl. Main Central Drive aliases)
         khyParams.push(khayabanSearchPatterns().map((p) => `%${p}%`));
         const khyIdx = khyParams.length;
         const khyCount = await db.query(
@@ -2534,7 +2538,7 @@ app.get('/api/places/suggest', authenticateToken, async (req, res) => {
            INNER JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
            WHERE m.user_id = $1 AND n.is_property IS TRUE
            ${khyFilter}
-           AND ${placeText} ILIKE ANY($${khyIdx})`,
+           AND ${searchable} ILIKE ANY($${khyIdx})`,
           khyParams
         );
         const hits = khyCount.rows[0]?.hits || 0;
@@ -2552,7 +2556,7 @@ app.get('/api/places/suggest', authenticateToken, async (req, res) => {
            INNER JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
            WHERE m.user_id = $1 AND n.is_property IS TRUE
            ${dhaFilter}
-           AND ${placeText} ILIKE ANY($${dhaIdx})`,
+           AND ${searchable} ILIKE ANY($${dhaIdx})`,
           dhaParams
         );
         const hits = dhaCount.rows[0]?.hits || 0;

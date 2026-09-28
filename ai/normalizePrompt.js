@@ -63,6 +63,7 @@ Rules:
    - "vicinity" = Sub-location (Phase 6, Block H, Scheme 33, Street 3, Main Street 5, etc.)
    - Roman Urdu "mein" / "mai" / bare "main" usually means "in" (e.g. "Korangi mein" = in Korangi). Do NOT store "main" or "mein" as area or vicinity by itself.
    - For "Main DHA Phase 8", area="DHA", vicinity="Phase 8" (phase is the strong signal; do not use area="Main" or "Main DHA").
+   - Streets like "Main Central Drive" / "Sector 2D" in Karachi DHA ads are real street names (keep them in vicinity). They are often in the Khayaban corridor — set area="DHA" when DHA/Defence context is clear; do NOT invent "Khayaban" unless the message says it or clearly names a Khayaban street.
 7. Normalize city names: "Karachi", "Lahore", "Islamabad", "Rawalpindi", "Faisalabad", etc.
 8. Handle spelling variations: "Cliftn" -> "Clifton", "Krachi" -> "Karachi", "kroangi/korngi" -> "Korangi"
 9. CRITICAL NUMERIC RULES:

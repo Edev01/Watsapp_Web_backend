@@ -35,6 +35,7 @@ const SEED_LOCALITIES = [
   'khayaban-e-qasim', 'khayaban-e-jami', 'khayaban-e-shujaat', 'khayaban-e-tanzeem',
   'khayaban-e-roomi', 'khayaban-e-saba', 'khayaban-e-rizwan',
   'rizwan', 'saba avenue', 'beach avenue', 'coastal avenue',
+  'main central drive', 'central drive',
   'jami commercial', 'muslim commercial', 'khalid commercial', 'babar commercial',
   'ayubi commercial', 'badar commercial', 'nishat commercial', 'bukhari commercial',
   'tauheed commercial', 'toheed commercial', 'al murtaza', 'al-murtaza commercial',
@@ -93,6 +94,9 @@ const ALIASES = Object.freeze({
   'khy ittehad': 'khayaban-e-ittehad',
   'khybn ittehad': 'khayaban-e-ittehad',
   'khaybn ittehad': 'khayaban-e-ittehad',
+  'main central drive': 'main central drive',
+  'central drive': 'main central drive',
+  'main central': 'main central drive',
   'khy-e-rizwan': 'khayaban-e-rizwan',
   'khy e rizwan': 'khayaban-e-rizwan',
   'kh-e-rizwan': 'khayaban-e-rizwan',
@@ -146,7 +150,12 @@ function khayabanSearchPatterns() {
     'khayabn',
     'khayban',
     'khyabn',
-    'khayaben'
+    'khayaben',
+    // Known Khayaban-corridor streets that often omit the word "khayaban" in ads
+    'main central drive',
+    'central drive',
+    'khayaban e ittehad',
+    'khayaban-e-ittehad'
   ];
 }
 
