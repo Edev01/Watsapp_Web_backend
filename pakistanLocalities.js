@@ -136,27 +136,35 @@ function isKhayabanFamilyToken(tok) {
   return editDistance(t, 'khayaban') <= 3;
 }
 
-/** ILIKE patterns that catch every Khayaban street spelling in listings / chat text. */
-function khayabanSearchPatterns() {
+/** Word/typo forms of "khayaban" — safe to match in message text. */
+function khayabanWordPatterns() {
   return [
     'khayaban',
     'khyaban',
     'khayaban-e',
     'khyaban-e',
-    'khy-e-',
-    'kh-e-',
     'khybn',
     'khaybn',
     'khayabn',
     'khayban',
     'khyabn',
     'khayaben',
-    // Known Khayaban-corridor streets that often omit the word "khayaban" in ads
-    'main central drive',
-    'central drive',
     'khayaban e ittehad',
     'khayaban-e-ittehad'
   ];
+}
+
+/**
+ * Street names under the Khayaban corridor that often omit the word "khayaban".
+ * Match these ONLY on city/area/vicinity — never on raw chat (too many false hits).
+ */
+function khayabanStreetPatterns() {
+  return ['main central drive', 'central drive'];
+}
+
+/** @deprecated use khayabanWordPatterns + khayabanStreetPatterns */
+function khayabanSearchPatterns() {
+  return [...khayabanWordPatterns(), ...khayabanStreetPatterns()];
 }
 
 /**
@@ -401,5 +409,7 @@ module.exports = {
   editDistance,
   isKhayabanFamilyToken,
   khayabanSearchPatterns,
+  khayabanWordPatterns,
+  khayabanStreetPatterns,
   canonicalizePlaceText
 };

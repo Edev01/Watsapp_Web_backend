@@ -8,7 +8,7 @@ const db = require('./db');
 const { sendResponse } = require('./responseHelper');
 const { authenticateToken, isAdmin } = require('./middleware');
 const { filterAndSortProperties, PROPERTY_STATUSES, normalizePropertyStatus, isValidPropertyStatus, expandLocationQuery } = require('./propertyHelper');
-const { setExtraLocalities, correctLocalityTypos, canonicalizePlaceText, normalizePlaceKey, isKhayabanFamilyToken, khayabanSearchPatterns } = require('./pakistanLocalities');
+const { setExtraLocalities, correctLocalityTypos, canonicalizePlaceText, normalizePlaceKey, isKhayabanFamilyToken, khayabanSearchPatterns, khayabanWordPatterns, khayabanStreetPatterns } = require('./pakistanLocalities');
 const { parseSmartLocationQuery, buildSmartLocationSql, scoreLocationMatch, textHasPhase, textHasStreet } = require('./smartLocationSearch');
 const { isWeakLocation } = require('./ai/cascadeMerge');
 const { extractUserId } = require('./userMiddleware');
@@ -2521,24 +2521,31 @@ app.get('/api/places/suggest', authenticateToken, async (req, res) => {
     }
 
     if (queryWantsKhayaban || queryWantsDha) {
-      // Same searchable corpus as runPropertySearch — so parent hits match search totals
+      // Same match rules as search for "Khayaban":
+      // - word/typo forms may match searchable text
+      // - corridor streets (Main Central Drive) only on city/area/vicinity
       const searchable = `LOWER(CONCAT_WS(' ', COALESCE(n.area,''), COALESCE(n.vicinity,''), COALESCE(n.city,''), ` +
         `COALESCE(n.summary,''), COALESCE(n.listing_excerpt,''), ` +
         `LEFT(COALESCE(m.message,''), 800)))`;
+      const placeOnly = `LOWER(CONCAT_WS(' ', COALESCE(n.city,''), COALESCE(n.area,''), COALESCE(n.vicinity,'')))`;
 
       if (queryWantsKhayaban) {
         const khyParams = [userId];
         const khyFilter = appendCommonFilters(khyParams);
-        // Mirror bare "Khayaban" search patterns (incl. Main Central Drive aliases)
-        khyParams.push(khayabanSearchPatterns().map((p) => `%${p}%`));
-        const khyIdx = khyParams.length;
+        khyParams.push(khayabanWordPatterns().map((p) => `%${p}%`));
+        const wordIdx = khyParams.length;
+        khyParams.push(khayabanStreetPatterns().map((p) => `%${p}%`));
+        const streetIdx = khyParams.length;
         const khyCount = await db.query(
           `SELECT COUNT(*)::int AS hits
            FROM normalized_messages n
            INNER JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
            WHERE m.user_id = $1 AND n.is_property IS TRUE
            ${khyFilter}
-           AND ${searchable} ILIKE ANY($${khyIdx})`,
+           AND (
+             ${searchable} ILIKE ANY($${wordIdx})
+             OR ${placeOnly} ILIKE ANY($${streetIdx})
+           )`,
           khyParams
         );
         const hits = khyCount.rows[0]?.hits || 0;
@@ -2556,7 +2563,7 @@ app.get('/api/places/suggest', authenticateToken, async (req, res) => {
            INNER JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
            WHERE m.user_id = $1 AND n.is_property IS TRUE
            ${dhaFilter}
-           AND ${searchable} ILIKE ANY($${dhaIdx})`,
+           AND ${placeOnly} ILIKE ANY($${dhaIdx})`,
           dhaParams
         );
         const hits = dhaCount.rows[0]?.hits || 0;

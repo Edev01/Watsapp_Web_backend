@@ -11,6 +11,8 @@ const {
   editDistance,
   isKhayabanFamilyToken,
   khayabanSearchPatterns,
+  khayabanWordPatterns,
+  khayabanStreetPatterns,
   canonicalizePlaceText
 } = require('./pakistanLocalities');
 
@@ -254,6 +256,7 @@ function parseSmartLocationQuery(raw) {
   const lower = text.toLowerCase();
 
   const mustGroups = [];
+  let placeOnlyGroups = [];
   let phaseNumber = null;
   const consumed = new Set();
 
@@ -292,11 +295,13 @@ function parseSmartLocationQuery(raw) {
 
   const tokens = lower.split(/[\s,&/|]+/).map(cleanToken).filter(Boolean);
 
-  // Bare "khayaban" / "khybn" (no street name) → match entire Khayaban family
+  // Bare "khayaban" / "khybn" (no street name) → match Khayaban word family
+  // + known corridor streets on place fields only (not raw chat false positives)
   if (!khyMatch) {
     const bareKhy = tokens.find((tok) => isKhayabanFamilyToken(tok));
     if (bareKhy) {
-      mustGroups.push(khayabanSearchPatterns());
+      mustGroups.push(khayabanWordPatterns());
+      placeOnlyGroups.push(khayabanStreetPatterns());
       consumed.add(bareKhy);
       [
         'khayaban', 'khyaban', 'khybn', 'khaybn', 'khayabn', 'khayban', 'khyabn',
@@ -354,6 +359,7 @@ function parseSmartLocationQuery(raw) {
 
   const rejectAll =
     !capped.length &&
+    !placeOnlyGroups.length &&
     phaseNumber == null &&
     isWeakOnlyLocationQuery(input);
 
@@ -361,6 +367,7 @@ function parseSmartLocationQuery(raw) {
     isId: null,
     isMessageId: null,
     mustGroups: capped,
+    placeOnlyGroups,
     phaseNumber,
     streetNumber: null,
     displayQuery: text,
@@ -427,10 +434,34 @@ function buildSmartLocationSql(parsed, searchableExpr, params) {
     parts.push(`${searchableExpr} ~* $${params.length}`);
   }
 
+  const mustClauses = [];
   for (const group of parsed.mustGroups || []) {
     const patterns = group.map((v) => `%${v}%`);
     params.push(patterns);
-    parts.push(`${searchableExpr} ILIKE ANY($${params.length})`);
+    mustClauses.push(`${searchableExpr} ILIKE ANY($${params.length})`);
+  }
+
+  // Place-only aliases (Main Central Drive under Khayaban) — never match raw chat dumps
+  const placeExpr =
+    `LOWER(CONCAT_WS(' ', COALESCE(n.city,''), COALESCE(n.area,''), COALESCE(n.vicinity,'')))`;
+  const placeClauses = [];
+  for (const group of parsed.placeOnlyGroups || []) {
+    const patterns = group.map((v) => `%${v}%`);
+    params.push(patterns);
+    placeClauses.push(`${placeExpr} ILIKE ANY($${params.length})`);
+  }
+
+  if (mustClauses.length && placeClauses.length) {
+    // Bare Khayaban: (word hits in text) OR (known corridor streets in place fields)
+    parts.push(
+      `((${mustClauses.join(' AND ')}) OR (${placeClauses.join(' OR ')}))`
+    );
+  } else if (mustClauses.length) {
+    for (const c of mustClauses) parts.push(c);
+  } else if (placeClauses.length) {
+    parts.push(
+      placeClauses.length === 1 ? placeClauses[0] : `(${placeClauses.join(' OR ')})`
+    );
   }
 
   // Direct place-name match: raw query against area / vicinity / city
@@ -537,6 +568,10 @@ function scoreLocationMatch(row, parsed) {
   }
   for (const group of parsed.mustGroups || []) {
     if (group.some((g) => text.includes(String(g).toLowerCase()))) score += 20;
+  }
+  const placeOnlyText = `${area} ${vicinity} ${city}`;
+  for (const group of parsed.placeOnlyGroups || []) {
+    if (group.some((g) => placeOnlyText.includes(String(g).toLowerCase()))) score += 25;
   }
   return score;
 }
