@@ -8,7 +8,7 @@ const db = require('./db');
 const { sendResponse } = require('./responseHelper');
 const { authenticateToken, isAdmin } = require('./middleware');
 const { filterAndSortProperties, PROPERTY_STATUSES, normalizePropertyStatus, isValidPropertyStatus, expandLocationQuery } = require('./propertyHelper');
-const { setExtraLocalities, correctLocalityTypos, canonicalizePlaceText, normalizePlaceKey, SEED_LOCALITIES, isKhayabanFamilyToken } = require('./pakistanLocalities');
+const { setExtraLocalities, correctLocalityTypos, canonicalizePlaceText, normalizePlaceKey, isKhayabanFamilyToken, khayabanSearchPatterns } = require('./pakistanLocalities');
 const { parseSmartLocationQuery, buildSmartLocationSql, scoreLocationMatch, textHasPhase, textHasStreet } = require('./smartLocationSearch');
 const { extractUserId } = require('./userMiddleware');
 const { findOrCreateCanonicalChat, upsertChatsBulk, cleanText, isSystemNotificationText, isCommonJunkMessage } = require('./contactHelper');
@@ -2342,9 +2342,9 @@ app.get('/api/properties/statuses', (req, res) => {
 });
 
 /**
- * Live place autocomplete for Search Properties location field.
- * GET /api/places/suggest?q=khay
- * Returns deduped canonical names from the user's saved properties + gazetteer.
+ * GET /api/places/suggest?q=khay&purpose=Buy&status=AVAILABLE&city=...
+ * Inventory-only autocomplete: places on the user's properties under active
+ * filters. Adds parent buckets (Khayaban / DHA) when matching listings exist.
  */
 app.get('/api/places/suggest', authenticateToken, async (req, res) => {
   const userId = resolveTenantUserId(req, null);
@@ -2359,53 +2359,108 @@ app.get('/api/places/suggest', authenticateToken, async (req, res) => {
 
   const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 18, 1), 40);
   const canonQ = canonicalizePlaceText(rawQ);
-  const searchTerms = [...new Set(
+  const uniqTerms = [...new Set(
     [rawQ, canonQ]
       .map((t) => String(t || '').trim().toLowerCase())
       .filter((t) => t.length >= 1)
   )];
 
-  if (searchTerms.some((t) => isKhayabanFamilyToken(t))) {
-    searchTerms.push('khayaban');
+  if (uniqTerms.some((t) => isKhayabanFamilyToken(t))) {
+    uniqTerms.push('khayaban');
   }
+  const searchTerms = [...new Set(uniqTerms)];
 
-  const uniqTerms = [...new Set(searchTerms)];
+  const queryWantsKhayaban = searchTerms.some((t) => {
+    if (isKhayabanFamilyToken(t)) return true;
+    if (t.length >= 3 && 'khayaban'.startsWith(t)) return true;
+    return false;
+  });
+  const queryWantsDha = searchTerms.some((t) => {
+    if (t.length < 2) return false;
+    return ['dha', 'defence', 'defense', 'defance'].some(
+      (d) => d === t || (t.length >= 2 && d.startsWith(t))
+    );
+  });
+
+  const purpose = String(req.query.purpose || '').trim().toLowerCase();
+  const city = String(req.query.city || '').trim();
+  const propertyType = String(req.query.propertyType || req.query.property_type || '').trim();
+  const propertySubType = String(req.query.propertySubType || req.query.property_sub_type || '').trim();
+  const statusRaw = String(req.query.status || req.query.propertyStatus || req.query.property_status || '').trim();
+
+  const appendCommonFilters = (params) => {
+    let filterSql = '';
+    if (purpose && purpose !== 'all') {
+      if (purpose === 'buy' || purpose === 'sale' || purpose === 'sell') {
+        params.push(['buy', 'sale', 'sell']);
+        filterSql += ` AND LOWER(COALESCE(n.purpose, '')) = ANY($${params.length})`;
+      } else if (purpose === 'rent') {
+        filterSql += ` AND LOWER(COALESCE(n.purpose, '')) = 'rent'`;
+      }
+    }
+    if (city && city.toLowerCase() !== 'all cities') {
+      params.push(`%${city}%`);
+      filterSql += ` AND (n.city ILIKE $${params.length} OR n.area ILIKE $${params.length} OR n.vicinity ILIKE $${params.length})`;
+    }
+    if (propertyType && propertyType.toLowerCase() !== 'all') {
+      params.push(`%${propertyType}%`);
+      filterSql += ` AND COALESCE(n.property_type, '') ILIKE $${params.length}`;
+    }
+    if (propertySubType && !['any', 'standard', ''].includes(propertySubType.toLowerCase())) {
+      params.push(`%${propertySubType}%`);
+      filterSql += ` AND COALESCE(n.property_sub_type, n.property_type, '') ILIKE $${params.length}`;
+    }
+    if (statusRaw) {
+      const statusList = statusRaw
+        .split(',')
+        .map((s) => normalizePropertyStatus(s))
+        .filter(Boolean);
+      if (statusList.length) {
+        params.push(statusList);
+        filterSql += ` AND UPPER(COALESCE(n.property_status, 'AVAILABLE')) = ANY($${params.length})`;
+      }
+    }
+    return filterSql;
+  };
 
   try {
     const params = [userId];
+    const filterSql = appendCommonFilters(params);
+
     const likeParts = [];
-    for (const term of uniqTerms) {
+    for (const term of searchTerms) {
       params.push(`%${term}%`);
       const idx = params.length;
       likeParts.push(
         `(LOWER(COALESCE(n.city,'')) LIKE $${idx} OR LOWER(COALESCE(n.area,'')) LIKE $${idx} OR LOWER(COALESCE(n.vicinity,'')) LIKE $${idx})`
       );
     }
+    const placeMatchSql = `(${likeParts.join(' OR ')})`;
+    const baseWhere = `
+      FROM normalized_messages n
+      INNER JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
+      WHERE m.user_id = $1 AND n.is_property IS TRUE
+      ${filterSql}
+    `;
 
     const sql = `
       SELECT name, kind, hits FROM (
         SELECT LOWER(TRIM(n.city)) AS name, 'city' AS kind, COUNT(*)::int AS hits
-        FROM normalized_messages n
-        INNER JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
-        WHERE m.user_id = $1 AND n.is_property IS TRUE
+        ${baseWhere}
           AND n.city IS NOT NULL AND TRIM(n.city) <> ''
-          AND (${likeParts.join(' OR ')})
+          AND ${placeMatchSql}
         GROUP BY LOWER(TRIM(n.city))
         UNION ALL
         SELECT LOWER(TRIM(n.area)) AS name, 'area' AS kind, COUNT(*)::int AS hits
-        FROM normalized_messages n
-        INNER JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
-        WHERE m.user_id = $1 AND n.is_property IS TRUE
+        ${baseWhere}
           AND n.area IS NOT NULL AND TRIM(n.area) <> ''
-          AND (${likeParts.join(' OR ')})
+          AND ${placeMatchSql}
         GROUP BY LOWER(TRIM(n.area))
         UNION ALL
         SELECT LOWER(TRIM(n.vicinity)) AS name, 'street' AS kind, COUNT(*)::int AS hits
-        FROM normalized_messages n
-        INNER JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
-        WHERE m.user_id = $1 AND n.is_property IS TRUE
+        ${baseWhere}
           AND n.vicinity IS NOT NULL AND TRIM(n.vicinity) <> ''
-          AND (${likeParts.join(' OR ')})
+          AND ${placeMatchSql}
         GROUP BY LOWER(TRIM(n.vicinity))
       ) t
       WHERE LENGTH(name) BETWEEN 2 AND 80
@@ -2416,22 +2471,29 @@ app.get('/api/places/suggest', authenticateToken, async (req, res) => {
     const dbResult = await db.query(sql, params);
     const byKey = new Map();
 
-    const addSuggestion = (rawName, kind, hits = 0, source = 'db') => {
+    const addSuggestion = (rawName, kind, hits = 0, { parent = false } = {}) => {
       const cleaned = String(rawName || '').trim();
       if (!cleaned) return;
       const canon = canonicalizePlaceText(cleaned) || cleaned;
       const key = normalizePlaceKey(canon);
       if (!key || key.length < 2) return;
 
-      // Collapse bare khayaban typos into one stem entry
-      const stemKey = isKhayabanFamilyToken(key) && !key.includes(' ') && !/-e-/.test(canon.replace(/\s+/g, '-'))
-        ? 'khayaban'
-        : key;
-      const label = stemKey === 'khayaban' && !/-e-| e /i.test(canon)
-        ? 'Khayaban'
+      // Bare khayaban typos are not streets — parent "Khayaban" covers all
+      if (
+        !parent &&
+        isKhayabanFamilyToken(key) &&
+        !key.includes(' ') &&
+        !/-e-/.test(canon.replace(/\s+/g, '-')) &&
+        !/\be\b/i.test(canon)
+      ) {
+        return;
+      }
+
+      const label = parent
+        ? (key === 'khayaban' ? 'Khayaban' : key === 'dha' ? 'DHA' : titlePlaceLabel(canon))
         : titlePlaceLabel(canon);
 
-      const existing = byKey.get(stemKey);
+      const existing = byKey.get(key);
       if (existing) {
         existing.hits += Number(hits) || 0;
         if ((Number(hits) || 0) > existing.bestHits) {
@@ -2439,46 +2501,70 @@ app.get('/api/places/suggest', authenticateToken, async (req, res) => {
           existing.kind = kind || existing.kind;
           existing.bestHits = Number(hits) || 0;
         }
+        if (parent) existing.kind = 'group';
         return;
       }
-      byKey.set(stemKey, {
-        id: stemKey,
+      byKey.set(key, {
+        id: key,
         label,
-        kind: kind || 'area',
+        kind: parent ? 'group' : (kind || 'area'),
         hits: Number(hits) || 0,
         bestHits: Number(hits) || 0,
-        source
+        parent: !!parent
       });
     };
 
     for (const row of dbResult.rows) {
-      addSuggestion(row.name, row.kind, row.hits, 'db');
+      addSuggestion(row.name, row.kind, row.hits);
     }
 
-    // Gazetteer fill-in (cities / DHA / known streets) so typing still helps before DB has volume
-    const qLower = uniqTerms[0];
-    for (const seed of SEED_LOCALITIES) {
-      const seedLower = String(seed).toLowerCase();
-      const seedCanon = canonicalizePlaceText(seedLower);
-      const matches = uniqTerms.some(
-        (t) => seedLower.includes(t) || seedCanon.includes(t) || normalizePlaceKey(seedCanon).includes(normalizePlaceKey(t))
-      );
-      if (!matches) continue;
-      let kind = 'area';
-      if (/^(karachi|lahore|islamabad|rawalpindi|faisalabad|multan|peshawar|hyderabad|quetta)$/i.test(seed)) {
-        kind = 'city';
-      } else if (/khayaban|street|avenue|road|commercial/i.test(seed)) {
-        kind = 'street';
-      } else if (/phase|block|sector|scheme/i.test(seed)) {
-        kind = 'phase';
+    if (queryWantsKhayaban || queryWantsDha) {
+      const placeText = `LOWER(CONCAT_WS(' ', COALESCE(n.city,''), COALESCE(n.area,''), COALESCE(n.vicinity,'')))`;
+
+      if (queryWantsKhayaban) {
+        const khyParams = [userId];
+        const khyFilter = appendCommonFilters(khyParams);
+        khyParams.push(khayabanSearchPatterns().map((p) => `%${p}%`));
+        const khyIdx = khyParams.length;
+        const khyCount = await db.query(
+          `SELECT COUNT(*)::int AS hits
+           FROM normalized_messages n
+           INNER JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
+           WHERE m.user_id = $1 AND n.is_property IS TRUE
+           ${khyFilter}
+           AND ${placeText} ILIKE ANY($${khyIdx})`,
+          khyParams
+        );
+        const hits = khyCount.rows[0]?.hits || 0;
+        if (hits > 0) addSuggestion('Khayaban', 'group', hits, { parent: true });
       }
-      addSuggestion(seed, kind, 0, 'gazetteer');
+
+      if (queryWantsDha || queryWantsKhayaban) {
+        const dhaParams = [userId];
+        const dhaFilter = appendCommonFilters(dhaParams);
+        dhaParams.push(['%dha%', '%defence%', '%defense%', '%defance%']);
+        const dhaIdx = dhaParams.length;
+        const dhaCount = await db.query(
+          `SELECT COUNT(*)::int AS hits
+           FROM normalized_messages n
+           INNER JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
+           WHERE m.user_id = $1 AND n.is_property IS TRUE
+           ${dhaFilter}
+           AND ${placeText} ILIKE ANY($${dhaIdx})`,
+          dhaParams
+        );
+        const hits = dhaCount.rows[0]?.hits || 0;
+        if (hits > 0) addSuggestion('DHA', 'group', hits, { parent: true });
+      }
     }
 
     const scored = [...byKey.values()].map((s) => {
       const labelLower = s.label.toLowerCase();
-      const prefix = uniqTerms.some((t) => labelLower.startsWith(t) || normalizePlaceKey(labelLower).startsWith(normalizePlaceKey(t)));
-      return { ...s, score: (prefix ? 1000 : 0) + s.hits };
+      const prefix = searchTerms.some(
+        (t) => labelLower.startsWith(t) || normalizePlaceKey(labelLower).startsWith(normalizePlaceKey(t))
+      );
+      const parentBoost = s.parent ? 5000 : 0;
+      return { ...s, score: parentBoost + (prefix ? 1000 : 0) + s.hits };
     });
 
     scored.sort((a, b) => b.score - a.score || a.label.localeCompare(b.label));
