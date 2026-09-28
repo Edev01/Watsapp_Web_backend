@@ -9,10 +9,26 @@ const OFFER_HINT =
 const SIZE_START =
   /(?:^|\n)\s*\*??\s*(?:\d+\s*\+\s*)?\d+(?:\.\d+)?\s*(?:yard|yrd|yards|sq\.?\s*yd|marla|kanal|sq\.?\s*ft)\b/gi;
 
+function normalizePkMobile(raw) {
+  let digits = String(raw || '').replace(/\D/g, '');
+  if (!digits) return null;
+  if (digits.startsWith('92') && digits.length >= 12) digits = `0${digits.slice(2)}`;
+  if (/^3\d{9}$/.test(digits)) digits = `0${digits}`;
+  if (!/^03\d{9}$/.test(digits)) return null;
+  return digits;
+}
+
 function extractSharedContacts(text) {
-  const matches = String(text || '').match(/(?:\+?92|0)?3\d{9}/g) || [];
-  const uniq = [...new Set(matches.map((m) => m.replace(/\s+/g, '')))];
-  return uniq.length ? uniq.join(', ') : null;
+  const t = String(text || '');
+  const found = new Set();
+  // Allow dashes/spaces/markdown: 0318-2427563, 0309 8196446, +92 318 2427563, `0315-3732175`
+  const re = /(?:\+?92[\s\-.]*)?0?3(?:[\s\-.]*\d){9}/g;
+  let m;
+  while ((m = re.exec(t)) !== null) {
+    const phone = normalizePkMobile(m[0]);
+    if (phone) found.add(phone);
+  }
+  return found.size ? [...found].join(', ') : null;
 }
 
 function looksLikeOffer(chunk) {

@@ -82,6 +82,7 @@ async function runMigrationSteps(client) {
     `ALTER TABLE whatsapp_chats ADD COLUMN IF NOT EXISTS user_id INTEGER`,
     `ALTER TABLE whatsapp_chats ADD COLUMN IF NOT EXISTS monitored_at TIMESTAMPTZ`,
     `ALTER TABLE whatsapp_chats ADD COLUMN IF NOT EXISTS last_scraped_at TIMESTAMPTZ`,
+    `ALTER TABLE whatsapp_chats ADD COLUMN IF NOT EXISTS monitor_letter VARCHAR(8)`,
     `UPDATE whatsapp_chats
      SET monitored_at = COALESCE(monitored_at, created_at, NOW())
      WHERE is_monitored = TRUE AND monitored_at IS NULL`,
@@ -109,7 +110,18 @@ async function runMigrationSteps(client) {
     )`,
     `ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS user_id INTEGER`,
     `ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS from_me BOOLEAN DEFAULT FALSE`,
-    `ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS seq_in_chat INTEGER`,
+    `ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS seq_in_chat TEXT`,
+    // Legacy installs had INTEGER seq_in_chat — cast to text labels (a-1, b-2, …)
+    `DO $$ BEGIN
+       IF EXISTS (
+         SELECT 1 FROM information_schema.columns
+         WHERE table_name = 'whatsapp_messages' AND column_name = 'seq_in_chat'
+           AND data_type = 'integer'
+       ) THEN
+         ALTER TABLE whatsapp_messages
+           ALTER COLUMN seq_in_chat TYPE TEXT USING seq_in_chat::text;
+       END IF;
+     END $$`,
     `CREATE INDEX IF NOT EXISTS idx_whatsapp_messages_chat_seq
        ON whatsapp_messages (user_id, chat_jid, seq_in_chat)`,
     `CREATE UNIQUE INDEX IF NOT EXISTS uniq_whatsapp_messages_chat_seq
@@ -275,9 +287,37 @@ async function ensureScrapeColumns(client) {
     await dbClient.query(`
       ALTER TABLE whatsapp_chats ADD COLUMN IF NOT EXISTS monitored_at TIMESTAMPTZ;
       ALTER TABLE whatsapp_chats ADD COLUMN IF NOT EXISTS last_scraped_at TIMESTAMPTZ;
+      ALTER TABLE whatsapp_chats ADD COLUMN IF NOT EXISTS monitor_letter VARCHAR(8);
     `);
   } finally {
     if (!client) dbClient.release();
+  }
+}
+
+async function migrateSeqLabels() {
+  try {
+    const {
+      backfillMonitorLetters,
+      rewriteLegacySeqLabels,
+      reassignMonitorLettersAndSeqs
+    } = require('./seqHelper');
+    // If any monitored chat is missing a letter, or Propsync-style wrong order detected,
+    // do a full reassign once when legacy numeric seqs still exist; otherwise fill gaps.
+    const numeric = await pool.query(
+      `SELECT count(*)::int AS n FROM whatsapp_messages WHERE seq_in_chat ~ '^[0-9]+$'`
+    );
+    if ((numeric.rows[0] && numeric.rows[0].n > 0) || process.env.SEQ_REASSIGN === '1') {
+      const r = await reassignMonitorLettersAndSeqs();
+      console.log(`[seq] full reassign letters=${r.letters} rebuilt=${r.rebuilt}`);
+      return;
+    }
+    const letters = await backfillMonitorLetters();
+    const rewritten = await rewriteLegacySeqLabels();
+    if (letters || rewritten) {
+      console.log(`[seq] monitor letters assigned=${letters}, legacy seq rewritten=${rewritten}`);
+    }
+  } catch (err) {
+    console.warn('[seq] label migration skipped:', err.message);
   }
 }
 
@@ -285,5 +325,6 @@ module.exports = {
   query: (text, params) => pool.query(text, params),
   initializeDb,
   ensureScrapeColumns: () => ensureScrapeColumns(),
+  migrateSeqLabels,
   pool
 };

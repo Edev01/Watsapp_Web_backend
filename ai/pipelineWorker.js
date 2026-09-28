@@ -161,7 +161,11 @@ async function processJob(job) {
     200,
     Math.max(1, Number(job.batch_size) || cfg.defaultBatchSize)
   );
-  const doEmbed = job.embed !== false;
+  const embedHost = String(process.env.EMBEDDING_BASE_URL || '');
+  const doEmbed =
+    job.embed !== false &&
+    Boolean(embedHost) &&
+    !/localhost|127\.0\.0\.1/.test(embedHost);
 
   stats.currentUserId = userId;
   console.info(
@@ -229,12 +233,12 @@ async function processJob(job) {
        AND m.message IS NOT NULL AND TRIM(m.message) <> ''
        AND NOT EXISTS (
          SELECT 1 FROM normalized_messages n
-         WHERE n.whatsapp_message_id = m.id AND n.model_used = $2
+         WHERE n.whatsapp_message_id = m.id
        )`,
-    [userId, model]
+    [userId]
   );
   const pending = pendingRes.rows[0]?.c || 0;
-  if (pending > 0 && totalNorm === 0) {
+  if (pending > 0) {
     await db.query(
       `UPDATE normalize_jobs
        SET status = 'queued', updated_at = NOW(),
@@ -242,7 +246,9 @@ async function processJob(job) {
        WHERE user_id = $1 AND status = 'running'`,
       [
         userId,
-        `LLM produced no valid JSON for ${pending} pending message(s); re-queued`
+        totalNorm === 0
+          ? `No listings written for ${pending} pending message(s); re-queued`
+          : `Partial NER run (${totalNorm}); ${pending} still pending`
       ]
     );
     console.warn(`[pipeline] Job user=${userId} re-queued; ${pending} still pending`);

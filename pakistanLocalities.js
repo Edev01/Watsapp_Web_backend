@@ -208,6 +208,8 @@ function matchLocality(phrase) {
 
   const { exact, keys } = getIndex();
   const key = normalizePlaceKey(raw);
+  // "phase" is not a locality — compact index "phase5" used to fuzzy-match it to Phase 5.
+  if (/^(phase|block|street|st|scheme|sector)$/.test(key)) return null;
   if (exact.has(key)) return exact.get(key);
 
   const compact = key.replace(/\s+/g, '');
@@ -217,10 +219,12 @@ function matchLocality(phrase) {
   let best = null;
   let bestDist = Infinity;
   const keyTail = key.split(/\s+/).pop();
+  const keyHasNum = /\d/.test(key);
   for (const k of keys) {
     if (Math.abs(k.length - key.length) > maxD) continue;
     // Prefer same starting letter to cut false positives (bahria ≠ baldia)
     if (k[0] !== key[0]) continue;
+    if (keyHasNum !== /\d/.test(k)) continue;
     // For multi-word / khayaban names, last token must be very close (rizwan ≠ rahat)
     const kTail = k.split(/\s+/).pop();
     if (key.includes(' ') || key.length >= 10) {

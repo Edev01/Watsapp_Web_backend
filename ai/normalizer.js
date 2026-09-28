@@ -2,6 +2,7 @@ const db = require('../db');
 const { getConfig } = require('./config');
 const { LLMClient, expandListingSchemas } = require('./llmClient');
 const { splitPropertyOffers, extractSharedContacts } = require('./listingSplitter');
+const { LOCAL_MODEL, extractMessageSchema } = require('./localNer');
 const {
   loadSkippedIds,
   logNormalizationFailure,
@@ -181,7 +182,7 @@ async function saveNormalized(job, schema, targetModel) {
   return saved;
 }
 
-async function loadPendingJobs(targetModel, userId, window) {
+async function loadPendingJobs(targetModel, userId, window, { ignoreSkips = true } = {}) {
   const skipped = [...getSkippedIds()];
   const params = [targetModel];
   let userFilter = '';
@@ -198,7 +199,7 @@ async function loadPendingJobs(targetModel, userId, window) {
   }
 
   let skipFilter = '';
-  if (skipped.length) {
+  if (!ignoreSkips && skipped.length) {
     params.push(skipped);
     skipFilter = `AND m.id <> ALL($${params.length}::int[])`;
   }
@@ -213,7 +214,7 @@ async function loadPendingJobs(targetModel, userId, window) {
        AND TRIM(m.message) <> ''
        AND NOT EXISTS (
          SELECT 1 FROM normalized_messages n
-         WHERE n.whatsapp_message_id = m.id AND n.model_used = $1
+         WHERE n.whatsapp_message_id = m.id
        )
        AND NOT EXISTS (
          SELECT 1 FROM normalize_claims c
@@ -238,6 +239,18 @@ async function loadPendingJobs(targetModel, userId, window) {
 async function normalizeOne(job, llmClient, targetModel) {
   try {
     const sharedContact = extractSharedContacts(job.message);
+    const localSchema = await extractMessageSchema(job.message, job.sender);
+    if (localSchema) {
+      if (sharedContact && !localSchema.contact_number) {
+        localSchema.contact_number = sharedContact;
+      }
+      const saved = await saveNormalized(job, localSchema, LOCAL_MODEL);
+      console.info(
+        `[ai] Message ${job.id} (user ${tenantId(job.user_id)}) NER → ${saved} row(s)`
+      );
+      return { id: job.id, ok: true, listings: saved };
+    }
+
     const chunks = splitPropertyOffers(job.message);
     const useChunks = chunks.length >= 2;
 
@@ -290,7 +303,7 @@ async function normalizeOne(job, llmClient, targetModel) {
           listing_excerpt: r.listing_excerpt
         }))
       };
-      const saved = await saveNormalized(job, envelope, targetModel);
+      const saved = await saveNormalized(job, envelope, LOCAL_MODEL);
       console.info(
         `[ai] Message ${job.id} (user ${tenantId(job.user_id)}) split → ${saved} listing(s) from ${chunks.length} chunks`
       );
@@ -312,7 +325,7 @@ async function normalizeOne(job, llmClient, targetModel) {
       if (sharedContact && !result.schema.contact_number) {
         result.schema.contact_number = sharedContact;
       }
-      const saved = await saveNormalized(job, result.schema, targetModel);
+      const saved = await saveNormalized(job, result.schema, LOCAL_MODEL);
       console.info(
         `[ai] Message ${job.id} (user ${tenantId(job.user_id)}) → ${saved} listing(s) in ${result.latency.toFixed(2)}s`
       );
@@ -378,7 +391,7 @@ async function processUnnormalizedMessages({
   await releaseStaleClaims(targetModel);
 
   const window = Math.max(batchSize * 4, 80);
-  const candidates = await loadPendingJobs(targetModel, userId, window);
+  const candidates = await loadPendingJobs(targetModel, userId, window, { ignoreSkips: true });
   const selected = fairPick(candidates, batchSize, perUser);
   const claimed = await claimJobs(selected, targetModel);
 
@@ -393,8 +406,8 @@ async function processUnnormalizedMessages({
   }
 
   console.info(
-    `[ai] Processing ${claimed.length} messages with ${workers} parallel calls ` +
-      `(model '${targetModel}', tenants=${JSON.stringify(tenantCounts)})`
+    `[ai] Processing ${claimed.length} messages with ${workers} parallel NER ` +
+      `(engine '${LOCAL_MODEL}', tenants=${JSON.stringify(tenantCounts)})`
   );
 
   const started = Date.now();
@@ -419,6 +432,7 @@ async function processUnnormalizedMessages({
 
 module.exports = {
   processUnnormalizedMessages,
+  saveNormalized,
   fairPick,
   releaseStaleClaims,
   tenantId

@@ -13,6 +13,11 @@ const { parseSmartLocationQuery, buildSmartLocationSql, scoreLocationMatch, text
 const { extractUserId } = require('./userMiddleware');
 const { findOrCreateCanonicalChat, upsertChatsBulk, cleanText, isSystemNotificationText, isCommonJunkMessage } = require('./contactHelper');
 const {
+  ensureMonitorLetter,
+  allocateSeqInChat,
+  parseSeqNumber
+} = require('./seqHelper');
+const {
   DEFAULT_MODEL: NORMALIZE_MODEL,
   getNormalizeCounts,
   getNormalizeJob,
@@ -1285,10 +1290,11 @@ app.get('/api/scraped-chats/monitored', async (req, res) => {
     const result = await db.query(
       `SELECT c.jid, c.name, c.avatar, c.is_monitored, c.user_id, c.created_at,
          c.monitored_at,
+         c.monitor_letter,
          c.last_scraped_at
        FROM whatsapp_chats c 
        WHERE c.user_id = $1 AND c.is_monitored = TRUE 
-       ORDER BY c.name ASC`,
+       ORDER BY c.monitor_letter ASC NULLS LAST, c.name ASC`,
       [userId]
     );
     return sendResponse(res, 200, false, result.rows, 'Monitored chats retrieved successfully');
@@ -1385,6 +1391,8 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
             row.isFromMe
           );
         }
+        // Never put seq_in_chat on the INSERT. A unique seq collision used to
+        // ROLLBACK the whole batch, so the worker "posted" but nothing saved.
         const result = await client.query(
           `INSERT INTO whatsapp_messages (user_id, chat_jid, sender, timestamp, message, from_me)
            VALUES ${values.join(',')}
@@ -1395,33 +1403,51 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
         );
         addedCount = result.rows.length;
         skippedCount += toInsert.length - addedCount;
+        await client.query('COMMIT');
 
-        if (addedCount > 0) {
-          const newIds = result.rows.map((r) => r.id);
-          const numbered = await client.query(
-            `UPDATE whatsapp_messages m
-             SET seq_in_chat = s.seq
-             FROM (
-               SELECT x.id,
-                      COALESCE((
-                        SELECT MAX(seq_in_chat)
-                        FROM whatsapp_messages
-                        WHERE user_id = $1 AND chat_jid = $2 AND seq_in_chat IS NOT NULL
-                      ), -1) + ROW_NUMBER() OVER (ORDER BY x.id) AS seq
-               FROM unnest($3::int[]) AS x(id)
-             ) s
-             WHERE m.id = s.id
-             RETURNING m.id, m.seq_in_chat`,
-            [userId, canonicalJid, newIds]
-          );
-          const seqs = numbered.rows.map((r) => r.seq_in_chat).filter((n) => n != null);
-          if (seqs.length) {
-            seqFrom = Math.min(...seqs);
-            seqTo = Math.max(...seqs);
+        const newIds = result.rows
+          .map((r) => parseInt(r.id, 10))
+          .filter((n) => Number.isFinite(n));
+        if (newIds.length) {
+          try {
+            await client.query('BEGIN');
+            await client.query(
+              `SELECT id FROM whatsapp_chats WHERE user_id = $1 AND jid = $2 FOR UPDATE`,
+              [userId, canonicalJid]
+            );
+            // Sticky letter for this monitored chat (a, b, c, …)
+            await ensureMonitorLetter(userId, canonicalJid, client);
+            for (const id of newIds) {
+              const nextSeq = await allocateSeqInChat(client, userId, canonicalJid);
+              const numbered = await client.query(
+                `UPDATE whatsapp_messages m
+                 SET seq_in_chat = $4
+                 WHERE m.id = $3 AND m.seq_in_chat IS NULL
+                 RETURNING m.seq_in_chat`,
+                [userId, canonicalJid, id, nextSeq]
+              );
+              const seq = numbered.rows[0]?.seq_in_chat;
+              if (seq != null) {
+                const n = parseSeqNumber(seq);
+                const fromN = parseSeqNumber(seqFrom);
+                const toN = parseSeqNumber(seqTo);
+                if (seqFrom == null || (n != null && fromN != null && n < fromN) || fromN == null) {
+                  seqFrom = seq;
+                }
+                if (seqTo == null || (n != null && toN != null && n > toN) || toN == null) {
+                  seqTo = seq;
+                }
+              }
+            }
+            await client.query('COMMIT');
+          } catch (seqErr) {
+            try { await client.query('ROLLBACK'); } catch (_) {}
+            console.error(
+              `seq_in_chat assign failed (messages kept) user=${userId} jid=${canonicalJid}:`,
+              seqErr.message
+            );
           }
         }
-
-        await client.query('COMMIT');
 
         for (const row of toInsert) {
           if (row.messageEpoch != null) {
@@ -1543,15 +1569,21 @@ app.post('/api/scraped-chats/monitor', async (req, res) => {
         `UPDATE whatsapp_chats
          SET is_monitored = TRUE, monitored_at = NOW()
          WHERE user_id = $1 AND jid = ANY($2)
-         RETURNING jid, name, is_monitored, monitored_at`,
+         RETURNING jid, name, is_monitored, monitored_at, monitor_letter`,
         [userId, canonicalJids]
       );
       updated = result.rowCount;
       updatedRows = result.rows;
+      for (const jid of canonicalJids) {
+        await ensureMonitorLetter(userId, jid);
+      }
     } else if (mode === 'remove') {
       // Unmonitor: only the given chat IDs are removed from monitored list
+      // Keep monitor_letter so historical a-1 / b-2 labels stay stable
       const result = await db.query(
-        'UPDATE whatsapp_chats SET is_monitored = FALSE WHERE user_id = $1 AND jid = ANY($2) RETURNING jid, name, is_monitored',
+        `UPDATE whatsapp_chats SET is_monitored = FALSE
+         WHERE user_id = $1 AND jid = ANY($2)
+         RETURNING jid, name, is_monitored, monitor_letter`,
         [userId, canonicalJids]
       );
       updated = result.rowCount;
@@ -1563,11 +1595,14 @@ app.post('/api/scraped-chats/monitor', async (req, res) => {
              monitored_at = CASE WHEN is_monitored = FALSE THEN NOW() ELSE monitored_at END,
              last_scraped_at = CASE WHEN is_monitored = FALSE THEN NULL ELSE last_scraped_at END
          WHERE user_id = $1 AND jid = ANY($2)
-         RETURNING jid, name, is_monitored, monitored_at`,
+         RETURNING jid, name, is_monitored, monitored_at, monitor_letter`,
         [userId, canonicalJids]
       );
       updated = result.rowCount;
       updatedRows = result.rows;
+      for (const jid of canonicalJids) {
+        await ensureMonitorLetter(userId, jid);
+      }
     }
 
     if (mode === 'add' && updated === 0) {
@@ -1581,7 +1616,10 @@ app.post('/api/scraped-chats/monitor', async (req, res) => {
     }
 
     const monitoredRows = await db.query(
-      'SELECT jid, name, is_monitored FROM whatsapp_chats WHERE user_id = $1 AND is_monitored = TRUE ORDER BY name ASC',
+      `SELECT jid, name, is_monitored, monitor_letter, monitored_at
+       FROM whatsapp_chats
+       WHERE user_id = $1 AND is_monitored = TRUE
+       ORDER BY monitor_letter ASC NULLS LAST, name ASC`,
       [userId]
     );
 
@@ -1661,7 +1699,9 @@ app.get('/api/scraped-chats/stats', async (req, res) => {
          (
            SELECT COUNT(*)::int
            FROM whatsapp_messages m
-           WHERE m.user_id = $1
+           INNER JOIN whatsapp_chats c
+             ON c.user_id = m.user_id AND c.jid = m.chat_jid
+           WHERE m.user_id = $1 AND c.is_monitored = TRUE
          ) AS messages
        FROM whatsapp_chats
        WHERE user_id = $1`,
@@ -1752,7 +1792,11 @@ app.get('/api/scraped-chats/messages', async (req, res) => {
   try {
     if (countOnly === '1' || countOnly === 'true') {
       const result = await db.query(
-        'SELECT COUNT(*)::int AS count FROM whatsapp_messages WHERE user_id = $1',
+        `SELECT COUNT(*)::int AS count
+         FROM whatsapp_messages m
+         INNER JOIN whatsapp_chats c
+           ON c.user_id = m.user_id AND c.jid = m.chat_jid
+         WHERE m.user_id = $1 AND c.is_monitored = TRUE`,
         [userId]
       );
       return sendResponse(res, 200, false, result.rows[0], 'Message count retrieved');
@@ -2061,11 +2105,12 @@ const runPropertySearch = async (req) => {
              n.summary, n.property_status, n.created_at, n.category, n.intent, n.sentiment,
              n.listing_index, n.listing_excerpt,
              LEFT(COALESCE(NULLIF(TRIM(n.listing_excerpt), ''), m.message), 500) AS raw_message,
-             m.timestamp AS message_timestamp, m.from_me, m.user_id, m.seq_in_chat
+             m.timestamp AS message_timestamp, m.from_me, m.user_id,
+             m.seq_in_chat, m.seq_in_chat AS "seqInChat"
       FROM normalized_messages n
       INNER JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
       WHERE m.user_id = $1
-        AND (n.is_property IS TRUE OR n.purpose IS NOT NULL OR n.property_type IS NOT NULL)
+        AND n.is_property IS TRUE
   `;
   const params = [userId];
 
@@ -2738,6 +2783,9 @@ async function refreshLocalityGazetteer() {
 (async () => {
   try {
     await db.initializeDb();
+    if (typeof db.migrateSeqLabels === 'function') {
+      await db.migrateSeqLabels();
+    }
   } catch (err) {
     console.error('Database init failed on startup:', err.message);
   }
