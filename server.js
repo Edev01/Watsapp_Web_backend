@@ -31,8 +31,19 @@ const {
 
 let startPipelineWorker = () => ({ started: false, reason: 'ai module missing' });
 let wakePipeline = () => {};
+let getPipelineStats = () => ({
+  running: false,
+  lastRun: null,
+  lastNormalized: 0,
+  lastEmbedded: 0,
+  totalNormalized: 0,
+  totalEmbedded: 0,
+  lastError: null
+});
+let getConfigSafe = () => ({});
 try {
-  ({ startPipelineWorker, wakePipeline } = require('./ai/pipelineWorker'));
+  ({ startPipelineWorker, wakePipeline, getPipelineStats } = require('./ai/pipelineWorker'));
+  ({ getConfigSafe } = require('./ai/config'));
 } catch (err) {
   console.warn('[pipeline] module not loaded:', err.message);
 }
