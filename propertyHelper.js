@@ -375,30 +375,56 @@ function collapseRepeatedText(raw) {
 /**
  * Collapse doubled paste ("hellohello") and whitespace so duplicate scrapes match.
  */
+function normalizeFingerprintText(s) {
+  return collapseRepeatedText(String(s || ''))
+    .toLowerCase()
+    .replace(/[*_`~#>|]+/g, ' ')
+    .replace(/[^\p{L}\p{N}\s./-]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function listingFingerprint(row) {
-  const raw = collapseRepeatedText(
-    row.listing_excerpt || row.rawMessage || row.raw_message || row.summary || ''
+  // Prefer structured listing text — full raw dumps differ by list position / noise
+  const structured = normalizeFingerprintText(
+    row.listingExcerpt || row.listing_excerpt || row.summary || ''
   );
+  const raw = structured || normalizeFingerprintText(row.rawMessage || row.raw_message || '');
+  if (!raw || raw.length < 24) {
+    // Too thin to safely collapse — keep row identity
+    return row.id != null ? `id:${row.id}` : '';
+  }
+  // Content-primary: ignore listing_index so same ad split/reposted once is enough.
+  // Keep purpose so sale vs rent of identical text can both show.
   return [
-    raw.slice(0, 200),
-    String(row.purpose || '').toLowerCase(),
-    String(row.size || ''),
-    String(row.vicinity || row.area || ''),
-    String(row.listing_index ?? row.listingIndex ?? '')
+    raw.slice(0, 180),
+    String(row.purpose || '').toLowerCase().trim()
   ].join('|');
 }
 
 function dedupeListings(items) {
   const seenId = new Set();
   const seenFp = new Set();
+  const seenMsgExcerpt = new Set();
   const out = [];
   for (const item of items) {
-    // Each normalized listing row is unique (multi-offers share whatsapp_message_id)
     if (item.id != null) {
       const key = `id:${item.id}`;
       if (seenId.has(key)) continue;
       seenId.add(key);
     }
+
+    // Same WhatsApp message + same excerpt body → keep one card
+    const msgId = item.whatsappMessageId ?? item.whatsapp_message_id;
+    const excerptKey = normalizeFingerprintText(
+      item.listingExcerpt || item.listing_excerpt || item.summary || ''
+    ).slice(0, 160);
+    if (msgId != null && excerptKey.length >= 24) {
+      const mk = `m:${msgId}|${excerptKey}`;
+      if (seenMsgExcerpt.has(mk)) continue;
+      seenMsgExcerpt.add(mk);
+    }
+
     const fp = listingFingerprint(item);
     if (fp && seenFp.has(fp)) continue;
     if (fp) seenFp.add(fp);

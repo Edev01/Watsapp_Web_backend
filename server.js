@@ -2234,7 +2234,7 @@ const runPropertySearch = async (req) => {
   const fetchLimit =
     parsedLocation && parsedLocation.phaseNumber != null
       ? Math.min(Math.max(limit * 3, limit), Math.max(limit, 2000))
-      : limit;
+      : Math.min(Math.max(limit * 3, limit), 1500);
 
   let queryText = `
     SELECT * FROM (
@@ -2303,7 +2303,7 @@ const runPropertySearch = async (req) => {
     const properties = filterAndSortProperties(rows, {
       ...filters,
       sortBy: parsedLocation ? 'Relevance' : filters.sortBy
-    });
+    }).slice(0, limit);
 
     return {
       filters,
