@@ -8,6 +8,7 @@ const db = require('./db');
 const { sendResponse } = require('./responseHelper');
 const { authenticateToken, isAdmin } = require('./middleware');
 const { filterAndSortProperties, PROPERTY_STATUSES, normalizePropertyStatus, isValidPropertyStatus, expandLocationQuery } = require('./propertyHelper');
+const { messageContentFingerprint } = require('./contentFingerprint');
 const { setExtraLocalities, correctLocalityTypos, canonicalizePlaceText, normalizePlaceKey, isKhayabanFamilyToken } = require('./pakistanLocalities');
 const { parseSmartLocationQuery, buildSmartLocationSql, scoreLocationMatch, textHasPhase, textHasStreet } = require('./smartLocationSearch');
 const { isWeakLocation } = require('./ai/cascadeMerge');
@@ -1378,10 +1379,37 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
           [userId, canonicalJid]
         );
 
+        // Drop body-identical reposts already stored for this chat (new timestamps still).
+        const prior = await client.query(
+          `SELECT message FROM whatsapp_messages
+           WHERE user_id = $1 AND chat_jid = $2
+           ORDER BY id DESC
+           LIMIT 8000`,
+          [userId, canonicalJid]
+        );
+        const seenBodies = new Set();
+        for (const r of prior.rows) {
+          const fp = messageContentFingerprint(r.message);
+          if (fp) seenBodies.add(fp);
+        }
+        const uniqueRows = [];
+        for (const row of toInsert) {
+          const fp = messageContentFingerprint(row.messageText);
+          if (fp && seenBodies.has(fp)) {
+            skippedCount += 1;
+            continue;
+          }
+          if (fp) seenBodies.add(fp);
+          uniqueRows.push(row);
+        }
+
+        if (!uniqueRows.length) {
+          await client.query('COMMIT');
+        } else {
         const params = [];
         const values = [];
         let p = 1;
-        for (const row of toInsert) {
+        for (const row of uniqueRows) {
           values.push(`($${p++},$${p++},$${p++},$${p++},$${p++},$${p++})`);
           params.push(
             userId,
@@ -1403,7 +1431,7 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
           params
         );
         addedCount = result.rows.length;
-        skippedCount += toInsert.length - addedCount;
+        skippedCount += uniqueRows.length - addedCount;
         await client.query('COMMIT');
 
         const newIds = result.rows
@@ -1450,7 +1478,7 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
           }
         }
 
-        for (const row of toInsert) {
+        for (const row of uniqueRows) {
           if (row.messageEpoch != null) {
             maxMessageEpoch =
               maxMessageEpoch == null
@@ -1459,6 +1487,7 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
           }
         }
         if (addedCount === 0) maxMessageEpoch = null;
+        } // end uniqueRows.length
       } catch (insertErr) {
         try { await client.query('ROLLBACK'); } catch (_) {}
         skippedCount += toInsert.length;

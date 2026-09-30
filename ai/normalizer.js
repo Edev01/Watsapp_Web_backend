@@ -7,6 +7,7 @@ const { refineWithGeocode } = require('./geocodeClient');
 const { splitPropertyOffers, extractSharedContacts } = require('./listingSplitter');
 const { extractMessageSchema } = require('./localNer');
 const { canonicalizePlaceText } = require('../pakistanLocalities');
+const { listingContentFingerprint } = require('../contentFingerprint');
 const {
   loadSkippedIds,
   logNormalizationFailure,
@@ -121,6 +122,26 @@ async function releaseClaim(messageId, modelName) {
   }
 }
 
+async function loadUserListingFingerprints(userId) {
+  if (userId == null) return new Set();
+  const { rows } = await db.query(
+    `SELECT n.listing_excerpt, n.summary, n.purpose
+     FROM normalized_messages n
+     INNER JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
+     WHERE m.user_id = $1
+       AND (n.is_property IS TRUE OR n.purpose IS NOT NULL OR n.property_type IS NOT NULL)
+     ORDER BY n.id DESC
+     LIMIT 2500`,
+    [Number(userId)]
+  );
+  const set = new Set();
+  for (const r of rows) {
+    const fp = listingContentFingerprint(r);
+    if (fp) set.add(fp);
+  }
+  return set;
+}
+
 async function saveNormalized(job, schema, targetModel) {
   const listingRows = expandListingSchemas(schema);
   if (!listingRows.length) return 0;
@@ -139,11 +160,24 @@ async function saveNormalized(job, schema, targetModel) {
     [job.id, targetModel]
   );
 
+  const existingFingerprints = await loadUserListingFingerprints(job.user_id);
   let saved = 0;
   for (const row of listingRows) {
     const isProp = Boolean(row.is_property_listing_or_inquiry);
     const areaCanon = isProp && row.area ? canonicalizePlaceText(row.area) : null;
     const vicinityCanon = isProp && row.vicinity ? canonicalizePlaceText(row.vicinity) : null;
+
+    // Skip identical listing content already stored for this user (repost / re-scrape)
+    const fp = listingContentFingerprint({
+      listing_excerpt: row.listing_excerpt,
+      summary: row.summary,
+      purpose: isProp ? row.purpose : null
+    });
+    if (fp) {
+      if (existingFingerprints.has(fp)) continue;
+      existingFingerprints.add(fp);
+    }
+
     await db.query(
       `INSERT INTO normalized_messages (
          whatsapp_message_id, chat_jid, sender, category, intent, sentiment, language,
@@ -227,6 +261,17 @@ async function loadPendingJobs(targetModel, userId, window, { ignoreSkips = true
        AND NOT EXISTS (
          SELECT 1 FROM normalize_claims c
          WHERE c.whatsapp_message_id = m.id AND c.model_used = $1
+       )
+       -- Skip exact body already normalized for this user (repost with new timestamp)
+       AND NOT EXISTS (
+         SELECT 1
+         FROM whatsapp_messages m2
+         INNER JOIN normalized_messages n2 ON n2.whatsapp_message_id = m2.id
+         WHERE m2.user_id IS NOT DISTINCT FROM m.user_id
+           AND m2.id <> m.id
+           AND length(COALESCE(m.message, '')) >= 40
+           AND md5(regexp_replace(lower(left(m2.message, 800)), E'\\s+', ' ', 'g'))
+             = md5(regexp_replace(lower(left(m.message, 800)), E'\\s+', ' ', 'g'))
        )
        ${userFilter}
        ${skipFilter}

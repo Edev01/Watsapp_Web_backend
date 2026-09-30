@@ -1,6 +1,11 @@
 /**
  * Property listing lifecycle statuses (portal manual updates).
  */
+const {
+  normalizeFingerprintText,
+  listingContentFingerprint
+} = require('./contentFingerprint');
+
 const PROPERTY_STATUSES = Object.freeze([
   'AVAILABLE',
   'SOLD',
@@ -354,52 +359,14 @@ function parseAreaInUnit(sizeStr, rawMsg, targetUnit = 'Marla') {
   return marlaVal;
 }
 
-function collapseRepeatedText(raw) {
-  let t = String(raw || '')
-    .toLowerCase()
-    .replace(/\s+/g, ' ')
-    .trim();
-  if (t.length < 40) return t;
-  const half = Math.floor(t.length / 2);
-  if (t.slice(0, half).trim() === t.slice(half).trim()) {
-    return t.slice(0, half).trim();
-  }
-  const noPunct = t.replace(/[.,!?;:]+/g, ' ').replace(/\s+/g, ' ').trim();
-  const h2 = Math.floor(noPunct.length / 2);
-  if (h2 >= 20 && noPunct.slice(0, h2).trim() === noPunct.slice(h2).trim()) {
-    return noPunct.slice(0, h2).trim();
-  }
-  return t;
-}
-
 /**
- * Collapse doubled paste ("hellohello") and whitespace so duplicate scrapes match.
+ * Content fingerprint for search cards (shared with ingest/normalize).
  */
-function normalizeFingerprintText(s) {
-  return collapseRepeatedText(String(s || ''))
-    .toLowerCase()
-    .replace(/[*_`~#>|]+/g, ' ')
-    .replace(/[^\p{L}\p{N}\s./-]+/gu, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
 function listingFingerprint(row) {
-  // Prefer structured listing text — full raw dumps differ by list position / noise
-  const structured = normalizeFingerprintText(
-    row.listingExcerpt || row.listing_excerpt || row.summary || ''
-  );
-  const raw = structured || normalizeFingerprintText(row.rawMessage || row.raw_message || '');
-  if (!raw || raw.length < 24) {
-    // Too thin to safely collapse — keep row identity
-    return row.id != null ? `id:${row.id}` : '';
-  }
-  // Content-primary: ignore listing_index so same ad split/reposted once is enough.
-  // Keep purpose so sale vs rent of identical text can both show.
-  return [
-    raw.slice(0, 180),
-    String(row.purpose || '').toLowerCase().trim()
-  ].join('|');
+  const fp = listingContentFingerprint(row);
+  if (fp) return fp;
+  // Too thin to safely collapse — keep row identity
+  return row.id != null ? `id:${row.id}` : '';
 }
 
 function dedupeListings(items) {
