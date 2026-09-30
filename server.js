@@ -2171,7 +2171,10 @@ function buildPropertySearchWhere(filters, userId) {
 }
 
 function resolveSearchFilters(req) {
-  const rawFilters = req.body?.filters || req.body || {};
+  // Flat body fields (query/limit/offset/status) + nested filters{} both supported
+  const body = req.body || {};
+  const nested = body.filters && typeof body.filters === 'object' ? body.filters : {};
+  const rawFilters = { ...body, ...nested };
   const queryFilters = req.query || {};
 
   const filters = {
@@ -2235,6 +2238,7 @@ function resolveSearchFilters(req) {
   );
 
   const requestedLimit = parseInt(rawFilters.limit || queryFilters.limit || '50', 10);
+  const requestedOffset = parseInt(rawFilters.offset || queryFilters.offset || '0', 10);
   const locationEarly = String(filters.location || '').trim();
   const maxLimit = locationEarly ? 10000 : 100;
   const defaultLimit = locationEarly ? 5000 : 50;
@@ -2242,8 +2246,9 @@ function resolveSearchFilters(req) {
     Math.max(Number.isFinite(requestedLimit) ? requestedLimit : defaultLimit, 1),
     maxLimit
   );
+  const offset = Math.max(Number.isFinite(requestedOffset) ? requestedOffset : 0, 0);
 
-  return { filters, userId, limit, rawFilters, queryFilters };
+  return { filters, userId, limit, offset, rawFilters, queryFilters };
 }
 
 /** Exact match count — same WHERE as property search (no LIMIT). */
@@ -2255,7 +2260,7 @@ async function countPropertySearch(filters, userId) {
 }
 
 const runPropertySearch = async (req) => {
-  const { filters, userId, limit } = resolveSearchFilters(req);
+  const { filters, userId, limit, offset } = resolveSearchFilters(req);
   if (!userId) {
     const err = new Error('userId is required');
     err.statusCode = 400;
@@ -2271,10 +2276,12 @@ const runPropertySearch = async (req) => {
   const countResult = await db.query(`SELECT COUNT(*)::int AS hits ${whereSql}`, params);
   const totalMatched = countResult.rows[0]?.hits || 0;
 
-  const fetchLimit =
-    parsedLocation && parsedLocation.phaseNumber != null
-      ? Math.min(Math.max(limit * 3, limit), Math.max(limit, 2000))
-      : Math.min(Math.max(limit * 3, limit), 1500);
+  // Oversample so content-dedupe + phase guards can still fill `limit` after offset
+  const need = offset + limit;
+  const fetchLimit = Math.min(
+    Math.max(need * 8, limit * 8, 80),
+    Math.max(need, 5000)
+  );
 
   let queryText = `
     SELECT * FROM (
@@ -2323,7 +2330,7 @@ const runPropertySearch = async (req) => {
       );
     }
 
-    // Relevance sort only — do NOT drop SQL matches (keeps suggest count = result count)
+    // Relevance rank the pool — do NOT slice to limit yet (dedupe needs headroom)
     if (
       parsedLocation &&
       (parsedLocation.phaseNumber != null ||
@@ -2334,22 +2341,25 @@ const runPropertySearch = async (req) => {
     ) {
       rows = rows
         .map((r) => ({ ...r, _score: scoreLocationMatch(r, parsedLocation) }))
-        .sort((a, b) => b._score - a._score || b.id - a.id)
-        .slice(0, limit);
-    } else if (rows.length > limit) {
-      rows = rows.slice(0, limit);
+        .sort((a, b) => b._score - a._score || b.id - a.id);
     }
 
-    const properties = filterAndSortProperties(rows, {
+    const deduped = filterAndSortProperties(rows, {
       ...filters,
+      // Keep newest / relevance order already applied above when location search
       sortBy: parsedLocation ? 'Relevance' : filters.sortBy
-    }).slice(0, limit);
+    });
+
+    const properties = deduped.slice(offset, offset + limit);
 
     return {
       filters,
       userId,
+      limit,
+      offset,
       totalMatched,
-      // If post-filters trimmed rows, surface returned count separately
+      // Unique cards in the fetched/deduped pool (better UX than raw SQL dups)
+      uniqueInPool: deduped.length,
       totalReturned: properties.length,
       properties
     };
@@ -2364,7 +2374,8 @@ const runPropertySearch = async (req) => {
 
 const handlePropertyFilter = async (req, res) => {
   try {
-    const { filters, properties, totalMatched, totalReturned } = await runPropertySearch(req);
+    const { filters, properties, totalMatched, totalReturned, limit, offset, uniqueInPool } =
+      await runPropertySearch(req);
     const enriched = properties.map((p) => ({
       ...p,
       id: p.id,
@@ -2378,6 +2389,9 @@ const handlePropertyFilter = async (req, res) => {
       total: totalMatched != null ? totalMatched : enriched.length,
       totalMatched: totalMatched != null ? totalMatched : enriched.length,
       totalReturned: totalReturned != null ? totalReturned : enriched.length,
+      uniqueInPool: uniqueInPool != null ? uniqueInPool : enriched.length,
+      limit: limit != null ? limit : enriched.length,
+      offset: offset != null ? offset : 0,
       filters,
       properties: enriched
     }, 'Properties retrieved successfully');
@@ -2421,13 +2435,19 @@ function toDashboardSearchResult(p) {
 /** Same JSON shape the portal expects from FastAPI POST /api/dashboard-search */
 const handleDashboardSearch = async (req, res) => {
   try {
-    const { properties, totalMatched, totalReturned } = await runPropertySearch(req);
+    const { properties, totalMatched, totalReturned, limit, offset, uniqueInPool } =
+      await runPropertySearch(req);
     const results = properties.map(toDashboardSearchResult);
     return res.json({
       success: true,
+      // SQL row matches (includes content-dup rows still in DB)
       count: totalMatched != null ? totalMatched : results.length,
       totalMatched: totalMatched != null ? totalMatched : results.length,
+      // Cards actually returned this page (after dedupe)
       totalReturned: totalReturned != null ? totalReturned : results.length,
+      limit: limit != null ? limit : results.length,
+      offset: offset != null ? offset : 0,
+      uniqueInPool: uniqueInPool != null ? uniqueInPool : results.length,
       results
     });
   } catch (err) {
