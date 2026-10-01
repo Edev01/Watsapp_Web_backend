@@ -280,7 +280,45 @@ async function runMigrationSteps(client) {
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`,
     `CREATE INDEX IF NOT EXISTS idx_property_comments_user_property
-       ON property_comments (user_id, property_id, created_at DESC)`
+       ON property_comments (user_id, property_id, created_at DESC)`,
+    // Place hierarchy tags (background-resolved; used by search expand)
+    `CREATE TABLE IF NOT EXISTS place_regions (
+      parent_key TEXT PRIMARY KEY,
+      aliases TEXT[] NOT NULL DEFAULT '{}',
+      children TEXT[] NOT NULL DEFAULT '{}',
+      source TEXT DEFAULT 'seed',
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )`,
+    `DO $$ BEGIN
+       IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'normalized_messages') THEN
+         BEGIN
+           ALTER TABLE normalized_messages ADD COLUMN IF NOT EXISTS place_tags TEXT[];
+           ALTER TABLE normalized_messages ADD COLUMN IF NOT EXISTS geo_lat DOUBLE PRECISION;
+           ALTER TABLE normalized_messages ADD COLUMN IF NOT EXISTS geo_lng DOUBLE PRECISION;
+           ALTER TABLE normalized_messages ADD COLUMN IF NOT EXISTS place_resolved_at TIMESTAMPTZ;
+           CREATE INDEX IF NOT EXISTS idx_nm_place_tags
+             ON normalized_messages USING gin (place_tags);
+         EXCEPTION WHEN insufficient_privilege THEN
+           RAISE NOTICE 'skip normalized_messages place_tags DDL: not table owner';
+         END;
+       END IF;
+     END $$`,
+    // Soft-deleted duplicate rows (cron purge script moves here before DELETE)
+    `CREATE TABLE IF NOT EXISTS trash (
+      id BIGSERIAL PRIMARY KEY,
+      run_id UUID NOT NULL,
+      source_table TEXT NOT NULL,
+      original_id INTEGER NOT NULL,
+      user_id INTEGER,
+      dup_reason TEXT NOT NULL,
+      dup_key TEXT,
+      kept_id INTEGER,
+      payload JSONB NOT NULL,
+      trashed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_trash_run ON trash (run_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_trash_source_orig ON trash (source_table, original_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_trash_trashed_at ON trash (trashed_at DESC)`
   ];
 
   for (const sql of steps) {

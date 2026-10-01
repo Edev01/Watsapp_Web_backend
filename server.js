@@ -11,6 +11,8 @@ const { filterAndSortProperties, PROPERTY_STATUSES, normalizePropertyStatus, isV
 const { userMessageFingerprint } = require('./contentFingerprint');
 const { setExtraLocalities, correctLocalityTypos, canonicalizePlaceText, normalizePlaceKey, isKhayabanFamilyToken } = require('./pakistanLocalities');
 const { parseSmartLocationQuery, buildSmartLocationSql, scoreLocationMatch, textHasPhase, textHasStreet } = require('./smartLocationSearch');
+const { classifyLocationQuery, norm: placeNorm } = require('./ai/placeRegions');
+const { ensurePlaceRegionsSeeded } = require('./ai/placeResolver');
 const { isWeakLocation } = require('./ai/cascadeMerge');
 const { extractUserId } = require('./userMiddleware');
 const { findOrCreateCanonicalChat, upsertChatsBulk, cleanText, isSystemNotificationText, isCommonJunkMessage } = require('./contactHelper');
@@ -2157,6 +2159,7 @@ function buildPropertySearchWhere(filters, userId) {
   `;
   const params = [userId];
   let parsedLocation = null;
+  let regionClass = null;
 
   const purpose = String(filters.purpose || '').trim().toLowerCase();
   if (purpose && purpose !== 'all') {
@@ -2177,15 +2180,38 @@ function buildPropertySearchWhere(filters, userId) {
   const location = String(filters.location || '').trim();
   if (location) {
     parsedLocation = parseSmartLocationQuery(location);
-    // Phase searches: prefer structured fields so agent footers in raw chat don't inflate hits
+    regionClass = classifyLocationQuery(location);
+
+    // Parent region (Malir / Airport): expand mustGroups to all children
+    if (regionClass.mode === 'parent' && regionClass.terms.length) {
+      parsedLocation.mustGroups = [regionClass.terms];
+      parsedLocation.regionMode = 'parent';
+      parsedLocation.regionTerms = regionClass.terms;
+      parsedLocation.placeOnlyGroups = [];
+      parsedLocation.searchRegexes = [];
+    } else if (regionClass.mode === 'exact' && regionClass.terms.length) {
+      // Exact locality: constrain to that place (+ spellings) only
+      parsedLocation.mustGroups = [regionClass.terms];
+      parsedLocation.regionMode = 'exact';
+      parsedLocation.regionTerms = regionClass.terms;
+      // Keep phase/street if already parsed; clear bare khayaban OR noise
+      if (parsedLocation.phaseNumber == null) {
+        parsedLocation.placeOnlyGroups = [];
+        parsedLocation.searchRegexes = [];
+      }
+    }
+
+    // Include place_tags + full message in searchable text (no tiny LEFT for match)
     const searchable =
       parsedLocation.phaseNumber != null
         ? `LOWER(CONCAT_WS(' ', COALESCE(n.area,''), COALESCE(n.vicinity,''), COALESCE(n.city,''), ` +
           `COALESCE(n.summary,''), COALESCE(n.listing_excerpt,''), ` +
-          `LEFT(COALESCE(NULLIF(TRIM(n.listing_excerpt), ''), m.message), 500)))`
+          `COALESCE(array_to_string(n.place_tags, ' '), ''), ` +
+          `COALESCE(NULLIF(TRIM(n.listing_excerpt), ''), m.message, '')))`
         : `LOWER(CONCAT_WS(' ', COALESCE(n.area,''), COALESCE(n.vicinity,''), COALESCE(n.city,''), ` +
           `COALESCE(n.summary,''), COALESCE(n.listing_excerpt,''), ` +
-          `LEFT(COALESCE(m.message,''), 800)))`;
+          `COALESCE(array_to_string(n.place_tags, ' '), ''), ` +
+          `COALESCE(m.message, '')))`;
 
     const built = buildSmartLocationSql(parsedLocation, searchable, params);
 
@@ -2223,7 +2249,64 @@ function buildPropertySearchWhere(filters, userId) {
     }
   }
 
-  return { queryText, params, parsedLocation };
+  return { queryText, params, parsedLocation, regionClass };
+}
+
+/** True if listing belongs to allowed location terms (strict relevancy). */
+function listingMatchesRegionTerms(row, terms) {
+  if (!terms || !terms.length) return true;
+  const tags = Array.isArray(row.place_tags) ? row.place_tags.map(placeNorm) : [];
+  const fieldBlob = placeNorm(
+    [row.area, row.vicinity, row.city].map((x) => String(x || '')).join(' ')
+  );
+  const softBlob = placeNorm(
+    [row.summary, row.listing_excerpt].map((x) => String(x || '')).join(' ')
+  );
+  const rawBlob = placeNorm(String(row.raw_message || ''));
+
+  const AMBIGUOUS = new Set([
+    'airport',
+    'tbz',
+    'landhi',
+    'peninsula',
+    'nishat',
+    'jami',
+    'qasim',
+    'roomi',
+    'sehar',
+    'corner',
+    'creek',
+    'iqbal',
+    'tariq'
+  ]);
+
+  const hasPhrase = (blob, term) => {
+    if (!blob || !term) return false;
+    if (blob === term) return true;
+    const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`(?:^|[^a-z0-9])${escaped}(?:[^a-z0-9]|$)`).test(blob);
+  };
+
+  return terms.some((t) => {
+    const term = placeNorm(t);
+    if (!term || term.length < 3) return false;
+
+    const inText = hasPhrase(softBlob, term) || hasPhrase(rawBlob, term);
+    const inFields = hasPhrase(fieldBlob, term);
+    const inTags = tags.includes(term);
+
+    // Prefer real message evidence (Askari-5 Malir Cantt in body, etc.)
+    if (inText) {
+      const ambiguous =
+        AMBIGUOUS.has(term) || (term.split(/\s+/).length === 1 && term.length < 8);
+      // Ambiguous single tokens in a long body still need a place-field/tag anchor
+      if (ambiguous) return inFields || inTags;
+      return true;
+    }
+
+    // Structured-only / tag-only without message support = often NER pollution
+    return false;
+  });
 }
 
 function resolveSearchFilters(req) {
@@ -2324,6 +2407,9 @@ async function countPropertySearch(filters, userId) {
 }
 
 const runPropertySearch = async (req) => {
+  // Warm place_regions seed once (non-blocking if fails)
+  ensurePlaceRegionsSeeded().catch(() => {});
+
   const { filters, userId, limit, offset, skipCount } = resolveSearchFilters(req);
   if (!userId) {
     const err = new Error('userId is required');
@@ -2331,7 +2417,7 @@ const runPropertySearch = async (req) => {
     throw err;
   }
 
-  const { queryText: whereSql, params, parsedLocation } = buildPropertySearchWhere(
+  const { queryText: whereSql, params, parsedLocation, regionClass } = buildPropertySearchWhere(
     filters,
     userId
   );
@@ -2351,20 +2437,13 @@ const runPropertySearch = async (req) => {
       (parsedLocation.phaseNumber != null ||
         parsedLocation.streetNumber != null ||
         (parsedLocation.mustGroups || []).length ||
-        (parsedLocation.placeOnlyGroups || []).length)
+        (parsedLocation.placeOnlyGroups || []).length ||
+        parsedLocation.regionMode)
   );
-  // Empty browse: pull a full window so uniqueInPool/count match every page (not just newest 4k)
+  // Location/region/phase: pull user's full property window so relevant cards aren't truncated
   const fetchLimit = !hasLocation
     ? Math.min(Math.max(need * 20, 20000), 25000)
-    : Math.min(
-        Math.max(
-          need * 12,
-          limit * 12,
-          120,
-          locationHeavy || skipCount ? 4000 : 0
-        ),
-        5000
-      );
+    : Math.min(Math.max(need * 20, 20000, locationHeavy ? 25000 : 8000), 25000);
 
   let queryText = `
     SELECT * FROM (
@@ -2372,8 +2451,8 @@ const runPropertySearch = async (req) => {
              n.property_type, n.property_sub_type, n.size, n.price,
              COALESCE(NULLIF(TRIM(n.contact_number), ''), NULLIF(TRIM(m.sender_phone), '')) AS contact_number,
              n.summary, n.property_status, n.created_at, n.category, n.intent, n.sentiment,
-             n.listing_index, n.listing_excerpt,
-             LEFT(COALESCE(NULLIF(TRIM(n.listing_excerpt), ''), m.message), 500) AS raw_message,
+             n.listing_index, n.listing_excerpt, n.place_tags,
+             COALESCE(NULLIF(TRIM(n.listing_excerpt), ''), m.message) AS raw_message,
              m.timestamp AS message_timestamp, m.from_me, m.user_id,
              m.seq_in_chat, m.seq_in_chat AS "seqInChat"
       ${whereSql}
@@ -2385,11 +2464,16 @@ const runPropertySearch = async (req) => {
   const client = await db.pool.connect();
   try {
     await client.query('BEGIN');
-    await client.query("SET LOCAL statement_timeout = '30s'");
+    await client.query("SET LOCAL statement_timeout = '45s'");
     const dbResult = await client.query(queryText, fetchParams);
     await client.query('COMMIT');
 
     let rows = dbResult.rows;
+
+    // 100% relevancy: parent/exact region terms must appear in place fields/tags/message
+    if (regionClass && regionClass.terms && regionClass.terms.length && regionClass.mode !== 'none') {
+      rows = rows.filter((r) => listingMatchesRegionTerms(r, regionClass.terms));
+    }
 
     if (parsedLocation && parsedLocation.phaseNumber != null) {
       const want = parsedLocation.phaseNumber;
@@ -2407,7 +2491,6 @@ const runPropertySearch = async (req) => {
           }
         }
         if (textHasPhase(structured, want)) return true;
-        // Raw-only phase match: require a real offer signal (type / size / price)
         const raw = String(r.raw_message || '');
         if (!textHasPhase(raw, want)) return false;
         return Boolean(
@@ -2422,7 +2505,7 @@ const runPropertySearch = async (req) => {
       const wantStreet = parsedLocation.streetNumber;
       rows = rows.filter((r) =>
         textHasStreet(
-          [r.area, r.vicinity, r.listing_excerpt, r.summary]
+          [r.area, r.vicinity, r.listing_excerpt, r.summary, r.raw_message]
             .map((x) => String(x || '').trim())
             .filter(Boolean)
             .join(' | '),
@@ -2438,7 +2521,8 @@ const runPropertySearch = async (req) => {
         parsedLocation.streetNumber != null ||
         (parsedLocation.mustGroups || []).length ||
         (parsedLocation.placeOnlyGroups || []).length ||
-        (parsedLocation.searchRegexes || []).length)
+        (parsedLocation.searchRegexes || []).length ||
+        parsedLocation.regionMode)
     ) {
       rows = rows
         .map((r) => ({ ...r, _score: scoreLocationMatch(r, parsedLocation) }))
@@ -2535,6 +2619,7 @@ function toDashboardSearchResult(p) {
     created_at: p.createdAt || p.created_at,
     property_status: p.propertyStatus || p.property_status || 'AVAILABLE',
     similarity_score: p.similarityScore || p.similarity_score || null,
+    place_tags: Array.isArray(p.placeTags || p.place_tags) ? (p.placeTags || p.place_tags) : [],
     isFavourite: Boolean(p.isFavourite),
     is_favourite: Boolean(p.isFavourite),
     comments: Array.isArray(p.comments) ? p.comments : []
@@ -2954,14 +3039,16 @@ function titlePlaceLabel(value) {
 }
 
 /**
- * Update property listing status by whatsapp_messages.id (message id from portal/search).
- * PATCH /api/properties/:messageId/status  body: { status: "SOLD" }
- * POST  /api/properties/:messageId/status  body or query: status=SOLD
+ * Update property listing status.
+ * :propertyId accepts either:
+ *   - normalized_messages.id (listing_id / id from search cards)  ← preferred
+ *   - whatsapp_messages.id (legacy message id)
+ * PATCH/POST/PUT /api/properties/:propertyId/status  body: { status: "SOLD" }
  */
 const handleUpdatePropertyStatus = async (req, res) => {
-  const messageId = parseInt(req.params.propertyId, 10);
-  if (!messageId || Number.isNaN(messageId)) {
-    return sendResponse(res, 400, true, null, 'messageId is required');
+  const propertyId = parseInt(req.params.propertyId, 10);
+  if (!propertyId || Number.isNaN(propertyId)) {
+    return sendResponse(res, 400, true, null, 'propertyId is required');
   }
 
   const rawStatus =
@@ -2985,15 +3072,27 @@ const handleUpdatePropertyStatus = async (req, res) => {
   const userId = Number(req.user?.id || req.userId || 1);
 
   try {
-    const check = await db.query(
-      `SELECT n.id, n.property_status, n.summary, m.user_id, m.id AS message_id
+    // Prefer listing/card id (normalized_messages.id); fall back to WhatsApp message id
+    let check = await db.query(
+      `SELECT n.id, n.property_status, n.summary, n.whatsapp_message_id, m.user_id, m.id AS message_id
        FROM normalized_messages n
        JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
-       WHERE m.id = $1
-       ORDER BY n.id DESC
+       WHERE n.id = $1
        LIMIT 1`,
-      [messageId]
+      [propertyId]
     );
+
+    if (!check.rows[0]) {
+      check = await db.query(
+        `SELECT n.id, n.property_status, n.summary, n.whatsapp_message_id, m.user_id, m.id AS message_id
+         FROM normalized_messages n
+         JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
+         WHERE m.id = $1
+         ORDER BY n.id DESC
+         LIMIT 1`,
+        [propertyId]
+      );
+    }
 
     if (!check.rows[0]) {
       return sendResponse(res, 404, true, null, 'Property not found');
@@ -3007,9 +3106,9 @@ const handleUpdatePropertyStatus = async (req, res) => {
     const result = await db.query(
       `UPDATE normalized_messages
        SET property_status = $2
-       WHERE whatsapp_message_id = $1
+       WHERE id = $1
        RETURNING id, property_status, summary, whatsapp_message_id, chat_jid, purpose, property_type, city, price`,
-      [messageId, status]
+      [row.id, status]
     );
 
     return sendResponse(
@@ -3019,6 +3118,7 @@ const handleUpdatePropertyStatus = async (req, res) => {
       {
         messageId: result.rows[0].whatsapp_message_id,
         propertyId: result.rows[0].id,
+        listingId: result.rows[0].id,
         previousStatus: (row.property_status || 'AVAILABLE').toUpperCase(),
         status: result.rows[0].property_status,
         property: result.rows[0]
@@ -3157,7 +3257,7 @@ app.get('/api/favourites', authenticateToken, async (req, res) => {
               COALESCE(NULLIF(TRIM(n.contact_number), ''), NULLIF(TRIM(m.sender_phone), '')) AS contact_number,
               n.summary, n.property_status, n.created_at, n.category, n.intent, n.sentiment,
               n.listing_index, n.listing_excerpt,
-              LEFT(COALESCE(NULLIF(TRIM(n.listing_excerpt), ''), m.message), 500) AS raw_message,
+              COALESCE(NULLIF(TRIM(n.listing_excerpt), ''), m.message) AS raw_message,
               m.timestamp AS message_timestamp, m.from_me, m.user_id,
               m.seq_in_chat, m.seq_in_chat AS "seqInChat"
        FROM property_favourites f

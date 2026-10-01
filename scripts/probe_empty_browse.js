@@ -1,72 +1,101 @@
 #!/usr/bin/env node
 /**
- * Probe empty browse search (no query) for Danish.
+ * Empty-query dashboard search totals for a user (what FE pagination uses).
  */
+require('dotenv').config();
 const http = require('http');
+const db = require('../db');
 
-function post(body) {
+const userId = Number(process.argv[2] || 4);
+
+function post(path, body) {
+  const payload = JSON.stringify(body);
   return new Promise((resolve, reject) => {
-    const b = JSON.stringify(body);
     const req = http.request(
       {
         hostname: '127.0.0.1',
         port: 3000,
-        path: '/api/dashboard-search',
+        path,
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(b)
+          'Content-Length': Buffer.byteLength(payload),
+          'x-user-id': String(userId)
         },
         timeout: 120000
       },
       (res) => {
         let d = '';
-        res.on('data', (c) => {
-          d += c;
-        });
+        res.on('data', (c) => (d += c));
         res.on('end', () => {
           try {
             resolve(JSON.parse(d));
           } catch (e) {
-            reject(new Error(d.slice(0, 300)));
+            reject(e);
           }
         });
       }
     );
     req.on('error', reject);
-    req.write(b);
+    req.write(payload);
     req.end();
   });
 }
 
 (async () => {
-  const cases = [
-    { label: 'empty_off0_l100', body: { limit: 100, offset: 0, skipCount: true, sortBy: 'Newest First', status: 'AVAILABLE', userId: 4 } },
-    { label: 'empty_off190_l100', body: { limit: 100, offset: 190, skipCount: true, sortBy: 'Newest First', status: 'AVAILABLE', userId: 4 } },
-    { label: 'empty_off190_l200', body: { limit: 200, offset: 190, skipCount: true, sortBy: 'Newest First', status: 'AVAILABLE', userId: 4 } },
-    { label: 'empty_off280_l100', body: { limit: 100, offset: 280, skipCount: true, sortBy: 'Newest First', status: 'AVAILABLE', userId: 4 } },
-    { label: 'empty_off400_l100', body: { limit: 100, offset: 400, skipCount: true, sortBy: 'Newest First', status: 'AVAILABLE', userId: 4 } },
-    { label: 'empty_countOn', body: { limit: 50, offset: 0, skipCount: false, sortBy: 'Newest First', status: 'AVAILABLE', userId: 4 } }
-  ];
+  const dbCounts = await db.query(
+    `SELECT
+       COUNT(*) FILTER (WHERE n.is_property IS TRUE)::int AS raw_properties,
+       COUNT(*) FILTER (
+         WHERE n.is_property IS TRUE
+           AND UPPER(COALESCE(n.property_status, 'AVAILABLE')) = 'AVAILABLE'
+       )::int AS available
+     FROM normalized_messages n
+     JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
+     WHERE m.user_id = $1`,
+    [userId]
+  );
 
-  for (const c of cases) {
-    const j = await post(c.body);
-    const ids = (j.results || []).map((r) => r.id);
-    console.log(
-      c.label,
-      JSON.stringify({
-        count: j.count,
-        totalMatched: j.totalMatched,
-        totalReturned: j.totalReturned,
-        uniqueInPool: j.uniqueInPool,
-        limit: j.limit,
-        offset: j.offset,
-        firstId: ids[0] || null,
-        lastId: ids[ids.length - 1] || null
-      })
-    );
-  }
-  console.log('DONE_TEST');
+  const browse = await post('/api/dashboard-search', {
+    query: '',
+    limit: 20,
+    offset: 0,
+    status: 'AVAILABLE',
+    userId
+  });
+
+  const browseNoStatus = await post('/api/dashboard-search', {
+    query: '',
+    limit: 20,
+    offset: 0,
+    userId
+  });
+
+  console.log(
+    JSON.stringify(
+      {
+        db: dbCounts.rows[0],
+        withStatusAvailable: {
+          count: browse.count,
+          totalMatched: browse.totalMatched,
+          uniqueInPool: browse.uniqueInPool,
+          results: (browse.results || []).length
+        },
+        noStatusFilter: {
+          count: browseNoStatus.count,
+          totalMatched: browseNoStatus.totalMatched,
+          uniqueInPool: browseNoStatus.uniqueInPool,
+          results: (browseNoStatus.results || []).length
+        },
+        feShown: 3811,
+        gapVsAvailable: (dbCounts.rows[0].available || 0) - 3811
+      },
+      null,
+      2
+    )
+  );
+  console.log('ZZ_DONE');
+  process.exit(0);
 })().catch((e) => {
   console.error(e);
   process.exit(1);

@@ -33,8 +33,9 @@ const SEED_LOCALITIES = [
   'khayaban-e-zahra', 'zahra',
   'khayaban-e-hilal', 'khayaban-e-sehar',
   'khayaban-e-qasim', 'khayaban-e-jami', 'khayaban-e-shujaat', 'khayaban-e-tanzeem',
+  // Also drop bare "rizwan" from seed list used as a locality synonym
   'khayaban-e-roomi', 'khayaban-e-saba', 'khayaban-e-rizwan',
-  'rizwan', 'saba avenue', 'beach avenue', 'coastal avenue',
+  'saba avenue', 'beach avenue', 'coastal avenue',
   'main central drive', 'central drive',
   'jami commercial', 'muslim commercial', 'khalid commercial', 'babar commercial',
   'ayubi commercial', 'badar commercial', 'nishat commercial', 'bukhari commercial',
@@ -104,7 +105,7 @@ const ALIASES = Object.freeze({
   'khayaban rizwan': 'khayaban-e-rizwan',
   'khayaban e rizwan': 'khayaban-e-rizwan',
   'khybn rizwan': 'khayaban-e-rizwan',
-  rizwan: 'khayaban-e-rizwan',
+  // NOTE: bare "rizwan" must NOT map to khayaban-e-rizwan (agent names)
   bukhri: 'bukhari',
   bukharii: 'bukhari',
   nishaat: 'nishat',

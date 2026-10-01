@@ -373,6 +373,7 @@ function dedupeListings(items) {
   const seenId = new Set();
   const seenFp = new Set();
   const seenMsgExcerpt = new Set();
+  const seenBodyOnly = new Set();
   const out = [];
   for (const item of items) {
     if (item.id != null) {
@@ -390,6 +391,20 @@ function dedupeListings(items) {
       const mk = `m:${msgId}|${excerptKey}`;
       if (seenMsgExcerpt.has(mk)) continue;
       seenMsgExcerpt.add(mk);
+    }
+
+    // Same offer body across different message ids / summaries (reposts)
+    const bodyOnly = normalizeFingerprintText(
+      item.rawMessage ||
+        item.raw_message ||
+        item.listingExcerpt ||
+        item.listing_excerpt ||
+        item.summary ||
+        ''
+    ).slice(0, 220);
+    if (bodyOnly.length >= 40) {
+      if (seenBodyOnly.has(bodyOnly)) continue;
+      seenBodyOnly.add(bodyOnly);
     }
 
     const fp = listingFingerprint(item);
@@ -515,6 +530,8 @@ function filterAndSortProperties(rawRows, filters = {}) {
       property_status: (r.property_status || 'AVAILABLE').toUpperCase(),
       rawMessage: r.raw_message,
       listingExcerpt: r.listing_excerpt || null,
+      placeTags: Array.isArray(r.place_tags) ? r.place_tags : [],
+      place_tags: Array.isArray(r.place_tags) ? r.place_tags : [],
       fromMe: r.from_me || r.fromMe || false,
       from_me: r.from_me || r.fromMe || false,
       userId: r.user_id || 1,

@@ -4,6 +4,7 @@ const { LLMClient, expandListingSchemas } = require('./llmClient');
 const { GeminiClient } = require('./geminiClient');
 const { fillGapsOnly, scrubWeakLocations } = require('./cascadeMerge');
 const { refineWithGeocode } = require('./geocodeClient');
+const { schedulePlaceResolve } = require('./placeResolver');
 const { splitPropertyOffers, extractSharedContacts, normalizePkMobile } = require('./listingSplitter');
 const { extractMessageSchema } = require('./localNer');
 const { canonicalizePlaceText } = require('../pakistanLocalities');
@@ -240,7 +241,7 @@ async function saveNormalized(job, schema, targetModel) {
   for (const item of toSave) {
     const { row, isProp, areaCanon, vicinityCanon, fp } = item;
     try {
-      await db.query(
+      const inserted = await db.query(
         `INSERT INTO normalized_messages (
            whatsapp_message_id, chat_jid, sender, category, intent, sentiment, language,
            summary, entities, city, is_property, purpose, property_type, property_sub_type,
@@ -251,7 +252,8 @@ async function saveNormalized(job, schema, targetModel) {
            $8,$9::jsonb,$10,$11,$12,$13,$14,
            $15,$16,$17,$18,$19,$20,$21,$22,
            $23,$24,$25,$26,$27,NOW()
-         )`,
+         )
+         RETURNING id, is_property, area, vicinity, city`,
         [
           job.id,
           job.chat_jid,
@@ -288,6 +290,9 @@ async function saveNormalized(job, schema, targetModel) {
         ]
       );
       saved += 1;
+      if (inserted.rows[0]?.is_property) {
+        schedulePlaceResolve(inserted.rows[0]);
+      }
     } catch (err) {
       // Unique fingerprint race — another worker saved the same ad
       if (err.code === '23505' && fp) {

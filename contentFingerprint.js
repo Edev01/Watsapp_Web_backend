@@ -39,19 +39,28 @@ function messageContentFingerprint(text, { minLen = 40, maxLen = 220 } = {}) {
 
 /**
  * Fingerprint for a normalized listing row / search card.
+ * Prefer the full offer text (raw/excerpt) so reposts with different AI summaries still collapse.
  */
-function listingContentFingerprint(row, { minLen = 24, maxLen = 180 } = {}) {
-  const structured = normalizeFingerprintText(
-    row.listingExcerpt || row.listing_excerpt || row.summary || ''
+function listingContentFingerprint(row, { minLen = 24, maxLen = 220 } = {}) {
+  const excerpt = normalizeFingerprintText(
+    row.listingExcerpt || row.listing_excerpt || ''
   );
-  const raw =
-    structured ||
-    normalizeFingerprintText(row.rawMessage || row.raw_message || row.message || '');
-  if (!raw || raw.length < minLen) return null;
+  const summary = normalizeFingerprintText(row.summary || '');
+  const raw = normalizeFingerprintText(
+    row.rawMessage || row.raw_message || row.message || ''
+  );
+
+  // Longest substantial body wins (raw WhatsApp text preferred over short summaries)
+  let body = '';
+  for (const candidate of [raw, excerpt, summary]) {
+    if (candidate.length >= minLen && candidate.length >= body.length) body = candidate;
+  }
+  if (!body || body.length < minLen) return null;
+
   const purpose = String(row.purpose || '')
     .toLowerCase()
     .trim();
-  return `${raw.slice(0, maxLen)}|${purpose}`;
+  return `${body.slice(0, maxLen)}|${purpose}`;
 }
 
 /** Per-user scoped listing fingerprint (safe for unique index). */
