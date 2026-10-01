@@ -8,7 +8,7 @@ const db = require('./db');
 const { sendResponse } = require('./responseHelper');
 const { authenticateToken, isAdmin } = require('./middleware');
 const { filterAndSortProperties, PROPERTY_STATUSES, normalizePropertyStatus, isValidPropertyStatus, expandLocationQuery } = require('./propertyHelper');
-const { messageContentFingerprint } = require('./contentFingerprint');
+const { userMessageFingerprint } = require('./contentFingerprint');
 const { setExtraLocalities, correctLocalityTypos, canonicalizePlaceText, normalizePlaceKey, isKhayabanFamilyToken } = require('./pakistanLocalities');
 const { parseSmartLocationQuery, buildSmartLocationSql, scoreLocationMatch, textHasPhase, textHasStreet } = require('./smartLocationSearch');
 const { isWeakLocation } = require('./ai/cascadeMerge');
@@ -1241,28 +1241,39 @@ function parseChatListQuery(req) {
 
 function buildChatListSql({ userId, type, search, pageSize, offset }) {
   const params = [userId];
-  let where = 'WHERE user_id = $1';
+  let where = 'WHERE c.user_id = $1';
 
   if (type === 'monitored') {
-    where += ' AND is_monitored = TRUE';
+    where += ' AND c.is_monitored = TRUE';
   } else if (type === 'chats') {
-    where += ' AND is_monitored = FALSE';
+    where += ' AND c.is_monitored = FALSE';
   }
 
   if (search) {
     params.push(`%${search}%`);
-    where += ` AND (LOWER(COALESCE(name, '')) LIKE LOWER($${params.length}) OR LOWER(jid) LIKE LOWER($${params.length}))`;
+    where += ` AND (LOWER(COALESCE(c.name, '')) LIKE LOWER($${params.length}) OR LOWER(c.jid) LIKE LOWER($${params.length}))`;
   }
 
-  const countSql = `SELECT COUNT(*)::int AS total FROM whatsapp_chats ${where}`;
+  const countSql = `SELECT COUNT(*)::int AS total FROM whatsapp_chats c ${where}`;
   const countParams = [...params];
 
   params.push(pageSize, offset);
   const sql = `
-    SELECT jid, name, avatar, is_monitored, user_id, created_at, monitored_at, last_scraped_at
-    FROM whatsapp_chats
+    SELECT c.jid, c.name, c.avatar, c.is_monitored, c.user_id, c.created_at, c.monitored_at, c.last_scraped_at,
+           lm.last_message_at,
+           lm.last_message_preview
+    FROM whatsapp_chats c
+    LEFT JOIN LATERAL (
+      SELECT m.created_at AS last_message_at,
+             LEFT(COALESCE(m.message, ''), 120) AS last_message_preview
+      FROM whatsapp_messages m
+      WHERE m.user_id = c.user_id AND m.chat_jid = c.jid
+      ORDER BY m.created_at DESC NULLS LAST, m.id DESC
+      LIMIT 1
+    ) lm ON TRUE
     ${where}
-    ORDER BY created_at DESC NULLS LAST, name ASC NULLS LAST, jid ASC
+    ORDER BY COALESCE(lm.last_message_at, c.last_scraped_at, c.created_at) DESC NULLS LAST,
+             c.name ASC NULLS LAST, c.jid ASC
     LIMIT $${params.length - 1} OFFSET $${params.length}`;
 
   return { sql, params, countSql, countParams };
@@ -1363,6 +1374,17 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
         rawFromMe === true ||
         rawFromMe === 1 ||
         String(rawFromMe).toLowerCase() === 'true';
+      const rawSenderPhone =
+        msg.senderPhone ?? msg.sender_phone ?? msg.participantPhone ?? msg.participant_phone ?? null;
+      let senderPhone = null;
+      if (rawSenderPhone) {
+        try {
+          const { normalizePkMobile } = require('./ai/listingSplitter');
+          senderPhone = normalizePkMobile(rawSenderPhone) || String(rawSenderPhone).trim() || null;
+        } catch (_) {
+          senderPhone = String(rawSenderPhone).trim() || null;
+        }
+      }
 
       if (!timestamp && !messageText) {
         skippedCount++;
@@ -1374,6 +1396,7 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
       }
       toInsert.push({
         sender: sender || 'unknown',
+        senderPhone,
         timestamp: timestamp || 'unknown',
         messageText,
         isFromMe,
@@ -1390,28 +1413,36 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
           [userId, canonicalJid]
         );
 
-        // Drop body-identical reposts already stored for this chat (new timestamps still).
+        // Drop body-identical reposts already stored for this user (any chat).
         const prior = await client.query(
-          `SELECT message FROM whatsapp_messages
-           WHERE user_id = $1 AND chat_jid = $2
+          `SELECT content_fingerprint, message FROM whatsapp_messages
+           WHERE user_id = $1
+             AND (
+               content_fingerprint IS NOT NULL
+               OR id > (SELECT COALESCE(MAX(id),0) - 20000 FROM whatsapp_messages WHERE user_id = $1)
+             )
            ORDER BY id DESC
-           LIMIT 8000`,
-          [userId, canonicalJid]
+           LIMIT 20000`,
+          [userId]
         );
         const seenBodies = new Set();
         for (const r of prior.rows) {
-          const fp = messageContentFingerprint(r.message);
+          if (r.content_fingerprint) {
+            seenBodies.add(r.content_fingerprint);
+            continue;
+          }
+          const fp = userMessageFingerprint(userId, r.message);
           if (fp) seenBodies.add(fp);
         }
         const uniqueRows = [];
         for (const row of toInsert) {
-          const fp = messageContentFingerprint(row.messageText);
+          const fp = userMessageFingerprint(userId, row.messageText);
           if (fp && seenBodies.has(fp)) {
             skippedCount += 1;
             continue;
           }
           if (fp) seenBodies.add(fp);
-          uniqueRows.push(row);
+          uniqueRows.push({ ...row, contentFingerprint: fp || null });
         }
 
         if (!uniqueRows.length) {
@@ -1421,20 +1452,22 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
         const values = [];
         let p = 1;
         for (const row of uniqueRows) {
-          values.push(`($${p++},$${p++},$${p++},$${p++},$${p++},$${p++})`);
+          values.push(`($${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++})`);
           params.push(
             userId,
             canonicalJid,
             row.sender,
             row.timestamp,
             row.messageText,
-            row.isFromMe
+            row.isFromMe,
+            row.contentFingerprint,
+            row.senderPhone || null
           );
         }
         // Never put seq_in_chat on the INSERT. A unique seq collision used to
         // ROLLBACK the whole batch, so the worker "posted" but nothing saved.
         const result = await client.query(
-          `INSERT INTO whatsapp_messages (user_id, chat_jid, sender, timestamp, message, from_me)
+          `INSERT INTO whatsapp_messages (user_id, chat_jid, sender, timestamp, message, from_me, content_fingerprint, sender_phone)
            VALUES ${values.join(',')}
            ON CONFLICT (user_id, chat_jid, sender, timestamp, message)
            DO NOTHING
@@ -1825,12 +1858,30 @@ app.get('/api/scraped-chats/messages', async (req, res) => {
   if (!userId) {
     return sendResponse(res, 401, true, null, 'Login required');
   }
-  const { chatId, jid, name, limit, offset, countOnly } = req.query;
+  const { chatId, jid, name, limit, offset, countOnly, sort, lastTimesOnly } = req.query;
   const targetId = chatId || jid;
   const pageLimit = Math.min(parseInt(limit, 10) || 5000, 10000);
   const pageOffset = Math.max(parseInt(offset, 10) || 0, 0);
+  // Newest first by default so monitored chat UI shows today's messages, not Sep-15 history page 1
+  const sortAsc = String(sort || '').toLowerCase() === 'asc';
+  const orderSql = sortAsc ? 'ORDER BY m.id ASC' : 'ORDER BY m.id DESC';
 
   try {
+    if (lastTimesOnly === '1' || lastTimesOnly === 'true') {
+      const result = await db.query(
+        `SELECT m.chat_jid,
+                MAX(m.timestamp) AS timestamp,
+                MAX(m.created_at) AS created_at
+         FROM whatsapp_messages m
+         INNER JOIN whatsapp_chats c
+           ON c.user_id = m.user_id AND c.jid = m.chat_jid
+         WHERE m.user_id = $1 AND c.is_monitored = TRUE
+         GROUP BY m.chat_jid`,
+        [userId]
+      );
+      return sendResponse(res, 200, false, result.rows, 'Last message times retrieved');
+    }
+
     if (countOnly === '1' || countOnly === 'true') {
       const result = await db.query(
         `SELECT COUNT(*)::int AS count
@@ -1850,7 +1901,7 @@ app.get('/api/scraped-chats/messages', async (req, res) => {
          FROM whatsapp_messages m
          LEFT JOIN whatsapp_chats c ON m.chat_jid = c.jid AND m.user_id = c.user_id
          WHERE m.user_id = $1 AND (m.chat_jid = $2 OR LOWER(COALESCE(c.name, '')) LIKE LOWER($3))
-         ORDER BY m.id ASC
+         ${orderSql}
          LIMIT $4 OFFSET $5`,
         [userId, targetId, `%${targetId}%`, pageLimit, pageOffset]
       );
@@ -1860,7 +1911,7 @@ app.get('/api/scraped-chats/messages', async (req, res) => {
          FROM whatsapp_messages m
          LEFT JOIN whatsapp_chats c ON m.chat_jid = c.jid AND m.user_id = c.user_id
          WHERE m.user_id = $1 AND LOWER(COALESCE(c.name, '')) LIKE LOWER($2)
-         ORDER BY m.id ASC
+         ${orderSql}
          LIMIT $3 OFFSET $4`,
         [userId, `%${name}%`, pageLimit, pageOffset]
       );
@@ -1871,7 +1922,7 @@ app.get('/api/scraped-chats/messages', async (req, res) => {
          FROM whatsapp_messages m
          LEFT JOIN whatsapp_chats c ON m.chat_jid = c.jid AND m.user_id = c.user_id
          WHERE m.user_id = $1
-         ORDER BY m.id ASC
+         ${orderSql}
          LIMIT $2 OFFSET $3`,
         [userId, pageLimit, pageOffset]
       );
@@ -2125,12 +2176,17 @@ function buildPropertySearchWhere(filters, userId) {
 
   const location = String(filters.location || '').trim();
   if (location) {
-    const searchable =
-      `LOWER(CONCAT_WS(' ', COALESCE(n.area,''), COALESCE(n.vicinity,''), COALESCE(n.city,''), ` +
-      `COALESCE(n.summary,''), COALESCE(n.listing_excerpt,''), ` +
-      `LEFT(COALESCE(m.message,''), 800)))`;
-
     parsedLocation = parseSmartLocationQuery(location);
+    // Phase searches: prefer structured fields so agent footers in raw chat don't inflate hits
+    const searchable =
+      parsedLocation.phaseNumber != null
+        ? `LOWER(CONCAT_WS(' ', COALESCE(n.area,''), COALESCE(n.vicinity,''), COALESCE(n.city,''), ` +
+          `COALESCE(n.summary,''), COALESCE(n.listing_excerpt,''), ` +
+          `LEFT(COALESCE(NULLIF(TRIM(n.listing_excerpt), ''), m.message), 500)))`
+        : `LOWER(CONCAT_WS(' ', COALESCE(n.area,''), COALESCE(n.vicinity,''), COALESCE(n.city,''), ` +
+          `COALESCE(n.summary,''), COALESCE(n.listing_excerpt,''), ` +
+          `LEFT(COALESCE(m.message,''), 800)))`;
+
     const built = buildSmartLocationSql(parsedLocation, searchable, params);
 
     if (built.sql) {
@@ -2240,15 +2296,23 @@ function resolveSearchFilters(req) {
   const requestedLimit = parseInt(rawFilters.limit || queryFilters.limit || '50', 10);
   const requestedOffset = parseInt(rawFilters.offset || queryFilters.offset || '0', 10);
   const locationEarly = String(filters.location || '').trim();
-  const maxLimit = locationEarly ? 10000 : 100;
-  const defaultLimit = locationEarly ? 5000 : 50;
+  // Empty browse must honor FE page sizes (200+). Location search can go higher.
+  const maxLimit = locationEarly ? 10000 : 500;
+  const defaultLimit = locationEarly ? 5000 : 100;
   const limit = Math.min(
     Math.max(Number.isFinite(requestedLimit) ? requestedLimit : defaultLimit, 1),
     maxLimit
   );
   const offset = Math.max(Number.isFinite(requestedOffset) ? requestedOffset : 0, 0);
 
-  return { filters, userId, limit, offset, rawFilters, queryFilters };
+  const skipCountRaw = rawFilters.skipCount ?? queryFilters.skipCount;
+  const skipCount =
+    skipCountRaw === true ||
+    skipCountRaw === 1 ||
+    String(skipCountRaw || '').toLowerCase() === 'true' ||
+    String(skipCountRaw || '') === '1';
+
+  return { filters, userId, limit, offset, skipCount, rawFilters, queryFilters };
 }
 
 /** Exact match count — same WHERE as property search (no LIMIT). */
@@ -2260,7 +2324,7 @@ async function countPropertySearch(filters, userId) {
 }
 
 const runPropertySearch = async (req) => {
-  const { filters, userId, limit, offset } = resolveSearchFilters(req);
+  const { filters, userId, limit, offset, skipCount } = resolveSearchFilters(req);
   if (!userId) {
     const err = new Error('userId is required');
     err.statusCode = 400;
@@ -2272,21 +2336,41 @@ const runPropertySearch = async (req) => {
     userId
   );
 
-  // Exact total before limit — this is what autosuggest must show
-  const countResult = await db.query(`SELECT COUNT(*)::int AS hits ${whereSql}`, params);
-  const totalMatched = countResult.rows[0]?.hits || 0;
+  // Exact total before limit — skip when FE sends skipCount (pagination / browse)
+  let totalMatched = null;
+  if (!skipCount) {
+    const countResult = await db.query(`SELECT COUNT(*)::int AS hits ${whereSql}`, params);
+    totalMatched = countResult.rows[0]?.hits || 0;
+  }
 
-  // Oversample so content-dedupe + phase guards can still fill `limit` after offset
+  // Oversample so content-dedupe + junk/phase guards can still fill `limit` after offset
   const need = offset + limit;
-  const fetchLimit = Math.min(
-    Math.max(need * 8, limit * 8, 80),
-    Math.max(need, 5000)
+  const hasLocation = Boolean(String(filters.location || '').trim());
+  const locationHeavy = Boolean(
+    parsedLocation &&
+      (parsedLocation.phaseNumber != null ||
+        parsedLocation.streetNumber != null ||
+        (parsedLocation.mustGroups || []).length ||
+        (parsedLocation.placeOnlyGroups || []).length)
   );
+  // Empty browse: pull a full window so uniqueInPool/count match every page (not just newest 4k)
+  const fetchLimit = !hasLocation
+    ? Math.min(Math.max(need * 20, 20000), 25000)
+    : Math.min(
+        Math.max(
+          need * 12,
+          limit * 12,
+          120,
+          locationHeavy || skipCount ? 4000 : 0
+        ),
+        5000
+      );
 
   let queryText = `
     SELECT * FROM (
       SELECT n.id, n.whatsapp_message_id, n.chat_jid, n.purpose, n.city, n.area, n.vicinity,
-             n.property_type, n.property_sub_type, n.size, n.price, n.contact_number,
+             n.property_type, n.property_sub_type, n.size, n.price,
+             COALESCE(NULLIF(TRIM(n.contact_number), ''), NULLIF(TRIM(m.sender_phone), '')) AS contact_number,
              n.summary, n.property_status, n.created_at, n.category, n.intent, n.sentiment,
              n.listing_index, n.listing_excerpt,
              LEFT(COALESCE(NULLIF(TRIM(n.listing_excerpt), ''), m.message), 500) AS raw_message,
@@ -2309,11 +2393,28 @@ const runPropertySearch = async (req) => {
 
     if (parsedLocation && parsedLocation.phaseNumber != null) {
       const want = parsedLocation.phaseNumber;
+      const qLow = String(parsedLocation.rawQuery || filters.location || '').toLowerCase();
+      const queryMentionsBahria = /\bbahria\b/.test(qLow);
       rows = rows.filter((r) => {
-        const local = [r.area, r.vicinity, r.listing_excerpt, r.summary, r.raw_message]
+        const structured = [r.area, r.vicinity, r.listing_excerpt, r.summary]
           .map((x) => String(x || ''))
           .join(' ');
-        return textHasPhase(local, want);
+        // Bare "Phase 8" in this product means DHA — not Bahria Town Phase 8
+        if (!queryMentionsBahria) {
+          const place = `${r.area || ''} ${r.vicinity || ''} ${r.city || ''}`.toLowerCase();
+          if (/\bbahria\b/.test(place) && !/\b(dha|defence|defense)\b/.test(place)) {
+            return false;
+          }
+        }
+        if (textHasPhase(structured, want)) return true;
+        // Raw-only phase match: require a real offer signal (type / size / price)
+        const raw = String(r.raw_message || '');
+        if (!textHasPhase(raw, want)) return false;
+        return Boolean(
+          String(r.property_type || '').trim() ||
+            String(r.size || '').trim() ||
+            String(r.price || '').trim()
+        );
       });
     }
 
@@ -2376,18 +2477,23 @@ const handlePropertyFilter = async (req, res) => {
   try {
     const { filters, properties, totalMatched, totalReturned, limit, offset, uniqueInPool } =
       await runPropertySearch(req);
-    const enriched = properties.map((p) => ({
+    const viewerId = resolveAuthUserId(req);
+    const withMeta = await attachPrivatePropertyMeta(viewerId, properties);
+    const enriched = withMeta.map((p) => ({
       ...p,
       id: p.id,
       listingId: p.id,
       messageId: p.whatsappMessageId || p.whatsapp_message_id || null,
       whatsappMessageId: p.whatsappMessageId || p.whatsapp_message_id || null,
       seqInChat: p.seqInChat ?? p.seq_in_chat ?? null,
-      seq_in_chat: p.seqInChat ?? p.seq_in_chat ?? null
+      seq_in_chat: p.seqInChat ?? p.seq_in_chat ?? null,
+      isFavourite: Boolean(p.isFavourite),
+      is_favourite: Boolean(p.isFavourite),
+      comments: Array.isArray(p.comments) ? p.comments : []
     }));
     return sendResponse(res, 200, false, {
-      total: totalMatched != null ? totalMatched : enriched.length,
-      totalMatched: totalMatched != null ? totalMatched : enriched.length,
+      total: totalMatched != null ? totalMatched : uniqueInPool != null ? uniqueInPool : enriched.length,
+      totalMatched: totalMatched != null ? totalMatched : uniqueInPool != null ? uniqueInPool : enriched.length,
       totalReturned: totalReturned != null ? totalReturned : enriched.length,
       uniqueInPool: uniqueInPool != null ? uniqueInPool : enriched.length,
       limit: limit != null ? limit : enriched.length,
@@ -2428,8 +2534,125 @@ function toDashboardSearchResult(p) {
     sentiment: p.sentiment || '',
     created_at: p.createdAt || p.created_at,
     property_status: p.propertyStatus || p.property_status || 'AVAILABLE',
-    similarity_score: p.similarityScore || p.similarity_score || null
+    similarity_score: p.similarityScore || p.similarity_score || null,
+    isFavourite: Boolean(p.isFavourite),
+    is_favourite: Boolean(p.isFavourite),
+    comments: Array.isArray(p.comments) ? p.comments : []
   };
+}
+
+function mapPropertyCommentRow(row) {
+  return {
+    id: row.id,
+    propertyId: row.property_id,
+    property_id: row.property_id,
+    comment: row.comment,
+    createdAt: row.created_at,
+    created_at: row.created_at,
+    updatedAt: row.updated_at,
+    updated_at: row.updated_at
+  };
+}
+
+/** Load this user's private comments + favourite flags for a page of listing ids. */
+async function loadUserPropertyMeta(userId, propertyIds) {
+  const ids = [
+    ...new Set(
+      (propertyIds || [])
+        .map((x) => Number(x))
+        .filter((n) => Number.isFinite(n) && n > 0)
+    )
+  ];
+  const empty = { commentsByProperty: new Map(), favouriteIds: new Set() };
+  if (!userId || !ids.length) return empty;
+
+  const [commentsRes, favRes] = await Promise.all([
+    db.query(
+      `SELECT id, property_id, comment, created_at, updated_at
+       FROM property_comments
+       WHERE user_id = $1 AND property_id = ANY($2::int[])
+       ORDER BY created_at ASC, id ASC`,
+      [userId, ids]
+    ),
+    db.query(
+      `SELECT property_id
+       FROM property_favourites
+       WHERE user_id = $1 AND property_id = ANY($2::int[])`,
+      [userId, ids]
+    )
+  ]);
+
+  const commentsByProperty = new Map();
+  for (const row of commentsRes.rows) {
+    const key = Number(row.property_id);
+    if (!commentsByProperty.has(key)) commentsByProperty.set(key, []);
+    commentsByProperty.get(key).push(mapPropertyCommentRow(row));
+  }
+
+  return {
+    commentsByProperty,
+    favouriteIds: new Set(favRes.rows.map((r) => Number(r.property_id)))
+  };
+}
+
+async function attachPrivatePropertyMeta(userId, properties) {
+  const list = Array.isArray(properties) ? properties : [];
+  if (!list.length) return list;
+  const meta = await loadUserPropertyMeta(
+    userId,
+    list.map((p) => p.id)
+  );
+  return list.map((p) => {
+    const id = Number(p.id);
+    return {
+      ...p,
+      isFavourite: meta.favouriteIds.has(id),
+      comments: meta.commentsByProperty.get(id) || []
+    };
+  });
+}
+
+async function findNormalizedPropertyById(propertyId) {
+  const id = Number(propertyId);
+  if (!Number.isFinite(id) || id <= 0) return null;
+  const result = await db.query(
+    `SELECT n.id, n.whatsapp_message_id, n.chat_jid, n.purpose, n.city, n.area, n.vicinity,
+            n.property_type, n.property_sub_type, n.size, n.price,
+            COALESCE(NULLIF(TRIM(n.contact_number), ''), NULLIF(TRIM(m.sender_phone), '')) AS contact_number,
+            n.summary, n.property_status, n.created_at, n.category, n.intent, n.sentiment,
+            n.listing_index, n.listing_excerpt,
+            LEFT(COALESCE(NULLIF(TRIM(n.listing_excerpt), ''), m.message), 500) AS raw_message,
+            m.timestamp AS message_timestamp, m.from_me, m.user_id,
+            m.seq_in_chat, m.seq_in_chat AS "seqInChat"
+     FROM normalized_messages n
+     INNER JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
+     WHERE n.id = $1
+     LIMIT 1`,
+    [id]
+  );
+  return result.rows[0] || null;
+}
+
+function resolveAuthUserId(req) {
+  const id = Number(req.user?.id || req.user?.userId || req.userId);
+  return Number.isFinite(id) && id > 0 ? id : null;
+}
+
+function resolvePropertyIdFromRequest(req) {
+  const raw =
+    req.params?.propertyId ??
+    req.params?.id ??
+    req.body?.propertyId ??
+    req.body?.property_id ??
+    req.body?.listingId ??
+    req.body?.listing_id ??
+    req.body?.id ??
+    req.query?.propertyId ??
+    req.query?.property_id ??
+    req.query?.listingId ??
+    req.query?.listing_id;
+  const id = parseInt(raw, 10);
+  return Number.isFinite(id) && id > 0 ? id : null;
 }
 
 /** Same JSON shape the portal expects from FastAPI POST /api/dashboard-search */
@@ -2437,12 +2660,14 @@ const handleDashboardSearch = async (req, res) => {
   try {
     const { properties, totalMatched, totalReturned, limit, offset, uniqueInPool } =
       await runPropertySearch(req);
-    const results = properties.map(toDashboardSearchResult);
+    const viewerId = resolveAuthUserId(req);
+    const withMeta = await attachPrivatePropertyMeta(viewerId, properties);
+    const results = withMeta.map(toDashboardSearchResult);
     return res.json({
       success: true,
-      // SQL row matches (includes content-dup rows still in DB)
-      count: totalMatched != null ? totalMatched : results.length,
-      totalMatched: totalMatched != null ? totalMatched : results.length,
+      // With skipCount: report unique pool size (post-dedupe/junk), not raw SQL hits
+      count: totalMatched != null ? totalMatched : uniqueInPool != null ? uniqueInPool : results.length,
+      totalMatched: totalMatched != null ? totalMatched : uniqueInPool != null ? uniqueInPool : results.length,
       // Cards actually returned this page (after dedupe)
       totalReturned: totalReturned != null ? totalReturned : results.length,
       limit: limit != null ? limit : results.length,
@@ -2809,6 +3034,332 @@ const handleUpdatePropertyStatus = async (req, res) => {
 app.patch('/api/properties/:propertyId/status', authenticateToken, handleUpdatePropertyStatus);
 app.post('/api/properties/:propertyId/status', authenticateToken, handleUpdatePropertyStatus);
 app.put('/api/properties/:propertyId/status', authenticateToken, handleUpdatePropertyStatus);
+
+// ---------------------------------------------------------------------------
+// Favourites + private property comments (per-user only)
+// ---------------------------------------------------------------------------
+
+/**
+ * POST /api/favourites  (toggle)
+ * Body: { propertyId | listingId | id }  — normalized_messages.id from search card
+ * If already favourited → removes it; otherwise adds it.
+ */
+app.post('/api/favourites', authenticateToken, async (req, res) => {
+  try {
+    const userId = resolveAuthUserId(req);
+    if (!userId) {
+      return sendResponse(res, 401, true, null, 'Login required');
+    }
+    const propertyId = resolvePropertyIdFromRequest(req);
+    if (!propertyId) {
+      return sendResponse(res, 400, true, null, 'propertyId is required');
+    }
+
+    const property = await findNormalizedPropertyById(propertyId);
+    if (!property) {
+      return sendResponse(res, 404, true, null, 'Property not found');
+    }
+
+    const existing = await db.query(
+      `SELECT id, property_id, created_at
+       FROM property_favourites
+       WHERE user_id = $1 AND property_id = $2
+       LIMIT 1`,
+      [userId, propertyId]
+    );
+
+    let favourited = false;
+    let favouriteRow = null;
+
+    if (existing.rows[0]) {
+      await db.query(`DELETE FROM property_favourites WHERE id = $1`, [existing.rows[0].id]);
+      favourited = false;
+    } else {
+      const inserted = await db.query(
+        `INSERT INTO property_favourites (user_id, property_id)
+         VALUES ($1, $2)
+         RETURNING id, user_id, property_id, created_at`,
+        [userId, propertyId]
+      );
+      favouriteRow = inserted.rows[0];
+      favourited = true;
+    }
+
+    const mapped = filterAndSortProperties([property], { sortBy: 'Newest First' })[0];
+    const withMeta = await attachPrivatePropertyMeta(userId, [
+      mapped || {
+        id: property.id,
+        whatsappMessageId: property.whatsapp_message_id,
+        listingIndex: property.listing_index ?? 0,
+        seqInChat: property.seq_in_chat,
+        purpose: property.purpose,
+        city: property.city,
+        area: property.area,
+        vicinity: property.vicinity,
+        propertyType: property.property_type,
+        propertySubType: property.property_sub_type,
+        size: property.size,
+        price: property.price,
+        contactNumber: property.contact_number,
+        summary: property.summary,
+        propertyStatus: property.property_status,
+        rawMessage: property.raw_message,
+        createdAt: property.created_at
+      }
+    ]);
+    const card = toDashboardSearchResult({
+      ...withMeta[0],
+      isFavourite: favourited
+    });
+
+    return sendResponse(
+      res,
+      200,
+      false,
+      {
+        toggled: true,
+        isFavourite: favourited,
+        is_favourite: favourited,
+        action: favourited ? 'added' : 'removed',
+        id: favouriteRow?.id || existing.rows[0]?.id || null,
+        propertyId,
+        property_id: propertyId,
+        createdAt: favouriteRow?.created_at || null,
+        created_at: favouriteRow?.created_at || null,
+        property: card
+      },
+      favourited ? 'Property added to favourites' : 'Property removed from favourites'
+    );
+  } catch (err) {
+    console.error('Toggle favourite error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
+/**
+ * GET /api/favourites
+ * Returns this user's favourited scraped cards (with private comments).
+ */
+app.get('/api/favourites', authenticateToken, async (req, res) => {
+  try {
+    const userId = resolveAuthUserId(req);
+    if (!userId) {
+      return sendResponse(res, 401, true, null, 'Login required');
+    }
+
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 200, 1), 1000);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+
+    const favs = await db.query(
+      `SELECT f.id AS favourite_id, f.property_id, f.created_at AS favourited_at,
+              n.id, n.whatsapp_message_id, n.chat_jid, n.purpose, n.city, n.area, n.vicinity,
+              n.property_type, n.property_sub_type, n.size, n.price,
+              COALESCE(NULLIF(TRIM(n.contact_number), ''), NULLIF(TRIM(m.sender_phone), '')) AS contact_number,
+              n.summary, n.property_status, n.created_at, n.category, n.intent, n.sentiment,
+              n.listing_index, n.listing_excerpt,
+              LEFT(COALESCE(NULLIF(TRIM(n.listing_excerpt), ''), m.message), 500) AS raw_message,
+              m.timestamp AS message_timestamp, m.from_me, m.user_id,
+              m.seq_in_chat, m.seq_in_chat AS "seqInChat"
+       FROM property_favourites f
+       INNER JOIN normalized_messages n ON n.id = f.property_id
+       INNER JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
+       WHERE f.user_id = $1
+       ORDER BY f.created_at DESC, f.id DESC
+       LIMIT $2 OFFSET $3`,
+      [userId, limit, offset]
+    );
+
+    const countRes = await db.query(
+      `SELECT COUNT(*)::int AS total FROM property_favourites WHERE user_id = $1`,
+      [userId]
+    );
+
+    const withMeta = await attachPrivatePropertyMeta(userId, favs.rows);
+    // Keep favourite order; skip junk filter so user still sees what they saved
+    const results = withMeta.map((row) => {
+      const mapped = filterAndSortProperties([row], { sortBy: 'Newest First' })[0];
+      const base = mapped || {
+        id: row.id,
+        whatsappMessageId: row.whatsapp_message_id,
+        listingIndex: row.listing_index ?? 0,
+        seqInChat: row.seq_in_chat,
+        purpose: row.purpose,
+        city: row.city,
+        area: row.area,
+        vicinity: row.vicinity,
+        propertyType: row.property_type,
+        propertySubType: row.property_sub_type,
+        size: row.size,
+        price: row.price,
+        contactNumber: row.contact_number,
+        summary: row.summary,
+        propertyStatus: row.property_status,
+        rawMessage: row.raw_message,
+        createdAt: row.created_at,
+        isFavourite: true,
+        comments: row.comments || []
+      };
+      base.isFavourite = true;
+      base.comments = row.comments || [];
+      const card = toDashboardSearchResult(base);
+      return {
+        ...card,
+        favouriteId: row.favourite_id,
+        favourite_id: row.favourite_id,
+        favouritedAt: row.favourited_at,
+        favourited_at: row.favourited_at
+      };
+    });
+
+    return sendResponse(
+      res,
+      200,
+      false,
+      {
+        total: countRes.rows[0]?.total || 0,
+        limit,
+        offset,
+        favourites: results
+      },
+      'Favourites retrieved'
+    );
+  } catch (err) {
+    console.error('Get favourites error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
+/**
+ * DELETE /api/favourites/:propertyId
+ */
+app.delete('/api/favourites/:propertyId', authenticateToken, async (req, res) => {
+  try {
+    const userId = resolveAuthUserId(req);
+    if (!userId) {
+      return sendResponse(res, 401, true, null, 'Login required');
+    }
+    const propertyId = resolvePropertyIdFromRequest(req);
+    if (!propertyId) {
+      return sendResponse(res, 400, true, null, 'propertyId is required');
+    }
+
+    const deleted = await db.query(
+      `DELETE FROM property_favourites
+       WHERE user_id = $1 AND property_id = $2
+       RETURNING id, property_id`,
+      [userId, propertyId]
+    );
+
+    if (!deleted.rows[0]) {
+      return sendResponse(res, 404, true, null, 'Favourite not found');
+    }
+
+    return sendResponse(
+      res,
+      200,
+      false,
+      {
+        propertyId: deleted.rows[0].property_id,
+        property_id: deleted.rows[0].property_id
+      },
+      'Favourite removed'
+    );
+  } catch (err) {
+    console.error('Delete favourite error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
+/**
+ * POST /api/properties/:propertyId/comments
+ * Body: { comment: "agent quoted 2.1 crore last deal" }
+ * Private to the logged-in user only.
+ */
+app.post('/api/properties/:propertyId/comments', authenticateToken, async (req, res) => {
+  try {
+    const userId = resolveAuthUserId(req);
+    if (!userId) {
+      return sendResponse(res, 401, true, null, 'Login required');
+    }
+    const propertyId = resolvePropertyIdFromRequest(req);
+    if (!propertyId) {
+      return sendResponse(res, 400, true, null, 'propertyId is required');
+    }
+
+    const comment = String(
+      req.body?.comment ?? req.body?.text ?? req.body?.note ?? ''
+    ).trim();
+    if (!comment) {
+      return sendResponse(res, 400, true, null, 'comment is required');
+    }
+    if (comment.length > 5000) {
+      return sendResponse(res, 400, true, null, 'comment is too long (max 5000 chars)');
+    }
+
+    const property = await findNormalizedPropertyById(propertyId);
+    if (!property) {
+      return sendResponse(res, 404, true, null, 'Property not found');
+    }
+
+    const inserted = await db.query(
+      `INSERT INTO property_comments (user_id, property_id, comment)
+       VALUES ($1, $2, $3)
+       RETURNING id, user_id, property_id, comment, created_at, updated_at`,
+      [userId, propertyId, comment]
+    );
+
+    return sendResponse(
+      res,
+      201,
+      false,
+      mapPropertyCommentRow(inserted.rows[0]),
+      'Comment added'
+    );
+  } catch (err) {
+    console.error('Add property comment error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
+/**
+ * GET /api/properties/:propertyId/comments
+ * Own private comments only.
+ */
+app.get('/api/properties/:propertyId/comments', authenticateToken, async (req, res) => {
+  try {
+    const userId = resolveAuthUserId(req);
+    if (!userId) {
+      return sendResponse(res, 401, true, null, 'Login required');
+    }
+    const propertyId = resolvePropertyIdFromRequest(req);
+    if (!propertyId) {
+      return sendResponse(res, 400, true, null, 'propertyId is required');
+    }
+
+    const result = await db.query(
+      `SELECT id, property_id, comment, created_at, updated_at
+       FROM property_comments
+       WHERE user_id = $1 AND property_id = $2
+       ORDER BY created_at ASC, id ASC`,
+      [userId, propertyId]
+    );
+
+    return sendResponse(
+      res,
+      200,
+      false,
+      {
+        propertyId,
+        property_id: propertyId,
+        comments: result.rows.map(mapPropertyCommentRow)
+      },
+      'Comments retrieved'
+    );
+  } catch (err) {
+    console.error('Get property comments error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Normalization (AI) — portal user triggers + polls progress

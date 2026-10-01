@@ -399,6 +399,88 @@ function dedupeListings(items) {
   }
   return out;
 }
+
+/**
+ * Drop agent footers / bare "Location Phase 8" fragments that are not real offers.
+ */
+function isListingNoise(item) {
+  const text = String(
+    item.listingExcerpt || item.listing_excerpt || item.summary || item.rawMessage || item.raw_message || ''
+  ).trim();
+  const lower = text.toLowerCase().replace(/\s+/g, ' ');
+  const hasType = Boolean(String(item.propertyType || item.property_type || '').trim());
+  const hasSize =
+    Boolean(String(item.size || '').trim()) ||
+    (item.parsedAreaInTargetUnit != null && !Number.isNaN(item.parsedAreaInTargetUnit));
+  const hasPrice =
+    Boolean(String(item.price || '').trim()) ||
+    (item.parsedPricePKR != null && !Number.isNaN(item.parsedPricePKR));
+  const offerWords =
+    /\b(sale|rent|plot|yard|yds|sq\.?\s*(ft|yd|yard)|bed|bungalow|apartment|flat|shop|house|demand|crore|lakh|lac|marla|kanal|basement|floor)\b/i;
+
+  if (!text || text.length < 12) return true;
+
+  // Bare location lines
+  if (/^(📍\s*)?(location\s*)?(dha\s*)?phase\s*(viii|8|vi{1,3}|\d+)\s*$/i.test(lower)) return true;
+  if (/^(📍\s*)?location\s*[:\-]?\s*phase\b/i.test(lower) && text.length < 70 && !hasSize && !hasPrice) {
+    return true;
+  }
+  if (
+    /^(📍\s*)?dha\s+phase\s*(viii|8)\s*[—\-–]?\s*[\w\s]*$/i.test(lower) &&
+    !hasType &&
+    !hasSize &&
+    !hasPrice &&
+    text.length < 90
+  ) {
+    return true;
+  }
+
+  // Buyer RFPs / requirements (not an offer card)
+  if (
+    /\b(urgent\s+)?requirement\b|\blooking for\b|\bwanted\b|\bbasement required\b/i.test(lower) &&
+    /\bbudget\b/i.test(lower) &&
+    !/\b(for sale|for rent|demand\s*:|@\s*\d)/i.test(lower)
+  ) {
+    return true;
+  }
+  if (
+    !hasType &&
+    !hasSize &&
+    /^[\s📍*]*location\s*[:\-]/i.test(lower) &&
+    /phase\s*(viii|8|0?8)\b/i.test(lower) &&
+    (/\bbudget\b|\brequired\b|\blooking\b/i.test(lower) || text.length < 160)
+  ) {
+    return true;
+  }
+
+  // Agent / office signature without an offer
+  if (!hasType && !hasSize && !hasPrice) {
+    if (
+      text.length < 240 &&
+      /(consultant|realtor|enterprises?|builders?|\bestate\b|for details call|contact (us|for|me)|suite\s*#?\d+|office\s*:|coral towers)/i.test(
+        lower
+      )
+    ) {
+      return true;
+    }
+    if (text.length < 110 && /phase\s*(viii|8|0?8)\b/i.test(lower) && !offerWords.test(lower)) {
+      return true;
+    }
+    // Header-only inventory titles (phase digit alone is not an offer signal)
+    if (
+      text.length < 100 &&
+      /(plots? for sale|apartments? for sale|prime investment|opportunity|inventory)\b/i.test(lower)
+    ) {
+      const withoutPhase = lower.replace(/phase\s*(viii|vi{1,3}|0?8|\d+)/gi, ' ');
+      if (!offerWords.test(withoutPhase.replace(/plots? for sale|apartments? for sale/gi, ' '))) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
 function filterAndSortProperties(rawRows, filters = {}) {
   const targetUnit = filters.areaUnit || 'Marla';
 
@@ -440,6 +522,9 @@ function filterAndSortProperties(rawRows, filters = {}) {
       createdAt: r.created_at
     };
   });
+
+  // Drop signature / bare-location junk cards
+  items = items.filter((item) => !isListingNoise(item));
 
   // Price Min Filter
   if (filters.priceMin !== undefined && filters.priceMin !== null && String(filters.priceMin).trim() !== '') {

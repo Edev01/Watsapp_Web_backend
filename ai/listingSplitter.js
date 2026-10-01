@@ -14,7 +14,11 @@ function normalizePkMobile(raw) {
   if (!digits) return null;
   if (digits.startsWith('92') && digits.length >= 12) digits = `0${digits.slice(2)}`;
   if (/^3\d{9}$/.test(digits)) digits = `0${digits}`;
-  if (!/^03\d{9}$/.test(digits)) return null;
+  if (!/^03\d{9}$/.test(digits)) {
+    // Keep plausible international numbers; reject short junk
+    if (digits.length >= 10 && digits.length <= 15) return digits;
+    return null;
+  }
   return digits;
 }
 
@@ -90,5 +94,6 @@ function splitPropertyOffers(rawText) {
 module.exports = {
   splitPropertyOffers,
   extractSharedContacts,
-  looksLikeOffer
+  looksLikeOffer,
+  normalizePkMobile
 };

@@ -54,9 +54,25 @@ function listingContentFingerprint(row, { minLen = 24, maxLen = 180 } = {}) {
   return `${raw.slice(0, maxLen)}|${purpose}`;
 }
 
+/** Per-user scoped listing fingerprint (safe for unique index). */
+function userListingFingerprint(userId, row, opts) {
+  const base = listingContentFingerprint(row, opts);
+  if (!base) return null;
+  return `u${Number(userId) || 0}|${base}`;
+}
+
+/** Per-user scoped message body fingerprint. */
+function userMessageFingerprint(userId, text, opts) {
+  const base = messageContentFingerprint(text, opts);
+  if (!base) return null;
+  return `u${Number(userId) || 0}|${base}`;
+}
+
 module.exports = {
   collapseRepeatedText,
   normalizeFingerprintText,
   messageContentFingerprint,
-  listingContentFingerprint
+  listingContentFingerprint,
+  userListingFingerprint,
+  userMessageFingerprint
 };

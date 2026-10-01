@@ -181,10 +181,27 @@ async function runMigrationSteps(client) {
            ALTER TABLE normalized_messages ADD COLUMN IF NOT EXISTS property_status VARCHAR(32) DEFAULT 'AVAILABLE';
            ALTER TABLE normalized_messages ADD COLUMN IF NOT EXISTS listing_index INTEGER DEFAULT 0;
            ALTER TABLE normalized_messages ADD COLUMN IF NOT EXISTS listing_excerpt TEXT;
+           ALTER TABLE normalized_messages ADD COLUMN IF NOT EXISTS content_fingerprint TEXT;
            CREATE INDEX IF NOT EXISTS idx_normalized_messages_property_status ON normalized_messages (property_status);
            CREATE INDEX IF NOT EXISTS idx_nm_message_listing ON normalized_messages (whatsapp_message_id, listing_index);
+           CREATE INDEX IF NOT EXISTS idx_nm_content_fingerprint
+             ON normalized_messages (content_fingerprint)
+             WHERE content_fingerprint IS NOT NULL;
          EXCEPTION WHEN insufficient_privilege THEN
            RAISE NOTICE 'skip normalized_messages DDL: not table owner';
+         END;
+       END IF;
+     END $$`,
+    `DO $$ BEGIN
+       IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'whatsapp_messages') THEN
+         BEGIN
+           ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS content_fingerprint TEXT;
+           ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS sender_phone TEXT;
+           CREATE INDEX IF NOT EXISTS idx_wm_user_content_fp
+             ON whatsapp_messages (user_id, content_fingerprint)
+             WHERE content_fingerprint IS NOT NULL;
+         EXCEPTION WHEN insufficient_privilege THEN
+           RAISE NOTICE 'skip whatsapp_messages fingerprint DDL: not table owner';
          END;
        END IF;
      END $$`,
@@ -240,7 +257,30 @@ async function runMigrationSteps(client) {
            RAISE NOTICE 'skip normalized_messages trgm indexes: not table owner';
          END;
        END IF;
-     END $$`
+     END $$`,
+    // Per-user private favourites on scraped property cards (normalized_messages.id)
+    `CREATE TABLE IF NOT EXISTS property_favourites (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      property_id INTEGER NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT uniq_user_property_favourite UNIQUE (user_id, property_id)
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_property_favourites_user
+       ON property_favourites (user_id, created_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_property_favourites_property
+       ON property_favourites (property_id)`,
+    // Per-user private notes/comments on scraped cards (only visible to that user)
+    `CREATE TABLE IF NOT EXISTS property_comments (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      property_id INTEGER NOT NULL,
+      comment TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_property_comments_user_property
+       ON property_comments (user_id, property_id, created_at DESC)`
   ];
 
   for (const sql of steps) {

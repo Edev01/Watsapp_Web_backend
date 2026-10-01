@@ -4,10 +4,10 @@ const { LLMClient, expandListingSchemas } = require('./llmClient');
 const { GeminiClient } = require('./geminiClient');
 const { fillGapsOnly, scrubWeakLocations } = require('./cascadeMerge');
 const { refineWithGeocode } = require('./geocodeClient');
-const { splitPropertyOffers, extractSharedContacts } = require('./listingSplitter');
+const { splitPropertyOffers, extractSharedContacts, normalizePkMobile } = require('./listingSplitter');
 const { extractMessageSchema } = require('./localNer');
 const { canonicalizePlaceText } = require('../pakistanLocalities');
-const { listingContentFingerprint } = require('../contentFingerprint');
+const { userListingFingerprint } = require('../contentFingerprint');
 const {
   loadSkippedIds,
   logNormalizationFailure,
@@ -122,21 +122,40 @@ async function releaseClaim(messageId, modelName) {
   }
 }
 
+async function listingFingerprintExists(userId, fingerprint) {
+  if (!fingerprint) return false;
+  const { rows } = await db.query(
+    `SELECT 1
+     FROM normalized_messages n
+     INNER JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
+     WHERE n.content_fingerprint = $1
+       AND n.is_property IS TRUE
+       AND m.user_id IS NOT DISTINCT FROM $2
+     LIMIT 1`,
+    [fingerprint, Number(userId)]
+  );
+  return rows.length > 0;
+}
+
 async function loadUserListingFingerprints(userId) {
   if (userId == null) return new Set();
   const { rows } = await db.query(
-    `SELECT n.listing_excerpt, n.summary, n.purpose
+    `SELECT n.content_fingerprint, n.listing_excerpt, n.summary, n.purpose
      FROM normalized_messages n
      INNER JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
      WHERE m.user_id = $1
-       AND (n.is_property IS TRUE OR n.purpose IS NOT NULL OR n.property_type IS NOT NULL)
+       AND n.is_property IS TRUE
      ORDER BY n.id DESC
-     LIMIT 2500`,
+     LIMIT 20000`,
     [Number(userId)]
   );
   const set = new Set();
   for (const r of rows) {
-    const fp = listingContentFingerprint(r);
+    if (r.content_fingerprint) {
+      set.add(r.content_fingerprint);
+      continue;
+    }
+    const fp = userListingFingerprint(userId, r);
     if (fp) set.add(fp);
   }
   return set;
@@ -153,6 +172,38 @@ async function saveNormalized(job, schema, targetModel) {
     names: []
   };
 
+  const userId = tenantId(job.user_id);
+  const existingFingerprints = await loadUserListingFingerprints(userId);
+
+  const toSave = [];
+  for (const row of listingRows) {
+    const isProp = Boolean(row.is_property_listing_or_inquiry);
+    const areaCanon = isProp && row.area ? canonicalizePlaceText(row.area) : null;
+    const vicinityCanon = isProp && row.vicinity ? canonicalizePlaceText(row.vicinity) : null;
+
+    let fp = null;
+    if (isProp) {
+      fp = userListingFingerprint(userId, {
+        listing_excerpt: row.listing_excerpt,
+        summary: row.summary,
+        purpose: row.purpose
+      });
+      if (fp && (existingFingerprints.has(fp) || (await listingFingerprintExists(userId, fp)))) {
+        existingFingerprints.add(fp);
+        continue;
+      }
+      if (fp) existingFingerprints.add(fp);
+    }
+
+    toSave.push({
+      row,
+      isProp,
+      areaCanon,
+      vicinityCanon,
+      fp: isProp ? fp : null
+    });
+  }
+
   // Replace prior rows for this message+model so re-runs can split multi-listings
   await db.query(
     `DELETE FROM normalized_messages
@@ -160,66 +211,91 @@ async function saveNormalized(job, schema, targetModel) {
     [job.id, targetModel]
   );
 
-  const existingFingerprints = await loadUserListingFingerprints(job.user_id);
-  let saved = 0;
-  for (const row of listingRows) {
-    const isProp = Boolean(row.is_property_listing_or_inquiry);
-    const areaCanon = isProp && row.area ? canonicalizePlaceText(row.area) : null;
-    const vicinityCanon = isProp && row.vicinity ? canonicalizePlaceText(row.vicinity) : null;
-
-    // Skip identical listing content already stored for this user (repost / re-scrape)
-    const fp = listingContentFingerprint({
-      listing_excerpt: row.listing_excerpt,
-      summary: row.summary,
-      purpose: isProp ? row.purpose : null
-    });
-    if (fp) {
-      if (existingFingerprints.has(fp)) continue;
-      existingFingerprints.add(fp);
-    }
-
+  // All offers already stored as another message — leave a stub so we don't re-queue forever
+  if (!toSave.length) {
     await db.query(
       `INSERT INTO normalized_messages (
          whatsapp_message_id, chat_jid, sender, category, intent, sentiment, language,
          summary, entities, city, is_property, purpose, property_type, property_sub_type,
          area, vicinity, size, size_value, size_unit, price, price_value, contact_number,
-         confidence_score, model_used, listing_index, listing_excerpt, created_at
+         confidence_score, model_used, listing_index, listing_excerpt, content_fingerprint, created_at
        ) VALUES (
-         $1,$2,$3,$4,$5,$6,$7,
-         $8,$9::jsonb,$10,$11,$12,$13,$14,
-         $15,$16,$17,$18,$19,$20,$21,$22,
-         $23,$24,$25,$26,NOW()
+         $1,$2,$3,'skipped','duplicate','neutral','en',
+         $4,'{}'::jsonb,NULL,FALSE,NULL,NULL,NULL,
+         NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+         0,$5,0,NULL,NULL,NOW()
        )`,
       [
         job.id,
         job.chat_jid,
         job.sender,
-        row.category,
-        row.intent,
-        row.sentiment,
-        row.language,
-        row.summary,
-        JSON.stringify(entities),
-        isProp ? row.city : null,
-        isProp,
-        isProp ? row.purpose : null,
-        isProp ? row.property_type : null,
-        isProp ? row.property_sub_type : null,
-        areaCanon,
-        vicinityCanon,
-        isProp ? row.size : null,
-        isProp ? row.size_value : null,
-        isProp ? row.size_unit : null,
-        isProp ? row.price : null,
-        isProp ? row.price_value : null,
-        isProp ? row.contact_number : null,
-        row.confidence_score,
-        targetModel,
-        Number(row.listing_index) || 0,
-        row.listing_excerpt ? String(row.listing_excerpt).slice(0, 2000) : null
+        '[skipped duplicate listing content]',
+        targetModel
       ]
     );
-    saved += 1;
+    return 0;
+  }
+
+  let saved = 0;
+  for (const item of toSave) {
+    const { row, isProp, areaCanon, vicinityCanon, fp } = item;
+    try {
+      await db.query(
+        `INSERT INTO normalized_messages (
+           whatsapp_message_id, chat_jid, sender, category, intent, sentiment, language,
+           summary, entities, city, is_property, purpose, property_type, property_sub_type,
+           area, vicinity, size, size_value, size_unit, price, price_value, contact_number,
+           confidence_score, model_used, listing_index, listing_excerpt, content_fingerprint, created_at
+         ) VALUES (
+           $1,$2,$3,$4,$5,$6,$7,
+           $8,$9::jsonb,$10,$11,$12,$13,$14,
+           $15,$16,$17,$18,$19,$20,$21,$22,
+           $23,$24,$25,$26,$27,NOW()
+         )`,
+        [
+          job.id,
+          job.chat_jid,
+          job.sender,
+          row.category,
+          row.intent,
+          row.sentiment,
+          row.language,
+          row.summary,
+          JSON.stringify(entities),
+          isProp ? row.city : null,
+          isProp,
+          isProp ? row.purpose : null,
+          isProp ? row.property_type : null,
+          isProp ? row.property_sub_type : null,
+          areaCanon,
+          vicinityCanon,
+          isProp ? row.size : null,
+          isProp ? row.size_value : null,
+          isProp ? row.size_unit : null,
+          isProp ? row.price : null,
+          isProp ? row.price_value : null,
+          isProp
+            ? row.contact_number ||
+              normalizePkMobile(job.sender_phone) ||
+              job.sender_phone ||
+              null
+            : null,
+          row.confidence_score,
+          targetModel,
+          Number(row.listing_index) || 0,
+          row.listing_excerpt ? String(row.listing_excerpt).slice(0, 2000) : null,
+          fp
+        ]
+      );
+      saved += 1;
+    } catch (err) {
+      // Unique fingerprint race — another worker saved the same ad
+      if (err.code === '23505' && fp) {
+        console.info(`[ai] skip duplicate listing fp for msg=${job.id}`);
+        continue;
+      }
+      throw err;
+    }
   }
   return saved;
 }
@@ -250,7 +326,7 @@ async function loadPendingJobs(targetModel, userId, window, { ignoreSkips = true
   const limitIdx = params.length;
 
   const result = await db.query(
-    `SELECT m.id, m.user_id, m.chat_jid, m.sender, m.message
+    `SELECT m.id, m.user_id, m.chat_jid, m.sender, m.sender_phone, m.message
      FROM whatsapp_messages m
      WHERE m.message IS NOT NULL
        AND TRIM(m.message) <> ''
@@ -285,6 +361,7 @@ async function loadPendingJobs(targetModel, userId, window, { ignoreSkips = true
     user_id: row.user_id,
     chat_jid: row.chat_jid,
     sender: row.sender,
+    sender_phone: row.sender_phone || null,
     message: row.message
   }));
 }
@@ -358,7 +435,11 @@ async function cascadeNormalizeText(text, sender, llmClient, qwenModel, geminiCl
 
 async function normalizeOne(job, llmClient, targetModel, geminiClient) {
   try {
-    const sharedContact = extractSharedContacts(job.message);
+    const senderFallback =
+      normalizePkMobile(job.sender_phone) ||
+      (job.sender_phone ? String(job.sender_phone).trim() : null) ||
+      null;
+    const sharedContact = extractSharedContacts(job.message) || senderFallback;
     const gemini = geminiClient || new GeminiClient();
     const chunks = splitPropertyOffers(job.message);
     const useChunks = chunks.length >= 2;
