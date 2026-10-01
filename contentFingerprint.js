@@ -28,6 +28,35 @@ function normalizeFingerprintText(s) {
 }
 
 /**
+ * Aggressive body key for search/purge dedupe — letters/digits/spaces only.
+ * Collapses emoji/punct noise so "11. 5 cr" === "11.5 cr".
+ */
+function bodyDedupeKey(text, { minLen = 8, maxLen = 500 } = {}) {
+  const n = normalizeFingerprintText(text)
+    .replace(/[./-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (n.length < minLen) return null;
+  return n.slice(0, maxLen);
+}
+
+/** Longest substantial text among listing fields (raw preferred when tied). */
+function pickListingBodyText(row) {
+  const candidates = [
+    row.rawMessage || row.raw_message || row.message || '',
+    row.listingExcerpt || row.listing_excerpt || '',
+    row.summary || ''
+  ].map((s) => String(s || ''));
+  let best = '';
+  for (const c of candidates) {
+    if (c.replace(/\s+/g, ' ').trim().length > best.replace(/\s+/g, ' ').trim().length) {
+      best = c;
+    }
+  }
+  return best;
+}
+
+/**
  * Fingerprint for raw WhatsApp message bodies (ingest / skip-normalize).
  * Returns null for short messages so we do not block "ok" / OTPs.
  */
@@ -41,26 +70,14 @@ function messageContentFingerprint(text, { minLen = 40, maxLen = 220 } = {}) {
  * Fingerprint for a normalized listing row / search card.
  * Prefer the full offer text (raw/excerpt) so reposts with different AI summaries still collapse.
  */
-function listingContentFingerprint(row, { minLen = 24, maxLen = 220 } = {}) {
-  const excerpt = normalizeFingerprintText(
-    row.listingExcerpt || row.listing_excerpt || ''
-  );
-  const summary = normalizeFingerprintText(row.summary || '');
-  const raw = normalizeFingerprintText(
-    row.rawMessage || row.raw_message || row.message || ''
-  );
-
-  // Longest substantial body wins (raw WhatsApp text preferred over short summaries)
-  let body = '';
-  for (const candidate of [raw, excerpt, summary]) {
-    if (candidate.length >= minLen && candidate.length >= body.length) body = candidate;
-  }
-  if (!body || body.length < minLen) return null;
+function listingContentFingerprint(row, { minLen = 8, maxLen = 400 } = {}) {
+  const body = bodyDedupeKey(pickListingBodyText(row), { minLen, maxLen });
+  if (!body) return null;
 
   const purpose = String(row.purpose || '')
     .toLowerCase()
     .trim();
-  return `${body.slice(0, maxLen)}|${purpose}`;
+  return `${body}|${purpose}`;
 }
 
 /** Per-user scoped listing fingerprint (safe for unique index). */
@@ -80,6 +97,8 @@ function userMessageFingerprint(userId, text, opts) {
 module.exports = {
   collapseRepeatedText,
   normalizeFingerprintText,
+  bodyDedupeKey,
+  pickListingBodyText,
   messageContentFingerprint,
   listingContentFingerprint,
   userListingFingerprint,

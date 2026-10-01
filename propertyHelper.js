@@ -3,6 +3,8 @@
  */
 const {
   normalizeFingerprintText,
+  bodyDedupeKey,
+  pickListingBodyText,
   listingContentFingerprint
 } = require('./contentFingerprint');
 
@@ -373,8 +375,28 @@ function dedupeListings(items) {
   const seenId = new Set();
   const seenFp = new Set();
   const seenMsgExcerpt = new Set();
-  const seenBodyOnly = new Set();
+  const seenBodyOnly = [];
   const out = [];
+
+  const isBodyDup = (key) => {
+    if (!key) return false;
+    for (let i = 0; i < seenBodyOnly.length; i++) {
+      const seen = seenBodyOnly[i];
+      if (seen === key) return true;
+      // Near-identical: shorter is mostly the same offer as longer (title prefix/suffix)
+      const short = seen.length <= key.length ? seen : key;
+      const long = seen.length <= key.length ? key : seen;
+      if (
+        short.length >= 32 &&
+        short.length / long.length >= 0.72 &&
+        long.includes(short)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  };
+
   for (const item of items) {
     if (item.id != null) {
       const key = `id:${item.id}`;
@@ -393,18 +415,12 @@ function dedupeListings(items) {
       seenMsgExcerpt.add(mk);
     }
 
-    // Same offer body across different message ids / summaries (reposts)
-    const bodyOnly = normalizeFingerprintText(
-      item.rawMessage ||
-        item.raw_message ||
-        item.listingExcerpt ||
-        item.listing_excerpt ||
-        item.summary ||
-        ''
-    ).slice(0, 220);
-    if (bodyOnly.length >= 40) {
-      if (seenBodyOnly.has(bodyOnly)) continue;
-      seenBodyOnly.add(bodyOnly);
+    // Same offer body across different message ids / summaries (reposts).
+    // Aggressive key + containment so short/emoji/punct variants collapse.
+    const bodyOnly = bodyDedupeKey(pickListingBodyText(item));
+    if (bodyOnly) {
+      if (isBodyDup(bodyOnly)) continue;
+      seenBodyOnly.push(bodyOnly);
     }
 
     const fp = listingFingerprint(item);

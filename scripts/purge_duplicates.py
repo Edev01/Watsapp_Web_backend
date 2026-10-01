@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-Find duplicate WhatsApp / listing rows, copy losers into `trash`, then delete them.
+Purge SAME-BODY duplicates (not same id).
+
+Cards/messages with the same normalized body text (emoji/punct ignored) are
+duplicates — keep the newest id, move losers into `trash`, then delete.
 
 Usage:
   python3 scripts/purge_duplicates.py              # dry-run (default)
@@ -9,7 +12,7 @@ Usage:
   python3 scripts/purge_duplicates.py --stats      # trash table summary only
 
 Cron (apply mode):
-  */30 * * * * cd /home/omer/whatsapp_scrapper_backend && /usr/bin/python3 scripts/purge_duplicates.py --apply >> logs/purge_duplicates.log 2>&1
+  0 * * * * /home/omer/whatsapp_scrapper_backend/scripts/cron_purge_duplicates.sh >> logs/purge_duplicates.log 2>&1
 """
 from __future__ import annotations
 
@@ -20,10 +23,9 @@ import os
 import re
 import sys
 import uuid
-from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -33,7 +35,6 @@ try:
 
     load_dotenv(ROOT / ".env")
 except ImportError:
-    # Minimal .env loader
     env_path = ROOT / ".env"
     if env_path.exists():
         for line in env_path.read_text().splitlines():
@@ -45,13 +46,12 @@ except ImportError:
 
 try:
     import psycopg2
-    import psycopg2.extras
 except ImportError:
     print("psycopg2 required: pip3 install --user psycopg2-binary", file=sys.stderr)
     sys.exit(1)
 
 
-# --- fingerprint helpers (mirror contentFingerprint.js) ---
+# --- body fingerprint (mirror contentFingerprint.js bodyDedupeKey) ---
 
 _PUNCT_RE = re.compile(r"[^\w\s./-]+", re.UNICODE)
 _MD_RE = re.compile(r"[*_`~#>|]+")
@@ -79,43 +79,41 @@ def normalize_fingerprint_text(s: str) -> str:
     return _WS_RE.sub(" ", t).strip()
 
 
-def message_content_fingerprint(text: str, min_len: int = 40, max_len: int = 220) -> Optional[str]:
+def body_dedupe_key(text: str, min_len: int = 8, max_len: int = 500) -> Optional[str]:
+    """Aggressive same-body key — letters/digits/spaces only."""
     n = normalize_fingerprint_text(text)
+    n = re.sub(r"[./-]+", " ", n)
+    n = _WS_RE.sub(" ", n).strip()
     if len(n) < min_len:
         return None
     return n[:max_len]
 
 
-def listing_content_fingerprint(
-    row: Dict[str, Any], min_len: int = 24, max_len: int = 220
-) -> Optional[str]:
-    excerpt = normalize_fingerprint_text(row.get("listing_excerpt") or "")
-    summary = normalize_fingerprint_text(row.get("summary") or "")
-    raw = normalize_fingerprint_text(
-        row.get("raw_message") or row.get("message") or ""
-    )
-    body = ""
-    for candidate in (raw, excerpt, summary):
-        if len(candidate) >= min_len and len(candidate) >= len(body):
-            body = candidate
-    if not body or len(body) < min_len:
-        return None
-    purpose = str(row.get("purpose") or "").lower().strip()
-    return f"{body[:max_len]}|{purpose}"
+def pick_listing_body_text(row: Dict[str, Any]) -> str:
+    """Longest of raw WhatsApp message / excerpt / summary."""
+    candidates = [
+        row.get("raw_message") or row.get("message") or "",
+        row.get("listing_excerpt") or "",
+        row.get("summary") or "",
+    ]
+    best = ""
+    for c in candidates:
+        s = str(c or "")
+        if len(_WS_RE.sub(" ", s).strip()) > len(_WS_RE.sub(" ", best).strip()):
+            best = s
+    return best
 
 
-def user_message_fp(user_id: int, text: str) -> Optional[str]:
-    base = message_content_fingerprint(text)
-    if not base:
-        return None
-    return f"u{int(user_id or 0)}|{base}"
-
-
-def user_listing_fp(user_id: int, row: Dict[str, Any]) -> Optional[str]:
-    base = listing_content_fingerprint(row)
-    if not base:
-        return None
-    return f"u{int(user_id or 0)}|{base}"
+def bodies_are_same(a: str, b: str) -> bool:
+    """Exact body match, or near-identical (title prefix / punct variant)."""
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    short, long = (a, b) if len(a) <= len(b) else (b, a)
+    if len(short) >= 32 and len(short) / len(long) >= 0.72 and short in long:
+        return True
+    return False
 
 
 def short_key(s: str) -> str:
@@ -148,7 +146,6 @@ def connect():
     if not url:
         print("DATABASE_URL missing", file=sys.stderr)
         sys.exit(1)
-    # Local / Contabo Postgres usually no SSL; Neon/cloud may need it
     kwargs: Dict[str, Any] = {"dsn": url}
     if "localhost" in url or "127.0.0.1" in url or "194.233." in url:
         kwargs["sslmode"] = "prefer"
@@ -195,15 +192,43 @@ def insert_trash(
     )
 
 
-# --- find duplicates ---
+def _find_body_losers(
+    rows: List[Dict[str, Any]],
+    *,
+    id_field: str,
+    user_field: str,
+    body_fn,
+    reason: str,
+) -> List[Tuple[Dict[str, Any], int, str]]:
+    """
+    Group by SAME BODY text per user (never by id).
+    Keep newest id; mark older same-body rows as losers.
+    """
+    kept_by_user: Dict[int, List[Tuple[str, int]]] = {}
+    losers: List[Tuple[Dict[str, Any], int, str]] = []
+
+    for r in rows:
+        uid = int(r.get(user_field) or 0)
+        body = body_fn(r)
+        if not body:
+            continue
+        bucket = kept_by_user.setdefault(uid, [])
+        matched_kept: Optional[int] = None
+        for seen_body, kept_id in bucket:
+            if bodies_are_same(seen_body, body):
+                matched_kept = kept_id
+                break
+        if matched_kept is not None:
+            losers.append((r, matched_kept, f"{reason}:{short_key(body)}"))
+        else:
+            bucket.append((body, int(r[id_field])))
+    return losers
+
 
 def find_message_body_dups(
     cur, user_id: Optional[int]
 ) -> List[Tuple[Dict[str, Any], int, str]]:
-    """
-    Returns list of (loser_row, kept_id, dup_key).
-    Keep highest id per user+body fingerprint.
-    """
+    """Same WhatsApp message BODY per user → keep newest message id."""
     params: List[Any] = []
     filt = ""
     if user_id is not None:
@@ -223,26 +248,21 @@ def find_message_body_dups(
     cols = [d[0] for d in cur.description]
     rows = [dict(zip(cols, r)) for r in cur.fetchall()]
 
-    keep: Dict[str, int] = {}
-    losers: List[Tuple[Dict[str, Any], int, str]] = []
-    for r in rows:
-        fp = r.get("content_fingerprint") or user_message_fp(r["user_id"], r.get("message") or "")
-        if not fp:
-            continue
-        key = short_key(fp)
-        if fp in keep:
-            losers.append((r, keep[fp], f"message_body:{key}"))
-        else:
-            keep[fp] = r["id"]
-    return losers
+    return _find_body_losers(
+        rows,
+        id_field="id",
+        user_field="user_id",
+        body_fn=lambda r: body_dedupe_key(r.get("message") or ""),
+        reason="same_message_body",
+    )
 
 
-def find_listing_content_dups(
+def find_listing_body_dups(
     cur, user_id: Optional[int]
 ) -> List[Tuple[Dict[str, Any], int, str]]:
     """
-    Duplicate property cards (normalized_messages) by listing fingerprint.
-    Keep highest n.id.
+    Same property CARD BODY per user → keep newest listing id.
+    Uses raw WhatsApp text (longest of message/excerpt/summary) — NOT row id.
     """
     params: List[Any] = []
     filt = ""
@@ -268,18 +288,13 @@ def find_listing_content_dups(
     cols = [d[0] for d in cur.description]
     rows = [dict(zip(cols, r)) for r in cur.fetchall()]
 
-    keep: Dict[str, int] = {}
-    losers: List[Tuple[Dict[str, Any], int, str]] = []
-    for r in rows:
-        fp = r.get("content_fingerprint") or user_listing_fp(r["user_id"], r)
-        if not fp:
-            continue
-        key = short_key(fp)
-        if fp in keep:
-            losers.append((r, keep[fp], f"listing_content:{key}"))
-        else:
-            keep[fp] = r["id"]
-    return losers
+    return _find_body_losers(
+        rows,
+        id_field="id",
+        user_field="user_id",
+        body_fn=lambda r: body_dedupe_key(pick_listing_body_text(r)),
+        reason="same_listing_body",
+    )
 
 
 def print_stats(cur) -> None:
@@ -295,10 +310,25 @@ def print_stats(cur) -> None:
     rows = cur.fetchall()
     cur.execute("SELECT COUNT(*)::int FROM trash")
     total = cur.fetchone()[0]
-    print(json.dumps({"trash_total": total, "by_reason": [
-        {"source_table": a, "dup_reason": b, "count": c, "first_at": str(d), "last_at": str(e)}
-        for a, b, c, d, e in rows
-    ]}, indent=2, default=str))
+    print(
+        json.dumps(
+            {
+                "trash_total": total,
+                "by_reason": [
+                    {
+                        "source_table": a,
+                        "dup_reason": b,
+                        "count": c,
+                        "first_at": str(d),
+                        "last_at": str(e),
+                    }
+                    for a, b, c, d, e in rows
+                ],
+            },
+            indent=2,
+            default=str,
+        )
+    )
 
 
 def apply_purge(
@@ -315,7 +345,7 @@ def apply_purge(
     conn.commit()
 
     msg_losers = find_message_body_dups(cur, user_id)
-    listing_losers = find_listing_content_dups(cur, user_id)
+    listing_losers = find_listing_body_dups(cur, user_id)
 
     if limit is not None:
         msg_losers = msg_losers[:limit]
@@ -325,32 +355,32 @@ def apply_purge(
         "run_id": run_id,
         "started_at": started,
         "apply": apply,
+        "mode": "same_body_only",
         "user_id": user_id,
-        "message_body_dups_found": len(msg_losers),
-        "listing_content_dups_found": len(listing_losers),
+        "same_message_body_dups": len(msg_losers),
+        "same_listing_body_dups": len(listing_losers),
         "trashed_messages": 0,
         "trashed_listings": 0,
         "deleted_messages": 0,
         "deleted_listings": 0,
         "samples": {
-            "messages": [
+            "same_message_body": [
                 {
-                    "id": r["id"],
+                    "loser_id": r["id"],
                     "kept_id": kept,
                     "user_id": r.get("user_id"),
-                    "preview": str(r.get("message") or "")[:100].replace("\n", " "),
+                    "body_preview": str(r.get("message") or "")[:120].replace("\n", " "),
                 }
                 for r, kept, _ in msg_losers[:5]
             ],
-            "listings": [
+            "same_listing_body": [
                 {
-                    "id": r["id"],
+                    "loser_id": r["id"],
                     "kept_id": kept,
                     "user_id": r.get("user_id"),
-                    "area": r.get("area"),
-                    "preview": str(r.get("raw_message") or r.get("summary") or "")[:100].replace(
-                        "\n", " "
-                    ),
+                    "body_preview": str(
+                        pick_listing_body_text(r) or r.get("summary") or ""
+                    )[:120].replace("\n", " "),
                 }
                 for r, kept, _ in listing_losers[:5]
             ],
@@ -359,10 +389,10 @@ def apply_purge(
 
     if not apply:
         print(json.dumps(summary, indent=2, default=str))
-        print("DRY_RUN — pass --apply to trash + delete")
+        print("DRY_RUN — pass --apply to trash + delete same-body duplicates")
         return summary
 
-    # 1) Listings first (depend on messages)
+    # 1) Same-body listing cards first
     for r, kept_id, dup_key in listing_losers:
         insert_trash(
             cur,
@@ -370,7 +400,7 @@ def apply_purge(
             "normalized_messages",
             r["id"],
             r.get("user_id"),
-            "listing_content",
+            "same_listing_body",
             dup_key,
             kept_id,
             r,
@@ -380,7 +410,6 @@ def apply_purge(
     listing_ids = [r["id"] for r, _, _ in listing_losers]
     for i in range(0, len(listing_ids), 500):
         batch = listing_ids[i : i + 500]
-        # Drop private fav/comments pointing at doomed cards
         cur.execute(
             "DELETE FROM property_favourites WHERE property_id = ANY(%s::int[])",
             (batch,),
@@ -395,7 +424,7 @@ def apply_purge(
         )
         summary["deleted_listings"] += cur.rowcount or 0
 
-    # 2) Messages — only delete if no remaining normalized rows reference them
+    # 2) Same-body WhatsApp messages
     for r, kept_id, dup_key in msg_losers:
         insert_trash(
             cur,
@@ -403,7 +432,7 @@ def apply_purge(
             "whatsapp_messages",
             r["id"],
             r.get("user_id"),
-            "message_body",
+            "same_message_body",
             dup_key,
             kept_id,
             r,
@@ -413,7 +442,6 @@ def apply_purge(
     msg_ids = [r["id"] for r, _, _ in msg_losers]
     for i in range(0, len(msg_ids), 500):
         batch = msg_ids[i : i + 500]
-        # Trash + delete any leftover normalized children of these messages
         cur.execute(
             """
             SELECT n.id, n.whatsapp_message_id, n.listing_index, n.is_property, n.purpose,
@@ -436,7 +464,7 @@ def apply_purge(
                 "normalized_messages",
                 child["id"],
                 child.get("user_id"),
-                "orphan_of_dup_message",
+                "orphan_of_same_body_message",
                 f"parent_msg:{child['whatsapp_message_id']}",
                 None,
                 child,
@@ -472,8 +500,14 @@ def apply_purge(
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Purge duplicate messages/listings into trash")
-    ap.add_argument("--apply", action="store_true", help="Actually trash + delete (default is dry-run)")
+    ap = argparse.ArgumentParser(
+        description="Purge SAME-BODY duplicate messages/listings into trash (not same-id)"
+    )
+    ap.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually trash + delete same-body dups (default is dry-run)",
+    )
     ap.add_argument("--user-id", type=int, default=None, help="Limit to one user_id")
     ap.add_argument("--limit", type=int, default=None, help="Max losers per category (debug)")
     ap.add_argument("--stats", action="store_true", help="Print trash table stats only")

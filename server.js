@@ -2452,7 +2452,7 @@ const runPropertySearch = async (req) => {
              COALESCE(NULLIF(TRIM(n.contact_number), ''), NULLIF(TRIM(m.sender_phone), '')) AS contact_number,
              n.summary, n.property_status, n.created_at, n.category, n.intent, n.sentiment,
              n.listing_index, n.listing_excerpt, n.place_tags,
-             COALESCE(NULLIF(TRIM(n.listing_excerpt), ''), m.message) AS raw_message,
+             m.message AS raw_message,
              m.timestamp AS message_timestamp, m.from_me, m.user_id,
              m.seq_in_chat, m.seq_in_chat AS "seqInChat"
       ${whereSql}
