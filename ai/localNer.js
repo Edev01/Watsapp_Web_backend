@@ -55,7 +55,7 @@ const SUBTYPE_PATTERNS = [
 ];
 
 const SIZE_RE =
-  /(\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)(?:\s*\+\s*(\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?))?\s*(yard|yrd|yards|sq\.?\s*yds?|sq\.?\s*yards?|marla|kanal|sq\.?\s*ft|sq\.?\s*feet)\b/i;
+  /(\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)(?:\s*(?:\+|\&|and)\s*(\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?))?\s*[*]*\s*(yard|yrd|yards|sq\.?\s*yds?|sq\.?\s*yards?|marla|kanal|sq\.?\s*ft|sq\.?\s*feet|sqfeet|sq\.?ft)\b/i;
 
 const PRICE_UNIT_RE =
   /(\d+(?:\.\d+)?)\s*(crores?|cror|crs?|lakhs?|lacs?|lac)\b/i;
@@ -233,12 +233,19 @@ function findSize(text) {
   const b = m[2] ? parseFloat(String(m[2]).replace(/,/g, '')) : 0;
   const value = a + (Number.isFinite(b) ? b : 0);
   const rawUnit = String(m[3] || '').toLowerCase();
+  // Prefer Sq. Ft. — convert Marla (1 = 225 Sq. Ft.); keep yards/kanal as stated
   let unit = 'Sq. Yd.';
-  if (/marla/.test(rawUnit)) unit = 'Marla';
-  else if (/kanal/.test(rawUnit)) unit = 'Kanal';
-  else if (/ft|feet/.test(rawUnit)) unit = 'Sq. Ft.';
-  const size = `${value} ${unit}`;
-  return { size, size_value: value, size_unit: unit };
+  let outValue = value;
+  if (/marla/.test(rawUnit)) {
+    unit = 'Sq. Ft.';
+    outValue = value * 225;
+  } else if (/kanal/.test(rawUnit)) {
+    unit = 'Kanal';
+  } else if (/ft|feet/.test(rawUnit)) {
+    unit = 'Sq. Ft.';
+  }
+  const size = `${outValue} ${unit}`;
+  return { size, size_value: outValue, size_unit: unit };
 }
 
 function findPurpose(text) {

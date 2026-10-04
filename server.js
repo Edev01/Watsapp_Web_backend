@@ -11,7 +11,11 @@ const { filterAndSortProperties, PROPERTY_STATUSES, normalizePropertyStatus, isV
 const { userMessageFingerprint } = require('./contentFingerprint');
 const { setExtraLocalities, correctLocalityTypos, canonicalizePlaceText, normalizePlaceKey, isKhayabanFamilyToken } = require('./pakistanLocalities');
 const { parseSmartLocationQuery, buildSmartLocationSql, scoreLocationMatch, textHasPhase, textHasStreet } = require('./smartLocationSearch');
-const { classifyLocationQuery, norm: placeNorm } = require('./ai/placeRegions');
+const {
+  classifyLocationQuery,
+  norm: placeNorm,
+  isDhaPhaseParent
+} = require('./ai/placeRegions');
 const { ensurePlaceRegionsSeeded } = require('./ai/placeResolver');
 const { isWeakLocation } = require('./ai/cascadeMerge');
 const { extractUserId } = require('./userMiddleware');
@@ -2182,13 +2186,20 @@ function buildPropertySearchWhere(filters, userId) {
     parsedLocation = parseSmartLocationQuery(location);
     regionClass = classifyLocationQuery(location);
 
-    // Parent region (Malir / Airport): expand mustGroups to all children
+    // Parent region (Malir / Airport / DHA Phase N): expand to all children
     if (regionClass.mode === 'parent' && regionClass.terms.length) {
       parsedLocation.mustGroups = [regionClass.terms];
       parsedLocation.regionMode = 'parent';
       parsedLocation.regionTerms = regionClass.terms;
       parsedLocation.placeOnlyGroups = [];
       parsedLocation.searchRegexes = [];
+      // Phase parents expand via local JSON children (ittehad, bukhari, …).
+      // Clear phaseNumber so SQL does not AND-require the literal "phase N"
+      // (a Phase 5 listing that only says "Ittehad" must still match).
+      if (isDhaPhaseParent(regionClass.parentKey)) {
+        parsedLocation.phaseNumber = null;
+        parsedLocation.expandedPhaseParent = regionClass.parentKey;
+      }
     } else if (regionClass.mode === 'exact' && regionClass.terms.length) {
       // Exact locality: constrain to that place (+ spellings) only
       parsedLocation.mustGroups = [regionClass.terms];
@@ -2304,7 +2315,9 @@ function listingMatchesRegionTerms(row, terms) {
       return true;
     }
 
-    // Structured-only / tag-only without message support = often NER pollution
+    // Curated gazetteer hits (place fields / place_tags) count for expand search
+    if (inFields || inTags) return true;
+
     return false;
   });
 }
@@ -2354,7 +2367,7 @@ function resolveSearchFilters(req) {
       queryFilters.areaUnit ||
       rawFilters.area_unit ||
       queryFilters.area_unit ||
-      'Marla',
+      'Sq. Ft.',
     areaMin: rawFilters.areaMin ?? queryFilters.areaMin ?? '',
     areaMax: rawFilters.areaMax ?? queryFilters.areaMax ?? '',
     status:
@@ -2448,7 +2461,7 @@ const runPropertySearch = async (req) => {
   let queryText = `
     SELECT * FROM (
       SELECT n.id, n.whatsapp_message_id, n.chat_jid, n.purpose, n.city, n.area, n.vicinity,
-             n.property_type, n.property_sub_type, n.size, n.price,
+             n.property_type, n.property_sub_type, n.size, n.size_value, n.size_unit, n.price,
              COALESCE(NULLIF(TRIM(n.contact_number), ''), NULLIF(TRIM(m.sender_phone), '')) AS contact_number,
              n.summary, n.property_status, n.created_at, n.category, n.intent, n.sentiment,
              n.listing_index, n.listing_excerpt, n.place_tags,
@@ -2473,6 +2486,21 @@ const runPropertySearch = async (req) => {
     // 100% relevancy: parent/exact region terms must appear in place fields/tags/message
     if (regionClass && regionClass.terms && regionClass.terms.length && regionClass.mode !== 'none') {
       rows = rows.filter((r) => listingMatchesRegionTerms(r, regionClass.terms));
+    }
+
+    // Bahria guard for expanded DHA phase parents (phaseNumber cleared for child OR)
+    if (parsedLocation && parsedLocation.expandedPhaseParent) {
+      const qLow = String(parsedLocation.rawQuery || filters.location || '').toLowerCase();
+      const queryMentionsBahria = /\bbahria\b/.test(qLow);
+      if (!queryMentionsBahria) {
+        rows = rows.filter((r) => {
+          const place = `${r.area || ''} ${r.vicinity || ''} ${r.city || ''}`.toLowerCase();
+          if (/\bbahria\b/.test(place) && !/\b(dha|defence|defense)\b/.test(place)) {
+            return false;
+          }
+          return true;
+        });
+      }
     }
 
     if (parsedLocation && parsedLocation.phaseNumber != null) {
@@ -2537,12 +2565,18 @@ const runPropertySearch = async (req) => {
 
     const properties = deduped.slice(offset, offset + limit);
 
+    // Price/area filters run in JS — SQL COUNT would over-report; use post-filter pool size
+    const hasJsRangeFilters = ['priceMin', 'priceMax', 'areaMin', 'areaMax'].some(
+      (k) => filters[k] !== undefined && filters[k] !== null && String(filters[k]).trim() !== ''
+    );
+    const effectiveTotal = hasJsRangeFilters ? deduped.length : totalMatched;
+
     return {
       filters,
       userId,
       limit,
       offset,
-      totalMatched,
+      totalMatched: effectiveTotal,
       // Unique cards in the fetched/deduped pool (better UX than raw SQL dups)
       uniqueInPool: deduped.length,
       totalReturned: properties.length,

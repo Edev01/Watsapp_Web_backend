@@ -3,6 +3,7 @@ const { getConfig } = require('./config');
 const { LLMClient, expandListingSchemas } = require('./llmClient');
 const { GeminiClient } = require('./geminiClient');
 const { fillGapsOnly, scrubWeakLocations } = require('./cascadeMerge');
+const { enrichSchemaWithLocalDhaPhase } = require('./placeRegions');
 const { refineWithGeocode } = require('./geocodeClient');
 const { schedulePlaceResolve } = require('./placeResolver');
 const { splitPropertyOffers, extractSharedContacts, normalizePkMobile } = require('./listingSplitter');
@@ -433,6 +434,14 @@ async function cascadeNormalizeText(text, sender, llmClient, qwenModel, geminiCl
     } catch (err) {
       stages.push(`geocode:err:${String(err.message || err).slice(0, 40)}`);
     }
+  }
+
+  // 5) Local DHA commercial → correct phase (Rahat = Phase 6, not OSM/LLM Phase 5)
+  if (schema) {
+    const before = `${schema.area || ''}|${schema.vicinity || ''}|${schema.city || ''}`;
+    schema = enrichSchemaWithLocalDhaPhase(schema, text);
+    const after = `${schema.area || ''}|${schema.vicinity || ''}|${schema.city || ''}`;
+    if (before !== after) stages.push('dha-phase:enriched');
   }
 
   return { schema, stages, rateLimited: false };

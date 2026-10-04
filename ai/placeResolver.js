@@ -8,6 +8,7 @@ const db = require('../db');
 const {
   tagsFromPlaceFields,
   seedRows,
+  enrichSchemaWithLocalDhaPhase,
   norm
 } = require('./placeRegions');
 
@@ -31,9 +32,9 @@ async function ensurePlaceRegionsSeeded() {
          VALUES ($1, $2::text[], $3::text[], $4, NOW())
          ON CONFLICT (parent_key) DO UPDATE SET
            aliases = EXCLUDED.aliases,
-           children = (
-             SELECT ARRAY(SELECT DISTINCT UNNEST(place_regions.children || EXCLUDED.children))
-           ),
+           -- Replace children (do not merge) so gazetteer corrections stick
+           children = EXCLUDED.children,
+           source = EXCLUDED.source,
            updated_at = NOW()`,
         [row.parent_key, row.aliases, row.children, row.source]
       );
@@ -129,10 +130,16 @@ async function resolveAndSavePlaceTags(row) {
     }
   }
 
+  // Correct DHA commercial→phase (e.g. Rahat → Phase 6) on stored fields
+  const enriched = enrichSchemaWithLocalDhaPhase(
+    { area: row.area, vicinity: row.vicinity, city: row.city },
+    row.raw_message || row.listing_excerpt || row.summary || ''
+  );
+
   const tags = tagsFromPlaceFields({
-    area: row.area,
-    vicinity: row.vicinity,
-    city: row.city,
+    area: enriched.area,
+    vicinity: enriched.vicinity,
+    city: enriched.city,
     extra
   });
 
@@ -141,14 +148,25 @@ async function resolveAndSavePlaceTags(row) {
   await db.query(
     `UPDATE normalized_messages
      SET place_tags = $2::text[],
+         area = COALESCE(NULLIF(TRIM($5), ''), area),
+         vicinity = COALESCE(NULLIF(TRIM($6), ''), vicinity),
+         city = COALESCE(NULLIF(TRIM($7), ''), city),
          geo_lat = COALESCE($3, geo_lat),
          geo_lng = COALESCE($4, geo_lng),
          place_resolved_at = NOW()
      WHERE id = $1`,
-    [row.id, tags, lat, lng]
+    [
+      row.id,
+      tags,
+      lat,
+      lng,
+      enriched.area || null,
+      enriched.vicinity || null,
+      enriched.city || null
+    ]
   );
 
-  return { id: row.id, tags, lat, lng };
+  return { id: row.id, tags, lat, lng, area: enriched.area, vicinity: enriched.vicinity };
 }
 
 /**

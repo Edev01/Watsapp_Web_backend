@@ -318,47 +318,91 @@ function parsePriceInPKR(priceStr, rawMsg) {
 }
 
 /**
- * Converts size strings (e.g. "2 Kanal", "5 Marla", "120 Sq Yd", "450 Sq Ft") to target area unit.
- * Standard Pakistani land units:
+ * Pakistani land units:
  * 1 Kanal = 20 Marla
  * 1 Marla = 25 Sq. Yd (Yards) = 225 Sq. Ft (Feet)
  */
-function parseAreaInUnit(sizeStr, rawMsg, targetUnit = 'Marla') {
-  const sourceStr = sizeStr || '';
-  if (!sourceStr && !rawMsg) return null;
-  const str = String(sourceStr || rawMsg).toLowerCase().replace(/,/g, '').trim();
+function areaUnitToMarla(value, unit) {
+  const v = parseFloat(value);
+  if (!Number.isFinite(v)) return null;
+  const u = String(unit || 'Sq. Ft.').toLowerCase().trim();
+  if (u.includes('kanal')) return v * 20;
+  if (u.includes('marla')) return v;
+  if (u.includes('yd') || u.includes('yard')) return v / 25;
+  if (u.includes('m.') || (u.includes('meter') && !u.includes('ft'))) return (v * 10.7639) / 225;
+  return v / 225; // Sq. Ft. / feet / default
+}
 
-  let marlaVal = null;
-
-  let kanalMatch = str.match(/(\d+(?:\.\d+)?)\s*kanal/i);
-  if (kanalMatch) {
-    marlaVal = parseFloat(kanalMatch[1]) * 20;
-  } else {
-    let marlaMatch = str.match(/(\d+(?:\.\d+)?)\s*marla/i);
-    if (marlaMatch) {
-      marlaVal = parseFloat(marlaMatch[1]);
-    } else {
-      let ydMatch = str.match(/(\d+(?:\.\d+)?)\s*(?:sq\.?\s*yd|sq\.?\s*yard|yard|yards|yrd|yd)/i);
-      if (ydMatch) {
-        marlaVal = parseFloat(ydMatch[1]) / 25;
-      } else {
-        let ftMatch = str.match(/(\d+(?:\.\d+)?)\s*(?:sq\.?\s*ft|sq\.?\s*feet|ft|feet)/i);
-        if (ftMatch) {
-          marlaVal = parseFloat(ftMatch[1]) / 225;
-        }
-      }
-    }
-  }
-
-  if (marlaVal === null) return null;
-
-  const tu = (targetUnit || 'Marla').toLowerCase().trim();
+function marlaToAreaUnit(marlaVal, targetUnit) {
+  if (marlaVal == null || !Number.isFinite(marlaVal)) return null;
+  const tu = String(targetUnit || 'Sq. Ft.').toLowerCase().trim();
   if (tu.includes('kanal')) return marlaVal / 20;
   if (tu.includes('marla')) return marlaVal;
   if (tu.includes('yd') || tu.includes('yard')) return marlaVal * 25;
-  if (tu.includes('ft') || tu.includes('feet')) return marlaVal * 225;
+  return marlaVal * 225; // Sq. Ft. default
+}
 
-  return marlaVal;
+function convertAreaValue(value, fromUnit, toUnit) {
+  return marlaToAreaUnit(areaUnitToMarla(value, fromUnit), toUnit);
+}
+
+function parseAreaFromText(str) {
+  const text = String(str || '').toLowerCase().replace(/,/g, '').trim();
+  if (!text) return null;
+
+  const kanalMatch = text.match(/(\d+(?:\.\d+)?)\s*kanal/i);
+  if (kanalMatch) return { value: parseFloat(kanalMatch[1]), unit: 'Kanal' };
+
+  const marlaMatch = text.match(/(\d+(?:\.\d+)?)\s*marla/i);
+  if (marlaMatch) return { value: parseFloat(marlaMatch[1]), unit: 'Marla' };
+
+  const ydMatch = text.match(/(\d+(?:\.\d+)?)\s*(?:sq\.?\s*yd|sq\.?\s*yard|yard|yards|yrd|yd)\b/i);
+  if (ydMatch) return { value: parseFloat(ydMatch[1]), unit: 'Sq. Yd.' };
+
+  const ftMatch = text.match(/(\d+(?:\.\d+)?)\s*(?:sq\.?\s*ft|sq\.?\s*feet|ft|feet)\b/i);
+  if (ftMatch) return { value: parseFloat(ftMatch[1]), unit: 'Sq. Ft.' };
+
+  return null;
+}
+
+/**
+ * Converts size (string / size_value+size_unit / raw message) into target area unit.
+ * Prefers structured size_value + size_unit when present.
+ */
+function parseAreaInUnit(sizeStr, rawMsg, targetUnit = 'Sq. Ft.', sizeValue = null, sizeUnit = null) {
+  const target = targetUnit || 'Sq. Ft.';
+
+  // 1) Structured DB fields (most reliable for advanced search)
+  if (sizeValue !== undefined && sizeValue !== null && String(sizeValue).trim() !== '') {
+    const n = parseFloat(sizeValue);
+    if (Number.isFinite(n)) {
+      const fromUnit =
+        (sizeUnit && String(sizeUnit).trim()) ||
+        parseAreaFromText(sizeStr)?.unit ||
+        'Sq. Ft.';
+      const converted = convertAreaValue(n, fromUnit, target);
+      if (converted != null) return converted;
+    }
+  }
+
+  // 2) Size text with unit ("500 Sq. Yd.", "5 Marla", …)
+  const fromSize = parseAreaFromText(sizeStr);
+  if (fromSize) return convertAreaValue(fromSize.value, fromSize.unit, target);
+
+  // 3) Bare numeric size + size_unit column ("2250" + "Sq. Ft.")
+  const bare = String(sizeStr || '')
+    .trim()
+    .match(/^(\d+(?:\.\d+)?)$/);
+  if (bare && sizeUnit && String(sizeUnit).trim()) {
+    const converted = convertAreaValue(parseFloat(bare[1]), sizeUnit, target);
+    if (converted != null) return converted;
+  }
+
+  // 4) Fall back to raw WhatsApp message
+  const fromRaw = parseAreaFromText(rawMsg);
+  if (fromRaw) return convertAreaValue(fromRaw.value, fromRaw.unit, target);
+
+  return null;
 }
 
 /**
@@ -513,11 +557,19 @@ function isListingNoise(item) {
 }
 
 function filterAndSortProperties(rawRows, filters = {}) {
-  const targetUnit = filters.areaUnit || 'Marla';
+  const targetUnit = filters.areaUnit || 'Sq. Ft.';
+  // Tiny tolerance so exact min=max still matches float conversions (e.g. marla→ft)
+  const AREA_EPS = 0.05;
 
   let items = rawRows.map(r => {
     const parsedPrice = parsePriceInPKR(r.price, r.raw_message);
-    const parsedArea = parseAreaInUnit(r.size, r.raw_message, targetUnit);
+    const parsedArea = parseAreaInUnit(
+      r.size,
+      r.raw_message,
+      targetUnit,
+      r.size_value ?? r.sizeValue ?? null,
+      r.size_unit ?? r.sizeUnit ?? null
+    );
 
     return {
       id: r.id,
@@ -536,6 +588,8 @@ function filterAndSortProperties(rawRows, filters = {}) {
       propertyType: r.property_type,
       propertySubType: r.property_sub_type || null,
       size: r.size,
+      size_value: r.size_value ?? r.sizeValue ?? null,
+      size_unit: r.size_unit ?? r.sizeUnit ?? null,
       parsedPricePKR: parsedPrice,
       parsedAreaInTargetUnit: parsedArea,
       targetAreaUnit: targetUnit,
@@ -575,19 +629,28 @@ function filterAndSortProperties(rawRows, filters = {}) {
     }
   }
 
-  // Area Min Filter
-  if (filters.areaMin !== undefined && filters.areaMin !== null && String(filters.areaMin).trim() !== '') {
-    const minA = parseFloat(filters.areaMin);
-    if (!isNaN(minA)) {
-      items = items.filter(r => r.parsedAreaInTargetUnit !== null && r.parsedAreaInTargetUnit >= minA);
-    }
-  }
+  // Area range (min=max → exact match within tiny epsilon)
+  const hasAreaMin = filters.areaMin !== undefined && filters.areaMin !== null && String(filters.areaMin).trim() !== '';
+  const hasAreaMax = filters.areaMax !== undefined && filters.areaMax !== null && String(filters.areaMax).trim() !== '';
+  const minA = hasAreaMin ? parseFloat(filters.areaMin) : NaN;
+  const maxA = hasAreaMax ? parseFloat(filters.areaMax) : NaN;
 
-  // Area Max Filter
-  if (filters.areaMax !== undefined && filters.areaMax !== null && String(filters.areaMax).trim() !== '') {
-    const maxA = parseFloat(filters.areaMax);
-    if (!isNaN(maxA)) {
-      items = items.filter(r => r.parsedAreaInTargetUnit !== null && r.parsedAreaInTargetUnit <= maxA);
+  if (hasAreaMin && hasAreaMax && !isNaN(minA) && !isNaN(maxA) && minA === maxA) {
+    items = items.filter(
+      (r) =>
+        r.parsedAreaInTargetUnit !== null &&
+        Math.abs(r.parsedAreaInTargetUnit - minA) <= AREA_EPS
+    );
+  } else {
+    if (hasAreaMin && !isNaN(minA)) {
+      items = items.filter(
+        (r) => r.parsedAreaInTargetUnit !== null && r.parsedAreaInTargetUnit + AREA_EPS >= minA
+      );
+    }
+    if (hasAreaMax && !isNaN(maxA)) {
+      items = items.filter(
+        (r) => r.parsedAreaInTargetUnit !== null && r.parsedAreaInTargetUnit - AREA_EPS <= maxA
+      );
     }
   }
 

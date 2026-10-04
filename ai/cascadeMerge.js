@@ -81,12 +81,20 @@ function isWeakLocation(value) {
   return false;
 }
 
+function normalizeCityLabel(city) {
+  const c = String(city || '').trim();
+  if (!c) return c;
+  if (/کراچی\s*ڈویژن/i.test(c) || /karachi\s*division/i.test(c)) return 'Karachi';
+  return c;
+}
+
 function scrubWeakLocations(schema) {
   if (!schema || typeof schema !== 'object') return schema;
   const out = { ...schema };
   for (const key of LOCATION_FIELDS) {
     if (isWeakLocation(out[key])) out[key] = null;
   }
+  if (out.city) out.city = normalizeCityLabel(out.city);
   if (Array.isArray(out.listings)) {
     out.listings = out.listings.map((item) => {
       if (!item || typeof item !== 'object') return item;
@@ -94,6 +102,7 @@ function scrubWeakLocations(schema) {
       for (const key of LOCATION_FIELDS) {
         if (isWeakLocation(row[key])) row[key] = null;
       }
+      if (row.city) row.city = normalizeCityLabel(row.city);
       return row;
     });
   }
