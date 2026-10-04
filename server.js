@@ -3537,6 +3537,58 @@ app.patch('/api/properties/:propertyId/comments/:commentId', authenticateToken, 
 });
 
 /**
+ * DELETE /api/properties/:propertyId/comments/:commentId
+ * Remove the user's private note.
+ */
+app.delete('/api/properties/:propertyId/comments/:commentId', authenticateToken, async (req, res) => {
+  try {
+    const userId = resolveAuthUserId(req);
+    if (!userId) {
+      return sendResponse(res, 401, true, null, 'Login required');
+    }
+    const propertyId = resolvePropertyIdFromRequest(req);
+    const commentId = Number(req.params.commentId);
+    if (!propertyId || !commentId || Number.isNaN(commentId)) {
+      return sendResponse(res, 400, true, null, 'propertyId and commentId are required');
+    }
+
+    const deleted = await db.query(
+      `DELETE FROM property_comments
+       WHERE id = $1 AND user_id = $2 AND property_id = $3
+       RETURNING id, property_id`,
+      [commentId, userId, propertyId]
+    );
+
+    if (!deleted.rows[0]) {
+      return sendResponse(res, 404, true, null, 'Comment not found');
+    }
+
+    // Clear any leftover duplicates for this user/property
+    await db.query(
+      `DELETE FROM property_comments
+       WHERE user_id = $1 AND property_id = $2`,
+      [userId, propertyId]
+    );
+
+    return sendResponse(
+      res,
+      200,
+      false,
+      {
+        propertyId,
+        property_id: propertyId,
+        commentId: deleted.rows[0].id,
+        deleted: true
+      },
+      'Comment deleted'
+    );
+  } catch (err) {
+    console.error('Delete property comment error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
+/**
  * GET /api/properties/:propertyId/comments
  * Own private comments only (at most one note per user/property).
  */
