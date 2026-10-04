@@ -2690,7 +2690,7 @@ async function loadUserPropertyMeta(userId, propertyIds) {
       `SELECT id, property_id, comment, created_at, updated_at
        FROM property_comments
        WHERE user_id = $1 AND property_id = ANY($2::int[])
-       ORDER BY created_at ASC, id ASC`,
+       ORDER BY updated_at ASC NULLS FIRST, created_at ASC, id ASC`,
       [userId, ids]
     ),
     db.query(
@@ -2704,8 +2704,8 @@ async function loadUserPropertyMeta(userId, propertyIds) {
   const commentsByProperty = new Map();
   for (const row of commentsRes.rows) {
     const key = Number(row.property_id);
-    if (!commentsByProperty.has(key)) commentsByProperty.set(key, []);
-    commentsByProperty.get(key).push(mapPropertyCommentRow(row));
+    // One private note per user/property (latest wins; rows ordered ASC)
+    commentsByProperty.set(key, [mapPropertyCommentRow(row)]);
   }
 
   return {
@@ -3407,7 +3407,7 @@ app.delete('/api/favourites/:propertyId', authenticateToken, async (req, res) =>
 /**
  * POST /api/properties/:propertyId/comments
  * Body: { comment: "agent quoted 2.1 crore last deal" }
- * Private to the logged-in user only.
+ * Private to the logged-in user only — one note per user/property (upsert).
  */
 app.post('/api/properties/:propertyId/comments', authenticateToken, async (req, res) => {
   try {
@@ -3435,19 +3435,49 @@ app.post('/api/properties/:propertyId/comments', authenticateToken, async (req, 
       return sendResponse(res, 404, true, null, 'Property not found');
     }
 
-    const inserted = await db.query(
-      `INSERT INTO property_comments (user_id, property_id, comment)
-       VALUES ($1, $2, $3)
-       RETURNING id, user_id, property_id, comment, created_at, updated_at`,
-      [userId, propertyId, comment]
+    const existing = await db.query(
+      `SELECT id
+       FROM property_comments
+       WHERE user_id = $1 AND property_id = $2
+       ORDER BY updated_at DESC NULLS LAST, created_at DESC, id DESC
+       LIMIT 1`,
+      [userId, propertyId]
     );
+
+    let row;
+    let created = false;
+    if (existing.rows[0]?.id) {
+      const keepId = existing.rows[0].id;
+      const updated = await db.query(
+        `UPDATE property_comments
+         SET comment = $3, updated_at = CURRENT_TIMESTAMP
+         WHERE id = $1 AND user_id = $2
+         RETURNING id, user_id, property_id, comment, created_at, updated_at`,
+        [keepId, userId, comment]
+      );
+      row = updated.rows[0];
+      await db.query(
+        `DELETE FROM property_comments
+         WHERE user_id = $1 AND property_id = $2 AND id <> $3`,
+        [userId, propertyId, keepId]
+      );
+    } else {
+      const inserted = await db.query(
+        `INSERT INTO property_comments (user_id, property_id, comment)
+         VALUES ($1, $2, $3)
+         RETURNING id, user_id, property_id, comment, created_at, updated_at`,
+        [userId, propertyId, comment]
+      );
+      row = inserted.rows[0];
+      created = true;
+    }
 
     return sendResponse(
       res,
-      201,
+      created ? 201 : 200,
       false,
-      mapPropertyCommentRow(inserted.rows[0]),
-      'Comment added'
+      mapPropertyCommentRow(row),
+      created ? 'Comment added' : 'Comment updated'
     );
   } catch (err) {
     console.error('Add property comment error:', err);
@@ -3456,8 +3486,59 @@ app.post('/api/properties/:propertyId/comments', authenticateToken, async (req, 
 });
 
 /**
+ * PATCH /api/properties/:propertyId/comments/:commentId
+ * Update the user's single private note.
+ */
+app.patch('/api/properties/:propertyId/comments/:commentId', authenticateToken, async (req, res) => {
+  try {
+    const userId = resolveAuthUserId(req);
+    if (!userId) {
+      return sendResponse(res, 401, true, null, 'Login required');
+    }
+    const propertyId = resolvePropertyIdFromRequest(req);
+    const commentId = Number(req.params.commentId);
+    if (!propertyId || !commentId || Number.isNaN(commentId)) {
+      return sendResponse(res, 400, true, null, 'propertyId and commentId are required');
+    }
+
+    const comment = String(
+      req.body?.comment ?? req.body?.text ?? req.body?.note ?? ''
+    ).trim();
+    if (!comment) {
+      return sendResponse(res, 400, true, null, 'comment is required');
+    }
+    if (comment.length > 5000) {
+      return sendResponse(res, 400, true, null, 'comment is too long (max 5000 chars)');
+    }
+
+    const updated = await db.query(
+      `UPDATE property_comments
+       SET comment = $4, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1 AND user_id = $2 AND property_id = $3
+       RETURNING id, user_id, property_id, comment, created_at, updated_at`,
+      [commentId, userId, propertyId, comment]
+    );
+
+    if (!updated.rows[0]) {
+      return sendResponse(res, 404, true, null, 'Comment not found');
+    }
+
+    await db.query(
+      `DELETE FROM property_comments
+       WHERE user_id = $1 AND property_id = $2 AND id <> $3`,
+      [userId, propertyId, commentId]
+    );
+
+    return sendResponse(res, 200, false, mapPropertyCommentRow(updated.rows[0]), 'Comment updated');
+  } catch (err) {
+    console.error('Update property comment error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
+/**
  * GET /api/properties/:propertyId/comments
- * Own private comments only.
+ * Own private comments only (at most one note per user/property).
  */
 app.get('/api/properties/:propertyId/comments', authenticateToken, async (req, res) => {
   try {
@@ -3474,7 +3555,8 @@ app.get('/api/properties/:propertyId/comments', authenticateToken, async (req, r
       `SELECT id, property_id, comment, created_at, updated_at
        FROM property_comments
        WHERE user_id = $1 AND property_id = $2
-       ORDER BY created_at ASC, id ASC`,
+       ORDER BY updated_at DESC NULLS LAST, created_at DESC, id DESC
+       LIMIT 1`,
       [userId, propertyId]
     );
 
