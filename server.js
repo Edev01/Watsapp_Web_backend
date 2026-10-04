@@ -2593,9 +2593,17 @@ const runPropertySearch = async (req) => {
 
 const handlePropertyFilter = async (req, res) => {
   try {
-    const { filters, properties, totalMatched, totalReturned, limit, offset, uniqueInPool } =
-      await runPropertySearch(req);
-    const viewerId = resolveAuthUserId(req);
+    const {
+      filters,
+      properties,
+      totalMatched,
+      totalReturned,
+      limit,
+      offset,
+      uniqueInPool,
+      userId: searchUserId
+    } = await runPropertySearch(req);
+    const viewerId = resolveAuthUserId(req) || Number(searchUserId) || null;
     const withMeta = await attachPrivatePropertyMeta(viewerId, properties);
     const enriched = withMeta.map((p) => ({
       ...p,
@@ -2719,14 +2727,16 @@ async function attachPrivatePropertyMeta(userId, properties) {
   if (!list.length) return list;
   const meta = await loadUserPropertyMeta(
     userId,
-    list.map((p) => p.id)
+    list.map((p) => p.id ?? p.listingId ?? p.listing_id ?? p.propertyId ?? p.property_id)
   );
   return list.map((p) => {
-    const id = Number(p.id);
+    const id = Number(p.id ?? p.listingId ?? p.listing_id ?? p.propertyId ?? p.property_id);
+    const isFavourite = Number.isFinite(id) && meta.favouriteIds.has(id);
     return {
       ...p,
-      isFavourite: meta.favouriteIds.has(id),
-      comments: meta.commentsByProperty.get(id) || []
+      isFavourite,
+      is_favourite: isFavourite,
+      comments: (Number.isFinite(id) && meta.commentsByProperty.get(id)) || []
     };
   });
 }
@@ -2777,11 +2787,26 @@ function resolvePropertyIdFromRequest(req) {
 /** Same JSON shape the portal expects from FastAPI POST /api/dashboard-search */
 const handleDashboardSearch = async (req, res) => {
   try {
-    const { properties, totalMatched, totalReturned, limit, offset, uniqueInPool } =
-      await runPropertySearch(req);
-    const viewerId = resolveAuthUserId(req);
+    const {
+      properties,
+      totalMatched,
+      totalReturned,
+      limit,
+      offset,
+      uniqueInPool,
+      userId: searchUserId
+    } = await runPropertySearch(req);
+    // Prefer JWT user; fall back to the tenant userId used for the SQL search
+    const viewerId = resolveAuthUserId(req) || Number(searchUserId) || null;
     const withMeta = await attachPrivatePropertyMeta(viewerId, properties);
-    const results = withMeta.map(toDashboardSearchResult);
+    const results = withMeta.map((p) =>
+      toDashboardSearchResult({
+        ...p,
+        isFavourite: Boolean(p.isFavourite),
+        propertyStatus: p.propertyStatus || p.property_status || 'AVAILABLE',
+        property_status: p.propertyStatus || p.property_status || 'AVAILABLE'
+      })
+    );
     return res.json({
       success: true,
       // With skipCount: report unique pool size (post-dedupe/junk), not raw SQL hits
