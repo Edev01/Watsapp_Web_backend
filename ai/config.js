@@ -25,12 +25,10 @@ function loadConfig({ requireLlm = true } = {}) {
     process.env.DEFAULT_MODEL ||
     'Qwen/Qwen3.5-9B';
 
+  const extractProvider = String(process.env.EXTRACT_PROVIDER || 'openai').toLowerCase();
   if (requireLlm && pipelineMode === 'local') {
-    if (!llmBaseUrl) {
-      throw new Error('[ai] LLM_BASE_URL is required when AI_PIPELINE=local');
-    }
-    if (!llmApiKey) {
-      throw new Error('[ai] LLM_API_KEY is required when AI_PIPELINE=local');
+    if (!process.env.OPENAI_API_KEY) {
+      throw new Error('[ai] OPENAI_API_KEY is required when AI_PIPELINE=local');
     }
   }
 
@@ -68,11 +66,6 @@ function loadConfig({ requireLlm = true } = {}) {
     );
   }
 
-  if (pipelineMode === 'local' && !geminiApiKeys.length) {
-    console.warn(
-      '[ai] No GEMINI_API_KEYS set — cascade will skip Gemini and use Qwen → local NER.'
-    );
-  }
 
   return {
     pipelineMode,

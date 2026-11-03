@@ -106,10 +106,61 @@ const ALIASES = Object.freeze({
   'khayaban e rizwan': 'khayaban-e-rizwan',
   'khybn rizwan': 'khayaban-e-rizwan',
   // NOTE: bare "rizwan" must NOT map to khayaban-e-rizwan (agent names)
+  // Common khayaban shortcuts / glued typos (expand as humans type them)
+  'khy e tanzeem': 'khayaban-e-tanzeem',
+  'khy-e-tanzeem': 'khayaban-e-tanzeem',
+  'kh e tanzeem': 'khayaban-e-tanzeem',
+  'khayaban tanzeem': 'khayaban-e-tanzeem',
+  'khayaban e tanzeem': 'khayaban-e-tanzeem',
+  khyabanetanzeem: 'khayaban-e-tanzeem',
+  khayabanetanzeem: 'khayaban-e-tanzeem',
+  tanzem: 'tanzeem',
+  tanzeeem: 'tanzeem',
+  'khy e rahat': 'khayaban-e-rahat',
+  'khy-e-rahat': 'khayaban-e-rahat',
+  'khayaban rahat': 'khayaban-e-rahat',
+  'khy e bukhari': 'khayaban-e-bukhari',
+  'khy-e-bukhari': 'khayaban-e-bukhari',
+  'khayaban bukhari': 'khayaban-e-bukhari',
+  'khy e ittehad': 'khayaban-e-ittehad',
+  'khy-e-ittehad': 'khayaban-e-ittehad',
+  ittehad: 'khayaban-e-ittehad',
+  'ittehad commercial': 'ittehad commercial',
+  'khy e nishat': 'khayaban-e-nishat',
+  'khy-e-nishat': 'khayaban-e-nishat',
+  'khayaban nishat': 'khayaban-e-nishat',
+  'khy e sehar': 'khayaban-e-sehar',
+  'khy-e-sehar': 'khayaban-e-sehar',
+  'khy e shahbaz': 'khayaban-e-shahbaz',
+  'khy-e-shahbaz': 'khayaban-e-shahbaz',
+  'khy e hilal': 'khayaban-e-hilal',
+  'khy-e-hilal': 'khayaban-e-hilal',
+  'khy e badar': 'khayaban-e-badar',
+  'khy-e-badar': 'khayaban-e-badar',
+  'khy e jami': 'khayaban-e-jami',
+  'khy-e-jami': 'khayaban-e-jami',
+  'khy e qasim': 'khayaban-e-qasim',
+  'khy-e-qasim': 'khayaban-e-qasim',
+  'khy e shujaat': 'khayaban-e-shujaat',
+  'khy-e-shujaat': 'khayaban-e-shujaat',
+  'khy e roomi': 'khayaban-e-roomi',
+  'khy-e-roomi': 'khayaban-e-roomi',
+  'khy e saba': 'khayaban-e-saba',
+  'khy-e-saba': 'khayaban-e-saba',
+  'khy e tufail': 'khayaban-e-tufail',
+  'khy-e-tufail': 'khayaban-e-tufail',
+  'khy e mujahid': 'khayaban-e-mujahid',
+  'khy-e-mujahid': 'khayaban-e-mujahid',
+  'khy e saadi': 'khayaban-e-saadi',
+  'khy-e-saadi': 'khayaban-e-saadi',
+  'khy e hafiz': 'khayaban-e-hafiz',
+  'khy-e-hafiz': 'khayaban-e-hafiz',
   bukhri: 'bukhari',
   bukharii: 'bukhari',
   nishaat: 'nishat',
   nishaath: 'nishat',
+  ittehaad: 'khayaban-e-ittehad',
+  rahatt: 'rahat',
   'dha city karachi': 'dha city',
   'defance phase': 'defence',
   'defense phase': 'defence'
@@ -184,6 +235,11 @@ function canonicalizePlaceText(text) {
   let out = String(text || '').trim();
   if (!out) return out;
 
+  // Glued forms: "khyabanetanzeem" / "khayabanittehad" → "khayaban-e-…"
+  out = out.replace(
+    /\b(khayaban|khyaban|khyabn|khaybn|khybn|khy)e([a-z\u0600-\u06ff]{3,})\b/gi,
+    'khayaban-e-$2'
+  );
   out = out.replace(/\b(khybn|khaybn|khayabn|khayban|khyaban|khyabn|khayaben|khayabaan|khayyaban|khyyaban)\b/gi, 'khayaban');
   out = out.replace(/\b(khy|kh)\s*[-.]?\s*e\s*[-.]?\s*/gi, 'khayaban-e-');
   out = correctLocalityTypos(out);

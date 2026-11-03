@@ -7,10 +7,15 @@ require('dotenv').config();
 const db = require('./db');
 const { sendResponse } = require('./responseHelper');
 const { authenticateToken, isAdmin } = require('./middleware');
+const billing = require('./billing');
+const safepayClient = require('./safepayClient');
+const { listUsers, getUserDetail, usageSummary, parseUsageQuery } = require('./adminStats');
 const { filterAndSortProperties, PROPERTY_STATUSES, normalizePropertyStatus, isValidPropertyStatus, expandLocationQuery } = require('./propertyHelper');
 const { userMessageFingerprint } = require('./contentFingerprint');
 const { setExtraLocalities, correctLocalityTypos, canonicalizePlaceText, normalizePlaceKey, isKhayabanFamilyToken } = require('./pakistanLocalities');
-const { parseSmartLocationQuery, buildSmartLocationSql, scoreLocationMatch, textHasPhase, textHasStreet } = require('./smartLocationSearch');
+const { parseSmartLocationQuery, buildSmartLocationSql, buildPhaseRegex, buildOtherPhaseRegex, scoreLocationMatch, textHasStreet, interpretDhaSearch, phaseSearchKeeps, isDefenceViewPlace, isCliftonOnlyPlace, parseScrapedMessageId } = require('./smartLocationSearch');
+const { discoverPhaseAreas, discoverDhaAreas, correctDefenceArea } = require('./ai/googlePhaseMap');
+const { interpretBtkSearch, precinctRegexes, btkSearchKeeps, chipLabels: btkChipLabels } = require('./ai/btkPrecincts');
 const {
   classifyLocationQuery,
   norm: placeNorm,
@@ -18,6 +23,7 @@ const {
 } = require('./ai/placeRegions');
 const { ensurePlaceRegionsSeeded } = require('./ai/placeResolver');
 const { isWeakLocation } = require('./ai/cascadeMerge');
+const { isRequirementFilter, REQUIREMENT_SQL, NON_INVENTORY_REQUIRED_SQL } = require('./ai/extract/listingKind');
 const { extractUserId } = require('./userMiddleware');
 const { findOrCreateCanonicalChat, upsertChatsBulk, cleanText, isSystemNotificationText, isCommonJunkMessage } = require('./contactHelper');
 const {
@@ -577,6 +583,13 @@ app.post('/api/auth/login', async (req, res) => {
       data.user.is_first_login = user.is_first_login;
     }
 
+    try {
+      data.billing = await billing.billingForUser(db, user);
+      data.user.billing = data.billing;
+    } catch (billErr) {
+      console.warn('[billing] login attach failed:', billErr.message);
+    }
+
     const whatsapp = await resolveWhatsAppConnectionForUser(user.id);
     data.whatsappConnected = whatsapp.whatsappConnected;
     data.whatsapp = whatsapp;
@@ -584,6 +597,56 @@ app.post('/api/auth/login', async (req, res) => {
     return sendResponse(res, 200, false, data, 'Login successful');
   } catch (err) {
     console.error('Login error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
+// 2b. Admin: list users with scrape / normalize / API-hit totals
+app.get('/api/users', authenticateToken, isAdmin, async (req, res) => {
+  try {
+    const users = await listUsers(db);
+    return sendResponse(res, 200, false, users, 'Users retrieved');
+  } catch (err) {
+    console.error('List users error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
+// 2c. Admin: one user + counts + monthly OpenAI hits
+app.get('/api/users/:id', authenticateToken, isAdmin, async (req, res) => {
+  const targetId = parseInt(req.params.id, 10);
+  if (!targetId || Number.isNaN(targetId)) {
+    return sendResponse(res, 400, true, null, 'Valid user id is required');
+  }
+  try {
+    const detail = await getUserDetail(db, targetId, req.query);
+    if (!detail) {
+      return sendResponse(res, 404, true, null, 'User not found');
+    }
+    return sendResponse(res, 200, false, detail, 'User retrieved');
+  } catch (err) {
+    console.error('Get user error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
+// 2d. Admin: OpenAI API hits for a month (optional userId), plus history
+app.get('/api/admin/usage', authenticateToken, isAdmin, async (req, res) => {
+  try {
+    const parsed = parseUsageQuery(req.query);
+    const userId = req.query.userId != null && req.query.userId !== ''
+      ? parseInt(req.query.userId, 10)
+      : null;
+    if (userId != null && Number.isNaN(userId)) {
+      return sendResponse(res, 400, true, null, 'Valid userId is required');
+    }
+    const usage = await usageSummary(db, {
+      userId: userId || null,
+      ...parsed
+    });
+    return sendResponse(res, 200, false, usage, 'Usage retrieved');
+  } catch (err) {
+    console.error('Admin usage error:', err);
     return sendResponse(res, 500, true, null, err.message || 'Server error');
   }
 });
@@ -609,13 +672,183 @@ app.post('/api/users', authenticateToken, isAdmin, async (req, res) => {
 
     // Create user (role defaults to 'user', is_first_login defaults to true)
     const result = await db.query(
-      'INSERT INTO users (email, password_hash, role, is_first_login, name, phone_number) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, email, role, name, phone_number',
+      'INSERT INTO users (email, password_hash, role, is_first_login, name, phone_number) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, email, role, name, phone_number, created_at',
       [email, passwordHash, 'user', true, name || null, phone_number || null]
     );
+    const created = result.rows[0];
+    try {
+      await billing.ensureSubscription(db, created, { existingFree: false });
+    } catch (billErr) {
+      console.warn('[billing] create-user subscription failed:', billErr.message);
+    }
 
-    return sendResponse(res, 201, false, result.rows[0], 'User account created successfully');
+    return sendResponse(res, 201, false, created, 'User account created successfully');
   } catch (err) {
     console.error('Create user error:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
+app.get('/api/billing/me', authenticateToken, async (req, res) => {
+  try {
+    const info = await billing.billingForUser(db, req.user);
+    return sendResponse(res, 200, false, info, 'Billing retrieved');
+  } catch (err) {
+    return sendResponse(res, 500, true, null, err.message || 'Server error');
+  }
+});
+
+app.post('/api/billing/confirm', authenticateToken, async (req, res) => {
+  try {
+    if (String(req.user.role || '').toLowerCase() === 'admin') {
+      return sendResponse(res, 400, true, null, 'Admins are not billed');
+    }
+    await billing.ensureSubscription(db, req.user);
+    const existing = await billing.getSubscription(db, req.user.id);
+    if (existing && String(existing.status).toLowerCase() === 'active' && existing.last_paid_at
+        && Date.now() - new Date(existing.last_paid_at).getTime() < 15 * 60 * 1000) {
+      return sendResponse(res, 200, false, billing.publicBilling(existing), 'Already paid');
+    }
+    const sub = await billing.markPaid(db, req.user.id, {});
+    await billing.recordPayment(db, {
+      userId: req.user.id,
+      status: 'succeeded',
+      source: 'safepay-return',
+      safepayRef: String(req.body?.tracker || req.body?.reference || req.query?.tracker || 'return-success')
+    });
+    const { sendBillingEmail } = require('./mailHelper');
+    const owner = await db.query('SELECT email FROM users WHERE id = $1', [req.user.id]);
+    sendBillingEmail({
+      to: owner.rows[0]?.email,
+      kind: 'paid',
+      amountPkr: billing.PLAN_AMOUNT_PKR,
+      periodEnd: sub?.current_period_end
+    }).catch((e) => console.warn('[billing] email paid:', e.message));
+    return sendResponse(res, 200, false, billing.publicBilling(sub), 'Payment confirmed');
+  } catch (err) {
+    return sendResponse(res, 500, true, null, err.message || 'Confirm failed');
+  }
+});
+
+app.post('/api/billing/checkout', authenticateToken, async (req, res) => {
+  try {
+    if (String(req.user.role || '').toLowerCase() === 'admin') {
+      return sendResponse(res, 400, true, null, 'Admins are not billed');
+    }
+    await billing.ensureSubscription(db, req.user);
+    const checkout = await safepayClient.createSubscriptionCheckout({
+      userId: req.user.id,
+      email: req.user.email
+    });
+    return sendResponse(res, 200, false, checkout, 'Checkout created');
+  } catch (err) {
+    const status = err.code === 'SAFEPAY_NOT_CONFIGURED' ? 503 : 500;
+    return sendResponse(res, status, true, null, err.message || 'Checkout failed');
+  }
+});
+
+app.post('/api/billing/webhook', async (req, res) => {
+  try {
+    console.info('[billing] webhook body keys:', Object.keys(req.body || {}));
+    const event = safepayClient.parseWebhook(req.body || {});
+    if (!event.userId) {
+      return sendResponse(res, 200, false, { ignored: true }, 'No user on webhook');
+    }
+    const owner = await db.query('SELECT id, email, role FROM users WHERE id = $1', [event.userId]);
+    if (!owner.rows[0]) {
+      return sendResponse(res, 200, false, { ignored: true }, 'Unknown user');
+    }
+    await billing.ensureSubscription(db, owner.rows[0]);
+    const { sendBillingEmail } = require('./mailHelper');
+    if (event.paid) {
+      const sub = await billing.markPaid(db, event.userId, {
+        safepaySubscriptionId: event.subscriptionId
+      });
+      await billing.recordPayment(db, {
+        userId: event.userId,
+        status: 'succeeded',
+        safepayRef: event.reference || event.subscriptionId,
+        payload: event.payload
+      });
+      sendBillingEmail({
+        to: owner.rows[0].email,
+        kind: 'paid',
+        amountPkr: billing.PLAN_AMOUNT_PKR,
+        periodEnd: sub?.current_period_end
+      }).catch((e) => console.warn('[billing] email paid:', e.message));
+    } else if (event.canceled) {
+      await billing.setStatus(db, event.userId, 'canceled', { clearSafepay: false });
+      sendBillingEmail({ to: owner.rows[0].email, kind: 'canceled' })
+        .catch((e) => console.warn('[billing] email canceled:', e.message));
+    } else if (event.failed) {
+      await billing.setStatus(db, event.userId, 'past_due');
+      await billing.recordPayment(db, {
+        userId: event.userId,
+        status: 'failed',
+        safepayRef: event.reference,
+        payload: event.payload
+      });
+      sendBillingEmail({ to: owner.rows[0].email, kind: 'failed' })
+        .catch((e) => console.warn('[billing] email failed:', e.message));
+    }
+    return sendResponse(res, 200, false, { ok: true }, 'Webhook processed');
+  } catch (err) {
+    console.error('[billing] webhook:', err);
+    return sendResponse(res, 500, true, null, err.message || 'Webhook failed');
+  }
+});
+
+app.post('/api/users/:id/billing', authenticateToken, isAdmin, async (req, res) => {
+  const targetId = parseInt(req.params.id, 10);
+  const action = String(req.body?.action || '').toLowerCase();
+  if (!targetId) return sendResponse(res, 400, true, null, 'Valid user id is required');
+  try {
+    const owner = await db.query('SELECT id, email, role FROM users WHERE id = $1', [targetId]);
+    if (!owner.rows[0]) return sendResponse(res, 404, true, null, 'User not found');
+    if (String(owner.rows[0].role).toLowerCase() === 'admin') {
+      return sendResponse(res, 400, true, null, 'Admin accounts are not billed');
+    }
+    await billing.ensureSubscription(db, owner.rows[0]);
+    const { sendBillingEmail } = require('./mailHelper');
+    let sub;
+    if (action === 'complimentary') {
+      sub = await billing.setStatus(db, targetId, 'complimentary', { graceUntil: null });
+      sendBillingEmail({ to: owner.rows[0].email, kind: 'complimentary' }).catch(() => {});
+    } else if (action === 'cancel') {
+      sub = await billing.setStatus(db, targetId, 'canceled', {
+        graceUntil: new Date(Date.now() - 1000),
+        clearSafepay: true
+      });
+      sendBillingEmail({ to: owner.rows[0].email, kind: 'canceled' }).catch(() => {});
+    } else if (action === 'mark_paid' || action === 'paid') {
+      sub = await billing.markPaid(db, targetId, {});
+      await billing.recordPayment(db, {
+        userId: targetId,
+        status: 'succeeded',
+        source: 'admin',
+        safepayRef: 'admin-mark-paid'
+      });
+      sendBillingEmail({
+        to: owner.rows[0].email,
+        kind: 'paid',
+        periodEnd: sub?.current_period_end
+      }).catch(() => {});
+    } else if (action === 'unpaid' || action === 'refund') {
+      const grace = billing.graceUntilFrom(new Date());
+      sub = await billing.setStatus(db, targetId, 'unpaid', { graceUntil: grace, clearSafepay: action === 'refund' });
+      if (action === 'refund') {
+        await billing.recordPayment(db, {
+          userId: targetId,
+          status: 'refunded',
+          source: 'admin',
+          safepayRef: 'admin-refund'
+        });
+      }
+    } else {
+      return sendResponse(res, 400, true, null, 'action must be complimentary, cancel, mark_paid, unpaid, or refund');
+    }
+    return sendResponse(res, 200, false, billing.publicBilling(sub), 'Billing updated');
+  } catch (err) {
     return sendResponse(res, 500, true, null, err.message || 'Server error');
   }
 });
@@ -1354,6 +1587,17 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
   }
 
   try {
+    try {
+      const owner = await db.query('SELECT id, role, created_at FROM users WHERE id = $1', [userId]);
+      if (owner.rows[0] && String(owner.rows[0].role).toLowerCase() !== 'admin') {
+        const sub = await billing.ensureSubscription(db, owner.rows[0]);
+        if (!billing.hasAccess(sub)) {
+          return sendResponse(res, 402, true, { billing: billing.publicBilling(sub) }, 'Payment required');
+        }
+      }
+    } catch (billErr) {
+      console.warn('[billing] ingest check skipped:', billErr.message);
+    }
     // Resolve canonical JID from database for this user
     const canonicalJid = await findOrCreateCanonicalChat(userId, resolvedChatId, resolvedChatName);
     if (!canonicalJid) {
@@ -1419,37 +1663,39 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
           [userId, canonicalJid]
         );
 
-        // Drop body-identical reposts already stored for this user (any chat).
+        // Same listing body except trailing contact/name: newest message wins.
+        // Existing cards are moved onto the new row so OpenAI is not called again.
         const prior = await client.query(
-          `SELECT content_fingerprint, message FROM whatsapp_messages
+          `SELECT id, message FROM whatsapp_messages
            WHERE user_id = $1
-             AND (
-               content_fingerprint IS NOT NULL
-               OR id > (SELECT COALESCE(MAX(id),0) - 20000 FROM whatsapp_messages WHERE user_id = $1)
-             )
+             AND id > (SELECT COALESCE(MAX(id),0) - 20000 FROM whatsapp_messages WHERE user_id = $1)
            ORDER BY id DESC
            LIMIT 20000`,
           [userId]
         );
-        const seenBodies = new Set();
+        const seenBodies = new Map();
         for (const r of prior.rows) {
-          if (r.content_fingerprint) {
-            seenBodies.add(r.content_fingerprint);
-            continue;
-          }
           const fp = userMessageFingerprint(userId, r.message);
-          if (fp) seenBodies.add(fp);
+          if (!fp) continue;
+          if (!seenBodies.has(fp)) seenBodies.set(fp, []);
+          seenBodies.get(fp).push(r.id);
         }
+        const replaceByFp = new Map();
+        const byFp = new Map();
         const uniqueRows = [];
         for (const row of toInsert) {
           const fp = userMessageFingerprint(userId, row.messageText);
+          const next = { ...row, contentFingerprint: fp || null };
           if (fp && seenBodies.has(fp)) {
-            skippedCount += 1;
+            replaceByFp.set(fp, seenBodies.get(fp));
+          }
+          if (!fp) {
+            uniqueRows.push(next);
             continue;
           }
-          if (fp) seenBodies.add(fp);
-          uniqueRows.push({ ...row, contentFingerprint: fp || null });
+          byFp.set(fp, next);
         }
+        uniqueRows.push(...byFp.values());
 
         if (!uniqueRows.length) {
           await client.query('COMMIT');
@@ -1477,11 +1723,36 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
            VALUES ${values.join(',')}
            ON CONFLICT (user_id, chat_jid, sender, timestamp, message)
            DO NOTHING
-           RETURNING id`,
+           RETURNING id, content_fingerprint, sender`,
           params
         );
         addedCount = result.rows.length;
         skippedCount += uniqueRows.length - addedCount;
+        for (const inserted of result.rows) {
+          const fp = inserted.content_fingerprint;
+          if (!fp || !replaceByFp.has(fp)) continue;
+          const oldIds = [...new Set(replaceByFp.get(fp))]
+            .map((id) => Number(id))
+            .filter((id) => Number.isFinite(id) && id !== Number(inserted.id));
+          if (!oldIds.length) continue;
+          const keepOld = Math.max(...oldIds);
+          await client.query(
+            `UPDATE normalized_messages
+                SET whatsapp_message_id = $1,
+                    chat_jid = $2,
+                    sender = $3
+              WHERE whatsapp_message_id = $4`,
+            [inserted.id, canonicalJid, inserted.sender, keepOld]
+          );
+          await client.query(
+            `DELETE FROM normalized_messages WHERE whatsapp_message_id = ANY($1::int[])`,
+            [oldIds]
+          );
+          await client.query(
+            `DELETE FROM whatsapp_messages WHERE id = ANY($1::int[])`,
+            [oldIds]
+          );
+        }
         await client.query('COMMIT');
 
         const newIds = result.rows
@@ -1864,10 +2135,13 @@ app.get('/api/scraped-chats/messages', async (req, res) => {
   if (!userId) {
     return sendResponse(res, 401, true, null, 'Login required');
   }
-  const { chatId, jid, name, limit, offset, countOnly, sort, lastTimesOnly } = req.query;
+  const { chatId, jid, name, limit, offset, countOnly, sort, lastTimesOnly, beforeId, q } = req.query;
   const targetId = chatId || jid;
   const pageLimit = Math.min(parseInt(limit, 10) || 5000, 10000);
   const pageOffset = Math.max(parseInt(offset, 10) || 0, 0);
+  const before = parseInt(beforeId, 10);
+  const hasBefore = Number.isFinite(before) && before > 0;
+  const searchQ = String(q || '').trim();
   // Newest first by default so monitored chat UI shows today's messages, not Sep-15 history page 1
   const sortAsc = String(sort || '').toLowerCase() === 'asc';
   const orderSql = sortAsc ? 'ORDER BY m.id ASC' : 'ORDER BY m.id DESC';
@@ -1900,41 +2174,52 @@ app.get('/api/scraped-chats/messages', async (req, res) => {
       return sendResponse(res, 200, false, result.rows[0], 'Message count retrieved');
     }
 
-    let result;
+    const params = [userId];
+    const where = ['m.user_id = $1'];
     if (targetId) {
-      result = await db.query(
-        `SELECT m.id, m.chat_jid, c.name as chat_name, m.sender, m.timestamp, m.message, m.from_me, m.from_me as "fromMe", m.user_id, m.created_at, m.seq_in_chat, m.seq_in_chat as "seqInChat" 
-         FROM whatsapp_messages m
-         LEFT JOIN whatsapp_chats c ON m.chat_jid = c.jid AND m.user_id = c.user_id
-         WHERE m.user_id = $1 AND (m.chat_jid = $2 OR LOWER(COALESCE(c.name, '')) LIKE LOWER($3))
-         ${orderSql}
-         LIMIT $4 OFFSET $5`,
-        [userId, targetId, `%${targetId}%`, pageLimit, pageOffset]
-      );
+      params.push(targetId, `%${targetId}%`);
+      where.push(`(m.chat_jid = $${params.length - 1} OR LOWER(COALESCE(c.name, '')) LIKE LOWER($${params.length}))`);
     } else if (name) {
-      result = await db.query(
-        `SELECT m.id, m.chat_jid, c.name as chat_name, m.sender, m.timestamp, m.message, m.from_me, m.from_me as "fromMe", m.user_id, m.created_at, m.seq_in_chat, m.seq_in_chat as "seqInChat" 
-         FROM whatsapp_messages m
-         LEFT JOIN whatsapp_chats c ON m.chat_jid = c.jid AND m.user_id = c.user_id
-         WHERE m.user_id = $1 AND LOWER(COALESCE(c.name, '')) LIKE LOWER($2)
-         ${orderSql}
-         LIMIT $3 OFFSET $4`,
-        [userId, `%${name}%`, pageLimit, pageOffset]
-      );
-    } else {
-      // No chat filter: return this user's messages only (fixes frontend 400)
-      result = await db.query(
-        `SELECT m.id, m.chat_jid, c.name as chat_name, m.sender, m.timestamp, m.message, m.from_me, m.from_me as "fromMe", m.user_id, m.created_at, m.seq_in_chat, m.seq_in_chat as "seqInChat" 
-         FROM whatsapp_messages m
-         LEFT JOIN whatsapp_chats c ON m.chat_jid = c.jid AND m.user_id = c.user_id
-         WHERE m.user_id = $1
-         ${orderSql}
-         LIMIT $2 OFFSET $3`,
-        [userId, pageLimit, pageOffset]
-      );
+      params.push(`%${name}%`);
+      where.push(`LOWER(COALESCE(c.name, '')) LIKE LOWER($${params.length})`);
+    }
+    if (hasBefore) {
+      params.push(before);
+      where.push(`m.id < $${params.length}`);
+    }
+    if (searchQ) {
+      params.push(`%${searchQ}%`);
+      where.push(`m.message ILIKE $${params.length}`);
     }
 
-    return sendResponse(res, 200, false, result.rows, 'Messages retrieved successfully');
+    const fetchLimit = pageLimit + 1;
+    params.push(fetchLimit);
+    const limitSql = `LIMIT $${params.length}`;
+    let offsetSql = '';
+    if (!hasBefore && pageOffset > 0) {
+      params.push(pageOffset);
+      offsetSql = ` OFFSET $${params.length}`;
+    }
+
+    const result = await db.query(
+      `SELECT m.id, m.chat_jid, c.name as chat_name, m.sender, m.timestamp, m.message, m.from_me, m.from_me as "fromMe", m.user_id, m.created_at, m.seq_in_chat, m.seq_in_chat as "seqInChat"
+         FROM whatsapp_messages m
+         LEFT JOIN whatsapp_chats c ON m.chat_jid = c.jid AND m.user_id = c.user_id
+        WHERE ${where.join(' AND ')}
+        ${orderSql}
+        ${limitSql}${offsetSql}`,
+      params
+    );
+
+    const hasMore = result.rows.length > pageLimit;
+    const rows = hasMore ? result.rows.slice(0, pageLimit) : result.rows;
+    return res.status(200).json({
+      error: false,
+      data: rows,
+      hasMore,
+      status: 200,
+      message: 'Messages retrieved successfully',
+    });
   } catch (err) {
     console.error('Get messages error:', err);
     return sendResponse(res, 500, true, null, err.message || 'Server error');
@@ -2154,16 +2439,122 @@ app.get('/api/ml/dataset', async (req, res) => {
  * Shared filter + location WHERE builder used by search AND suggest counts
  * so dropdown hits always equal properties returned for the same query.
  */
-function buildPropertySearchWhere(filters, userId) {
+function btkAreaSql(parsed, searchable, params) {
+  if (!parsed || !String(parsed.regionMode || '').startsWith('btk')) return { sql: '', parsed };
+  if (parsed.regionMode === 'btk-all') {
+    params.push('%bahria%');
+    const bahriaIdx = params.length;
+    params.push('%btk%');
+    const btkIdx = params.length;
+    params.push('%precinct%');
+    const precIdx = params.length;
+    params.push('(^|[^[:alnum:]])p[[:space:].\\-]*[0-9]{1,2}([a-z]|[^[:alnum:]]|$)');
+    const pCodeIdx = params.length;
+    return {
+      sql:
+        ` AND (${searchable} ILIKE $${bahriaIdx}` +
+        ` OR ${searchable} ILIKE $${btkIdx}` +
+        ` OR ${searchable} ILIKE $${precIdx}` +
+        ` OR ${searchable} ~* $${pCodeIdx})`,
+      parsed
+    };
+  }
+  const regexes = precinctRegexes(parsed.btkPrecincts || []);
+  if (!regexes.length) return { sql: '', parsed };
+  const parts = [];
+  for (const re of regexes) {
+    params.push(re);
+    parts.push(`${searchable} ~* $${params.length}`);
+  }
+  return { sql: ` AND (${parts.join(' OR ')})`, parsed };
+}
+
+function phaseAreaSql(parsed, searchable, params) {
+  const want = Number(parsed.phaseNumber);
+  if (!want) return { sql: '', parsed };
+  params.push(want);
+  const phaseIdx = params.length;
+  params.push(buildPhaseRegex(want));
+  const reIdx = params.length;
+  const areas = (parsed.googlePhaseAreas || []).map((name) => `%${String(name).toLowerCase()}%`);
+  let areaClause = 'FALSE';
+  if (areas.length) {
+    params.push(areas);
+    areaClause = `${searchable} LIKE ANY($${params.length})`;
+  }
+  params.push(buildOtherPhaseRegex(want));
+  const otherIdx = params.length;
+  const placeLine =
+    `LOWER(CONCAT_WS(' ', COALESCE(n.area,''), COALESCE(n.vicinity,''), COALESCE(n.city,''), ` +
+    `COALESCE(n.location_text,''), COALESCE(n.street_text,'')))`;
+  return {
+    sql:
+      ` AND (n.phase IS NULL OR n.phase = $${phaseIdx}` +
+      ` OR (n.phase_max IS NOT NULL AND n.phase <= $${phaseIdx} AND n.phase_max >= $${phaseIdx}))` +
+      ` AND (n.phase = $${phaseIdx}` +
+      ` OR (n.phase_max IS NOT NULL AND n.phase <= $${phaseIdx} AND n.phase_max >= $${phaseIdx})` +
+      ` OR ${searchable} ~* $${reIdx} OR ${areaClause})` +
+      ` AND NOT (${placeLine} ~* $${otherIdx} AND NOT (${placeLine} ~* $${reIdx})` +
+      ` AND NOT (n.phase_max IS NOT NULL AND n.phase <= $${phaseIdx} AND n.phase_max >= $${phaseIdx})) ` +
+      ` AND ${placeLine} !~* 'defen[cs]e\\s+view'` +
+      ` AND NOT (${placeLine} ~* '\\mclifton\\M' AND ${placeLine} !~* '\\m(dha|d\\\\.h\\\\.a)\\M')`,
+    parsed
+  };
+}
+
+function dhaAllSql(parsed, searchable, params) {
+  params.push(['%dha%', '%defence%', '%defense%', '%defance%', '%d.h.a%', '%dck%']);
+  const dhaIdx = params.length;
+  const areas = (parsed.googlePhaseAreas || []).map((name) => `%${String(name).toLowerCase()}%`);
+  let areaClause = 'FALSE';
+  if (areas.length) {
+    params.push(areas);
+    areaClause = `${searchable} LIKE ANY($${params.length})`;
+  }
+  const placeLine =
+    `LOWER(CONCAT_WS(' ', COALESCE(n.area,''), COALESCE(n.vicinity,''), COALESCE(n.city,''), ` +
+    `COALESCE(n.location_text,''), COALESCE(n.street_text,'')))`;
+  return {
+    sql:
+      ` AND (${searchable} ILIKE ANY($${dhaIdx}) OR ${areaClause})` +
+      ` AND ${placeLine} !~* 'defen[cs]e\\s+view'` +
+      ` AND NOT (${placeLine} ~* '\\mclifton\\M' AND ${placeLine} !~* '\\m(dha|d\\\\.h\\\\.a)\\M')`,
+    parsed
+  };
+}
+
+async function buildPropertySearchWhere(filters, userId) {
   let queryText = `
       FROM normalized_messages n
       INNER JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
       WHERE m.user_id = $1
         AND n.is_property IS TRUE
+        AND (
+          NULLIF(TRIM(COALESCE(n.area, '')), '') IS NOT NULL
+          OR NULLIF(TRIM(COALESCE(n.vicinity, '')), '') IS NOT NULL
+          OR NULLIF(TRIM(COALESCE(n.city, '')), '') IS NOT NULL
+          OR n.phase IS NOT NULL
+          OR COALESCE(cardinality(n.place_tags), 0) > 0
+        )
   `;
   const params = [userId];
   let parsedLocation = null;
   let regionClass = null;
+
+  const scrapedId = parseScrapedMessageId(filters.location);
+  if (scrapedId) {
+    params.push(scrapedId);
+    return {
+      queryText: `
+      FROM whatsapp_messages m
+      LEFT JOIN normalized_messages n ON n.whatsapp_message_id = m.id
+      WHERE m.user_id = $1 AND m.id = $2
+      `,
+      params,
+      parsedLocation: { regionMode: 'message-id', messageId: scrapedId, mustGroups: [], placeOnlyGroups: [], searchRegexes: [] },
+      regionClass: { mode: 'message-id', terms: [], parentKey: null }
+    };
+  }
 
   const purpose = String(filters.purpose || '').trim().toLowerCase();
   if (purpose && purpose !== 'all') {
@@ -2183,23 +2574,98 @@ function buildPropertySearchWhere(filters, userId) {
 
   const location = String(filters.location || '').trim();
   if (location) {
-    parsedLocation = parseSmartLocationQuery(location);
-    regionClass = classifyLocationQuery(location);
+    const btkIntent = interpretBtkSearch(location);
+    if (btkIntent) {
+      parsedLocation = parseSmartLocationQuery(location);
+      parsedLocation.phaseNumber = null;
+      parsedLocation.mustGroups = [];
+      parsedLocation.placeOnlyGroups = [];
+      parsedLocation.searchRegexes = [];
+      parsedLocation.regionMode = btkIntent.kind === 'btk-all' ? 'btk-all' : btkIntent.kind === 'btk-parent' ? 'btk-parent' : 'btk-exact';
+      parsedLocation.btkPrecincts = btkIntent.matchPrecincts || [];
+      parsedLocation.precinct = btkIntent.precinct || null;
+      parsedLocation.phaseAreaLabels = btkIntent.chips || btkChipLabels();
+      parsedLocation.googlePhaseAreas = parsedLocation.phaseAreaLabels;
+      regionClass = { mode: parsedLocation.regionMode, terms: parsedLocation.btkPrecincts, parentKey: 'btk' };
+    }
+    const intent = btkIntent ? { kind: 'btk' } : interpretDhaSearch(location);
+    if (btkIntent) {
+      // BTK precinct search is already parsed.
+    } else if (intent.kind === 'phase') {
+      // "dha phase 6" is that phase only. The word dha is not a second search.
+      parsedLocation = parseSmartLocationQuery(location);
+      parsedLocation.phaseNumber = intent.phaseNumber;
+      parsedLocation.mustGroups = [];
+      parsedLocation.placeOnlyGroups = [];
+      parsedLocation.searchRegexes = [];
+      parsedLocation.regionMode = 'phase';
+      const found = await discoverPhaseAreas(db, intent.phaseNumber);
+      parsedLocation.googlePhaseAreas = Array.isArray(found) ? found : (found.areas || []);
+      parsedLocation.phaseAreaLabels = Array.isArray(found) ? found : (found.labels || []);
+      regionClass = { mode: 'phase', terms: [], parentKey: `phase-${intent.phaseNumber}` };
+    } else if (intent.kind === 'dha-all') {
+      parsedLocation = parseSmartLocationQuery(location);
+      parsedLocation.phaseNumber = null;
+      parsedLocation.mustGroups = [];
+      parsedLocation.placeOnlyGroups = [];
+      parsedLocation.searchRegexes = [];
+      parsedLocation.regionMode = 'dha-all';
+      const found = await discoverDhaAreas(db);
+      parsedLocation.googlePhaseAreas = Array.isArray(found) ? found : (found.areas || []);
+      parsedLocation.phaseAreaLabels = Array.isArray(found) ? found : (found.labels || []);
+      regionClass = { mode: 'dha-all', terms: [], parentKey: 'dha' };
+    } else if (intent.kind === 'phrase') {
+      // "dha city" stays one place name. It is not all DHA plus the word city.
+      parsedLocation = parseSmartLocationQuery(intent.area);
+      parsedLocation.phaseNumber = null;
+      parsedLocation.mustGroups = [/dha city/i.test(intent.area) ? ['dha city', 'dck', 'dha city karachi'] : [intent.area]];
+      parsedLocation.placeOnlyGroups = [];
+      parsedLocation.searchRegexes = [];
+      parsedLocation.regionMode = 'exact';
+      regionClass = { mode: 'exact', terms: parsedLocation.mustGroups[0], parentKey: null };
+    } else {
+      // "dha bukhari" searches bukhari only, not every DHA listing as well.
+      // A misspelled Defence area (seher / sehar / sahar) is one place.
+      const queryForParse = intent.kind === 'area' ? intent.area : location;
+      const corrected = await correctDefenceArea(db, queryForParse);
+      if (corrected) {
+        parsedLocation = parseSmartLocationQuery(corrected.name);
+        parsedLocation.phaseNumber = null;
+        parsedLocation.mustGroups = [corrected.terms];
+        parsedLocation.placeOnlyGroups = [];
+        parsedLocation.searchRegexes = [];
+        parsedLocation.regionMode = 'spelling';
+        parsedLocation.rawQuery = corrected.name;
+        regionClass = { mode: 'spelling', terms: corrected.terms, parentKey: null };
+      } else {
+        parsedLocation = parseSmartLocationQuery(queryForParse);
+        regionClass = classifyLocationQuery(queryForParse);
+      }
+    }
 
-    // Parent region (Malir / Airport / DHA Phase N): expand to all children
-    if (regionClass.mode === 'parent' && regionClass.terms.length) {
+    // Parent region (Malir / Airport): expand to children on the listing card.
+    // A DHA phase search uses the stored phase. It does not OR every child
+    // name, because those names also sit in other phases.
+    if (intent.kind === 'phase' || intent.kind === 'dha-all' || intent.kind === 'phrase' || intent.kind === 'btk') {
+      // already decided above
+    } else if (regionClass.mode === 'parent' && regionClass.terms.length && isDhaPhaseParent(regionClass.parentKey)) {
+      const phaseFromKey = Number(String(regionClass.parentKey).replace(/\D/g, ''));
+      parsedLocation.phaseNumber = phaseFromKey || parsedLocation.phaseNumber;
+      parsedLocation.mustGroups = [];
+      parsedLocation.placeOnlyGroups = [];
+      parsedLocation.searchRegexes = [];
+      parsedLocation.regionMode = 'phase';
+      parsedLocation.expandedPhaseParent = regionClass.parentKey;
+      const found = await discoverPhaseAreas(db, parsedLocation.phaseNumber);
+      parsedLocation.googlePhaseAreas = Array.isArray(found) ? found : (found.areas || []);
+      parsedLocation.phaseAreaLabels = Array.isArray(found) ? found : (found.labels || []);
+      regionClass.mode = 'phase';
+    } else if (regionClass.mode === 'parent' && regionClass.terms.length) {
       parsedLocation.mustGroups = [regionClass.terms];
       parsedLocation.regionMode = 'parent';
       parsedLocation.regionTerms = regionClass.terms;
       parsedLocation.placeOnlyGroups = [];
       parsedLocation.searchRegexes = [];
-      // Phase parents expand via local JSON children (ittehad, bukhari, …).
-      // Clear phaseNumber so SQL does not AND-require the literal "phase N"
-      // (a Phase 5 listing that only says "Ittehad" must still match).
-      if (isDhaPhaseParent(regionClass.parentKey)) {
-        parsedLocation.phaseNumber = null;
-        parsedLocation.expandedPhaseParent = regionClass.parentKey;
-      }
     } else if (regionClass.mode === 'exact' && regionClass.terms.length) {
       // Exact locality: constrain to that place (+ spellings) only
       parsedLocation.mustGroups = [regionClass.terms];
@@ -2212,19 +2678,21 @@ function buildPropertySearchWhere(filters, userId) {
       }
     }
 
-    // Include place_tags + full message in searchable text (no tiny LEFT for match)
+    // Match this listing, not every other offer in the same WhatsApp message.
+    const phaseText = `CASE WHEN n.phase IS NOT NULL THEN 'phase ' || n.phase::text ELSE '' END`;
     const searchable =
-      parsedLocation.phaseNumber != null
-        ? `LOWER(CONCAT_WS(' ', COALESCE(n.area,''), COALESCE(n.vicinity,''), COALESCE(n.city,''), ` +
-          `COALESCE(n.summary,''), COALESCE(n.listing_excerpt,''), ` +
-          `COALESCE(array_to_string(n.place_tags, ' '), ''), ` +
-          `COALESCE(NULLIF(TRIM(n.listing_excerpt), ''), m.message, '')))`
-        : `LOWER(CONCAT_WS(' ', COALESCE(n.area,''), COALESCE(n.vicinity,''), COALESCE(n.city,''), ` +
-          `COALESCE(n.summary,''), COALESCE(n.listing_excerpt,''), ` +
-          `COALESCE(array_to_string(n.place_tags, ' '), ''), ` +
-          `COALESCE(m.message, '')))`;
+      `LOWER(CONCAT_WS(' ', COALESCE(n.area,''), COALESCE(n.vicinity,''), COALESCE(n.city,''), ` +
+      `COALESCE(n.location_text,''), COALESCE(n.street_text,''), ${phaseText}, ` +
+      `COALESCE(n.summary,''), COALESCE(n.listing_excerpt,''), ` +
+      `COALESCE(array_to_string(n.place_tags, ' '), '')))`;
 
-    const built = buildSmartLocationSql(parsedLocation, searchable, params);
+    const built = parsedLocation.regionMode === 'phase'
+      ? phaseAreaSql(parsedLocation, searchable, params)
+      : parsedLocation.regionMode === 'dha-all'
+        ? dhaAllSql(parsedLocation, searchable, params)
+        : String(parsedLocation.regionMode || '').startsWith('btk')
+          ? btkAreaSql(parsedLocation, searchable, params)
+          : buildSmartLocationSql(parsedLocation, searchable, params);
 
     if (built.sql) {
       queryText += built.sql;
@@ -2237,10 +2705,34 @@ function buildPropertySearchWhere(filters, userId) {
     }
   }
 
+  const listingKind = String(filters.listingKind || filters.listing_kind || '').trim().toUpperCase();
   const propertyType = String(filters.propertyType || '').trim();
-  if (propertyType && propertyType.toLowerCase() !== 'all') {
+  if (isRequirementFilter(filters)) {
+    params.push(NON_INVENTORY_REQUIRED_SQL);
+    const maskIdx = params.length;
+    params.push(REQUIREMENT_SQL);
+    const reIdx = params.length;
+    queryText += ` AND (
+      (
+        NULLIF(TRIM(COALESCE(n.listing_excerpt, '')), '') IS NOT NULL
+        AND regexp_replace(n.listing_excerpt, $${maskIdx}, ' ', 'gi') ~* $${reIdx}
+      )
+      OR (
+        NULLIF(TRIM(COALESCE(n.listing_excerpt, '')), '') IS NULL
+        AND regexp_replace(COALESCE(m.message, ''), $${maskIdx}, ' ', 'gi') ~* $${reIdx}
+      )
+    )`;
+  } else if (listingKind === 'OFFER') {
+    queryText += ` AND UPPER(COALESCE(n.listing_kind, 'OFFER')) = 'OFFER'`;
+  } else if (propertyType && propertyType.toLowerCase() !== 'all' && !/^requirement/i.test(propertyType)) {
     params.push(`%${propertyType}%`);
     queryText += ` AND COALESCE(n.property_type, '') ILIKE $${params.length}`;
+  }
+
+  const priceFlagged = filters.priceFlagged === true || filters.price_flagged === true
+    || String(filters.priceFlagged || filters.price_flagged || '').toLowerCase() === 'true';
+  if (priceFlagged) {
+    queryText += ` AND n.price_flagged IS TRUE`;
   }
 
   const propertySubType = String(filters.propertySubType || '').trim();
@@ -2264,6 +2756,19 @@ function buildPropertySearchWhere(filters, userId) {
 }
 
 /** True if listing belongs to allowed location terms (strict relevancy). */
+function listingCardText(row) {
+  return [
+    row.area,
+    row.vicinity,
+    row.city,
+    row.location_text,
+    row.street_text,
+    row.summary,
+    row.listing_excerpt,
+    ...(Array.isArray(row.place_tags) ? row.place_tags : [])
+  ].map((x) => String(x || '')).join(' ');
+}
+
 function listingMatchesRegionTerms(row, terms) {
   if (!terms || !terms.length) return true;
   const tags = Array.isArray(row.place_tags) ? row.place_tags.map(placeNorm) : [];
@@ -2348,6 +2853,18 @@ function resolveSearchFilters(req) {
       rawFilters.property_type ||
       queryFilters.property_type ||
       '',
+    listingKind:
+      rawFilters.listingKind ||
+      rawFilters.listing_kind ||
+      queryFilters.listingKind ||
+      queryFilters.listing_kind ||
+      '',
+    priceFlagged:
+      rawFilters.priceFlagged ??
+      rawFilters.price_flagged ??
+      queryFilters.priceFlagged ??
+      queryFilters.price_flagged ??
+      '',
     propertySubType:
       rawFilters.propertySubType ||
       queryFilters.propertySubType ||
@@ -2413,7 +2930,7 @@ function resolveSearchFilters(req) {
 
 /** Exact match count — same WHERE as property search (no LIMIT). */
 async function countPropertySearch(filters, userId) {
-  const { queryText, params } = buildPropertySearchWhere(filters, userId);
+  const { queryText, params } = await buildPropertySearchWhere(filters, userId);
   const sql = `SELECT COUNT(*)::int AS hits ${queryText}`;
   const result = await db.query(sql, params);
   return result.rows[0]?.hits || 0;
@@ -2430,7 +2947,7 @@ const runPropertySearch = async (req) => {
     throw err;
   }
 
-  const { queryText: whereSql, params, parsedLocation, regionClass } = buildPropertySearchWhere(
+  const { queryText: whereSql, params, parsedLocation, regionClass } = await buildPropertySearchWhere(
     filters,
     userId
   );
@@ -2460,11 +2977,13 @@ const runPropertySearch = async (req) => {
 
   let queryText = `
     SELECT * FROM (
-      SELECT n.id, n.whatsapp_message_id, n.chat_jid, n.purpose, n.city, n.area, n.vicinity,
+      SELECT n.id, COALESCE(n.whatsapp_message_id, m.id) AS whatsapp_message_id, COALESCE(n.chat_jid, m.chat_jid) AS chat_jid, n.purpose, n.city, n.area, n.vicinity,
              n.property_type, n.property_sub_type, n.size, n.size_value, n.size_unit, n.price,
              COALESCE(NULLIF(TRIM(n.contact_number), ''), NULLIF(TRIM(m.sender_phone), '')) AS contact_number,
              n.summary, n.property_status, n.created_at, n.category, n.intent, n.sentiment,
-             n.listing_index, n.listing_excerpt, n.place_tags,
+             n.listing_index, n.listing_excerpt, n.place_tags, n.phase, n.phase_max,
+             n.listing_kind, n.price_flagged, n.price_flag_reason,
+             n.location_text, n.street_text,
              m.message AS raw_message,
              m.timestamp AS message_timestamp, m.from_me, m.user_id,
              m.seq_in_chat, m.seq_in_chat AS "seqInChat"
@@ -2483,8 +3002,28 @@ const runPropertySearch = async (req) => {
 
     let rows = dbResult.rows;
 
-    // 100% relevancy: parent/exact region terms must appear in place fields/tags/message
-    if (regionClass && regionClass.terms && regionClass.terms.length && regionClass.mode !== 'none') {
+    if (parsedLocation && parsedLocation.regionMode === 'message-id') {
+      rows = rows.map((r) => {
+        if (r.id != null) return r;
+        return {
+          ...r,
+          id: 0,
+          whatsapp_message_id: parsedLocation.messageId,
+          summary: 'Not normalized yet',
+          listing_excerpt: null,
+          property_status: 'AVAILABLE'
+        };
+      });
+    }
+
+    // Phase search: this card's phase, not a sibling offer in the same chat.
+    if (parsedLocation && String(parsedLocation.regionMode || '').startsWith('btk')) {
+      rows = rows.filter((r) => btkSearchKeeps(r, parsedLocation));
+    } else if (regionClass && regionClass.mode === 'phase' && parsedLocation && parsedLocation.phaseNumber != null) {
+      const want = parsedLocation.phaseNumber;
+      const areas = parsedLocation.googlePhaseAreas || [];
+      rows = rows.filter((r) => phaseSearchKeeps(r, want, areas));
+    } else if (regionClass && regionClass.terms && regionClass.terms.length && regionClass.mode !== 'none') {
       rows = rows.filter((r) => listingMatchesRegionTerms(r, regionClass.terms));
     }
 
@@ -2503,6 +3042,10 @@ const runPropertySearch = async (req) => {
       }
     }
 
+    if (parsedLocation && parsedLocation.regionMode === 'dha-all') {
+      rows = rows.filter((r) => !isDefenceViewPlace(r) && !isCliftonOnlyPlace(r));
+    }
+
     if (parsedLocation && parsedLocation.phaseNumber != null) {
       const want = parsedLocation.phaseNumber;
       const qLow = String(parsedLocation.rawQuery || filters.location || '').toLowerCase();
@@ -2518,14 +3061,7 @@ const runPropertySearch = async (req) => {
             return false;
           }
         }
-        if (textHasPhase(structured, want)) return true;
-        const raw = String(r.raw_message || '');
-        if (!textHasPhase(raw, want)) return false;
-        return Boolean(
-          String(r.property_type || '').trim() ||
-            String(r.size || '').trim() ||
-            String(r.price || '').trim()
-        );
+        return phaseSearchKeeps(r, want, parsedLocation.googlePhaseAreas || []);
       });
     }
 
@@ -2559,6 +3095,9 @@ const runPropertySearch = async (req) => {
 
     const deduped = filterAndSortProperties(rows, {
       ...filters,
+      scrapedMessageId: parsedLocation && parsedLocation.regionMode === 'message-id'
+        ? parsedLocation.messageId
+        : null,
       // Keep newest / relevance order already applied above when location search
       sortBy: parsedLocation ? 'Relevance' : filters.sortBy
     });
@@ -2571,6 +3110,15 @@ const runPropertySearch = async (req) => {
     );
     const effectiveTotal = hasJsRangeFilters ? deduped.length : totalMatched;
 
+    const phaseAreas = parsedLocation && (
+      parsedLocation.regionMode === 'phase'
+      || parsedLocation.regionMode === 'dha-all'
+      || String(parsedLocation.regionMode || '').startsWith('btk')
+    )
+      ? ((parsedLocation.phaseAreaLabels && parsedLocation.phaseAreaLabels.length)
+        ? parsedLocation.phaseAreaLabels
+        : (parsedLocation.googlePhaseAreas || []))
+      : [];
     return {
       filters,
       userId,
@@ -2580,6 +3128,10 @@ const runPropertySearch = async (req) => {
       // Unique cards in the fetched/deduped pool (better UX than raw SQL dups)
       uniqueInPool: deduped.length,
       totalReturned: properties.length,
+      phaseAreas,
+      phaseNumber: phaseAreas.length || (parsedLocation && parsedLocation.regionMode === 'phase')
+        ? parsedLocation.phaseNumber
+        : null,
       properties
     };
   } catch (err) {
@@ -2601,6 +3153,8 @@ const handlePropertyFilter = async (req, res) => {
       limit,
       offset,
       uniqueInPool,
+      phaseAreas,
+      phaseNumber,
       userId: searchUserId
     } = await runPropertySearch(req);
     const viewerId = resolveAuthUserId(req) || Number(searchUserId) || null;
@@ -2624,6 +3178,8 @@ const handlePropertyFilter = async (req, res) => {
       uniqueInPool: uniqueInPool != null ? uniqueInPool : enriched.length,
       limit: limit != null ? limit : enriched.length,
       offset: offset != null ? offset : 0,
+      phaseAreas: Array.isArray(phaseAreas) ? phaseAreas : [],
+      phaseNumber: phaseNumber != null ? phaseNumber : null,
       filters,
       properties: enriched
     }, 'Properties retrieved successfully');
@@ -2646,6 +3202,12 @@ function toDashboardSearchResult(p) {
     city: p.city || '',
     area: p.area || '',
     vicinity: p.vicinity || '',
+    phase: p.phase != null ? Number(p.phase) : null,
+    phase_max: p.phase_max != null ? Number(p.phase_max) : null,
+    listing_kind: p.listing_kind || p.listingKind || 'OFFER',
+    listing_excerpt: p.listingExcerpt || p.listing_excerpt || '',
+    price_flagged: Boolean(p.price_flagged),
+    price_flag_reason: p.price_flag_reason || null,
     property_type: p.propertyType || p.property_type || '',
     property_sub_type: p.propertySubType || p.property_sub_type || null,
     purpose: p.purpose || '',
@@ -2794,9 +3356,10 @@ const handleDashboardSearch = async (req, res) => {
       limit,
       offset,
       uniqueInPool,
+      phaseAreas,
+      phaseNumber,
       userId: searchUserId
     } = await runPropertySearch(req);
-    // Prefer JWT user; fall back to the tenant userId used for the SQL search
     const viewerId = resolveAuthUserId(req) || Number(searchUserId) || null;
     const withMeta = await attachPrivatePropertyMeta(viewerId, properties);
     const results = withMeta.map((p) =>
@@ -2817,6 +3380,8 @@ const handleDashboardSearch = async (req, res) => {
       limit: limit != null ? limit : results.length,
       offset: offset != null ? offset : 0,
       uniqueInPool: uniqueInPool != null ? uniqueInPool : results.length,
+      phaseAreas: Array.isArray(phaseAreas) ? phaseAreas : [],
+      phaseNumber: phaseNumber != null ? phaseNumber : null,
       results
     });
   } catch (err) {
@@ -2863,7 +3428,7 @@ app.get('/api/places/suggest', authenticateToken, async (req, res) => {
     return sendResponse(res, 200, false, { suggestions: [] }, 'OK');
   }
 
-  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 18, 1), 40);
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 18, 1), 80);
   const canonQ = canonicalizePlaceText(rawQ);
   const uniqTerms = [...new Set(
     [rawQ, canonQ]
@@ -2885,6 +3450,13 @@ app.get('/api/places/suggest', authenticateToken, async (req, res) => {
     if (t.length < 2) return false;
     return ['dha', 'defence', 'defense', 'defance'].some(
       (d) => d === t || (t.length >= 2 && d.startsWith(t))
+    );
+  });
+  const btkSuggestIntent = interpretBtkSearch(rawQ);
+  const queryWantsBtk = Boolean(btkSuggestIntent) || searchTerms.some((t) => {
+    if (t.length < 2) return false;
+    return ['btk', 'bahria', 'bahria town', 'precinct', 'precint'].some(
+      (d) => d === t || d.startsWith(t) || t.startsWith(d)
     );
   });
 
@@ -3052,6 +3624,30 @@ app.get('/api/places/suggest', authenticateToken, async (req, res) => {
           console.warn('dha suggest count failed:', err.message);
         }
       }
+    }
+
+    if (queryWantsBtk) {
+      const baseFilters = {
+        purpose: String(req.query.purpose || ''),
+        city: String(req.query.city || ''),
+        propertyType: String(req.query.propertyType || req.query.property_type || ''),
+        propertySubType: String(req.query.propertySubType || req.query.property_sub_type || ''),
+        status: String(req.query.status || req.query.propertyStatus || req.query.property_status || '')
+      };
+      try {
+        const hits = await countPropertySearch({ ...baseFilters, location: 'BTK' }, userId);
+        addSuggestion('Bahria Town Karachi', 'group', hits, { parent: true });
+        addSuggestion('BTK', 'group', hits, { parent: true });
+      } catch (err) {
+        console.warn('btk suggest count failed:', err.message);
+        addSuggestion('Bahria Town Karachi', 'group', 0, { parent: true });
+        addSuggestion('BTK', 'group', 0, { parent: true });
+      }
+      const intent = btkSuggestIntent || interpretBtkSearch('BTK');
+      const labels = (intent && intent.kind !== 'btk-all' && intent.chips && intent.chips.length)
+        ? intent.chips
+        : btkChipLabels();
+      for (const label of labels) addSuggestion(label, 'area', 0);
     }
 
     const scored = [...byKey.values()].map((s) => {
@@ -4024,6 +4620,25 @@ async function refreshLocalityGazetteer() {
   setInterval(() => {
     refreshLocalityGazetteer().catch(() => {});
   }, 30 * 60 * 1000);
+
+  const runBillingJobs = async () => {
+    try {
+      const lockedIds = await billing.refreshLocks(db);
+      if (lockedIds.length) {
+        const { sendBillingEmail } = require('./mailHelper');
+        const owners = await db.query('SELECT id, email FROM users WHERE id = ANY($1::int[])', [lockedIds]);
+        for (const row of owners.rows) {
+          sendBillingEmail({ to: row.email, kind: 'locked' })
+            .catch((e) => console.warn('[billing] email locked:', e.message));
+        }
+      }
+      await billing.purgeOldChats(db);
+    } catch (err) {
+      console.warn('[billing] maintenance:', err.message);
+    }
+  };
+  setTimeout(runBillingJobs, 15000);
+  setInterval(runBillingJobs, 6 * 60 * 60 * 1000);
 
   try {
     const started = startPipelineWorker();

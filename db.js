@@ -7,7 +7,9 @@ dns.setDefaultResultOrder('ipv4first');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false },
+  ssl: /localhost|127\.0\.0\.1/.test(process.env.DATABASE_URL || '')
+    ? false
+    : { rejectUnauthorized: false },
   // Supabase Transaction-mode pooler: keep max connections low to avoid ECHECKOUTTIMEOUT.
   max: parseInt(process.env.DB_POOL_MAX || '4', 10),
   idleTimeoutMillis: 30000,
@@ -282,6 +284,21 @@ async function runMigrationSteps(client) {
     `CREATE INDEX IF NOT EXISTS idx_property_comments_user_property
        ON property_comments (user_id, property_id, created_at DESC)`,
     // Place hierarchy tags (background-resolved; used by search expand)
+    `CREATE TABLE IF NOT EXISTS google_phase_area_sets (
+      phase_number SMALLINT PRIMARY KEY,
+      area_names TEXT[] NOT NULL DEFAULT '{}',
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )`,
+    `CREATE TABLE IF NOT EXISTS google_phase_places (
+      area_key TEXT PRIMARY KEY,
+      area_name TEXT NOT NULL,
+      phase_name TEXT,
+      phase_number SMALLINT,
+      formatted_address TEXT,
+      lat DOUBLE PRECISION,
+      lng DOUBLE PRECISION,
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )`,
     `CREATE TABLE IF NOT EXISTS place_regions (
       parent_key TEXT PRIMARY KEY,
       aliases TEXT[] NOT NULL DEFAULT '{}',
@@ -296,6 +313,10 @@ async function runMigrationSteps(client) {
            ALTER TABLE normalized_messages ADD COLUMN IF NOT EXISTS geo_lat DOUBLE PRECISION;
            ALTER TABLE normalized_messages ADD COLUMN IF NOT EXISTS geo_lng DOUBLE PRECISION;
            ALTER TABLE normalized_messages ADD COLUMN IF NOT EXISTS place_resolved_at TIMESTAMPTZ;
+           ALTER TABLE normalized_messages ADD COLUMN IF NOT EXISTS listing_kind TEXT;
+           ALTER TABLE normalized_messages ADD COLUMN IF NOT EXISTS phase_max SMALLINT;
+           ALTER TABLE normalized_messages ADD COLUMN IF NOT EXISTS price_flagged BOOLEAN DEFAULT FALSE;
+           ALTER TABLE normalized_messages ADD COLUMN IF NOT EXISTS price_flag_reason TEXT;
            CREATE INDEX IF NOT EXISTS idx_nm_place_tags
              ON normalized_messages USING gin (place_tags);
          EXCEPTION WHEN insufficient_privilege THEN
@@ -318,7 +339,59 @@ async function runMigrationSteps(client) {
     )`,
     `CREATE INDEX IF NOT EXISTS idx_trash_run ON trash (run_id)`,
     `CREATE INDEX IF NOT EXISTS idx_trash_source_orig ON trash (source_table, original_id)`,
-    `CREATE INDEX IF NOT EXISTS idx_trash_trashed_at ON trash (trashed_at DESC)`
+    `CREATE INDEX IF NOT EXISTS idx_trash_trashed_at ON trash (trashed_at DESC)`,
+    `CREATE TABLE IF NOT EXISTS openai_api_counter (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      total_hits BIGINT NOT NULL DEFAULT 0,
+      last_hit_at TIMESTAMPTZ
+    )`,
+    `INSERT INTO openai_api_counter (id, total_hits) VALUES (1, 0) ON CONFLICT (id) DO NOTHING`,
+    `CREATE TABLE IF NOT EXISTS openai_api_hits (
+      id BIGSERIAL PRIMARY KEY,
+      hit_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      message_id INTEGER,
+      user_id INTEGER,
+      model TEXT,
+      ok BOOLEAN NOT NULL DEFAULT FALSE,
+      http_status INTEGER,
+      attempt INTEGER
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_openai_api_hits_hit_at ON openai_api_hits (hit_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_openai_api_hits_message ON openai_api_hits (message_id)`,
+    `CREATE TABLE IF NOT EXISTS subscriptions (
+      user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      status TEXT NOT NULL DEFAULT 'unpaid',
+      amount_pkr INTEGER NOT NULL DEFAULT 7000,
+      current_period_start TIMESTAMPTZ,
+      current_period_end TIMESTAMPTZ,
+      grace_until TIMESTAMPTZ,
+      last_paid_at TIMESTAMPTZ,
+      safepay_subscription_id TEXT,
+      safepay_customer_id TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      lock_emailed_at TIMESTAMPTZ
+    )`,
+    `ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS lock_emailed_at TIMESTAMPTZ`,
+    `CREATE TABLE IF NOT EXISTS payments (
+      id BIGSERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      amount_pkr INTEGER NOT NULL DEFAULT 7000,
+      status TEXT NOT NULL DEFAULT 'succeeded',
+      safepay_ref TEXT,
+      source TEXT NOT NULL DEFAULT 'safepay',
+      payload JSONB,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_payments_user ON payments (user_id, created_at DESC)`,
+    `INSERT INTO subscriptions (user_id, status, amount_pkr)
+     SELECT id, 'complimentary', 7000 FROM users
+      WHERE LOWER(COALESCE(role, 'user')) <> 'admin'
+     ON CONFLICT (user_id) DO NOTHING`,
+    `INSERT INTO subscriptions (user_id, status, amount_pkr)
+     SELECT id, 'complimentary', 0 FROM users
+      WHERE LOWER(COALESCE(role, 'user')) = 'admin'
+     ON CONFLICT (user_id) DO NOTHING`
   ];
 
   for (const sql of steps) {

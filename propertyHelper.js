@@ -3,7 +3,7 @@
  */
 const {
   normalizeFingerprintText,
-  bodyDedupeKey,
+  bodyExactKey,
   pickListingBodyText,
   listingContentFingerprint
 } = require('./contentFingerprint');
@@ -50,6 +50,8 @@ const {
   matchLocality,
   canonicalizePlaceText
 } = require('./pakistanLocalities');
+const { isRequirementFilter, isRequirementListing } = require('./ai/extract/listingKind');
+const { inferredYardages } = require('./ai/btkPrecincts');
 
 /** Roman / English word ↔ Arabic for DHA-style phase queries. */
 const ROMAN_TO_INT = Object.freeze({
@@ -267,7 +269,7 @@ function parsePriceInPKR(priceStr, rawMsg) {
   // When scanning raw WhatsApp text, require a price cue so phone digits are not used
   const scanningRaw = !primary && Boolean(rawMsg);
   if (scanningRaw) {
-    const hasPriceCue = /(?:\b(?:cr|crore|cror|crores|lac|lacs|lakh|lakhs|million|price|demand|pkr|rs\.?)\b|\b\d+(?:\.\d+)?\s*(?:cr|lac|lakh))/i.test(str);
+    const hasPriceCue = /(?:\b(?:cr|crore|cror|crores|lac|lacs|lakh|lakhs|million|price|demand|pkr|rs\.?)\b|\b\d+(?:\.\d+)?\s*(?:cr|lac|lakh)|@\s*\d)/i.test(str);
     if (!hasPriceCue) return null;
   }
 
@@ -424,21 +426,7 @@ function dedupeListings(items) {
 
   const isBodyDup = (key) => {
     if (!key) return false;
-    for (let i = 0; i < seenBodyOnly.length; i++) {
-      const seen = seenBodyOnly[i];
-      if (seen === key) return true;
-      // Near-identical: shorter is mostly the same offer as longer (title prefix/suffix)
-      const short = seen.length <= key.length ? seen : key;
-      const long = seen.length <= key.length ? key : seen;
-      if (
-        short.length >= 32 &&
-        short.length / long.length >= 0.72 &&
-        long.includes(short)
-      ) {
-        return true;
-      }
-    }
-    return false;
+    return seenBodyOnly.includes(key);
   };
 
   for (const item of items) {
@@ -461,7 +449,7 @@ function dedupeListings(items) {
 
     // Same offer body across different message ids / summaries (reposts).
     // Aggressive key + containment so short/emoji/punct variants collapse.
-    const bodyOnly = bodyDedupeKey(pickListingBodyText(item));
+    const bodyOnly = bodyExactKey(pickListingBodyText(item));
     if (bodyOnly) {
       if (isBodyDup(bodyOnly)) continue;
       seenBodyOnly.push(bodyOnly);
@@ -556,6 +544,16 @@ function isListingNoise(item) {
   return false;
 }
 
+function cardLocation(r) {
+  const written = r.vicinity || r.area || r.city;
+  if (written) return written;
+  const tags = Array.isArray(r.place_tags) ? r.place_tags : [];
+  const tag = tags.find((t) => String(t || '').trim());
+  if (tag) return String(tag).trim();
+  if (r.phase != null && String(r.phase).trim() !== '') return `Phase ${r.phase}`;
+  return null;
+}
+
 function filterAndSortProperties(rawRows, filters = {}) {
   const targetUnit = filters.areaUnit || 'Sq. Ft.';
   // Tiny tolerance so exact min=max still matches float conversions (e.g. marla→ft)
@@ -582,7 +580,7 @@ function filterAndSortProperties(rawRows, filters = {}) {
       sender: r.sender,
       purpose: r.purpose || 'SALE',
       city: r.city,
-      location: r.vicinity || r.area || r.city,
+      location: cardLocation(r),
       area: r.area,
       vicinity: r.vicinity,
       propertyType: r.property_type,
@@ -600,6 +598,12 @@ function filterAndSortProperties(rawRows, filters = {}) {
       property_status: (r.property_status || 'AVAILABLE').toUpperCase(),
       rawMessage: r.raw_message,
       listingExcerpt: r.listing_excerpt || null,
+      phase: r.phase != null ? Number(r.phase) : null,
+      phase_max: r.phase_max != null ? Number(r.phase_max) : null,
+      listing_kind: r.listing_kind || r.listingKind || 'OFFER',
+      listingKind: r.listing_kind || r.listingKind || 'OFFER',
+      price_flagged: Boolean(r.price_flagged),
+      price_flag_reason: r.price_flag_reason || null,
       placeTags: Array.isArray(r.place_tags) ? r.place_tags : [],
       place_tags: Array.isArray(r.place_tags) ? r.place_tags : [],
       fromMe: r.from_me || r.fromMe || false,
@@ -610,8 +614,13 @@ function filterAndSortProperties(rawRows, filters = {}) {
     };
   });
 
-  // Drop signature / bare-location junk cards
-  items = items.filter((item) => !isListingNoise(item));
+  if (!filters.scrapedMessageId) {
+    items = items.filter((item) => !isListingNoise(item));
+  }
+
+  if (isRequirementFilter(filters)) {
+    items = items.filter(isRequirementListing);
+  }
 
   // Price Min Filter
   if (filters.priceMin !== undefined && filters.priceMin !== null && String(filters.priceMin).trim() !== '') {
@@ -634,24 +643,29 @@ function filterAndSortProperties(rawRows, filters = {}) {
   const hasAreaMax = filters.areaMax !== undefined && filters.areaMax !== null && String(filters.areaMax).trim() !== '';
   const minA = hasAreaMin ? parseFloat(filters.areaMin) : NaN;
   const maxA = hasAreaMax ? parseFloat(filters.areaMax) : NaN;
-
-  if (hasAreaMin && hasAreaMax && !isNaN(minA) && !isNaN(maxA) && minA === maxA) {
-    items = items.filter(
-      (r) =>
-        r.parsedAreaInTargetUnit !== null &&
-        Math.abs(r.parsedAreaInTargetUnit - minA) <= AREA_EPS
-    );
-  } else {
-    if (hasAreaMin && !isNaN(minA)) {
-      items = items.filter(
-        (r) => r.parsedAreaInTargetUnit !== null && r.parsedAreaInTargetUnit + AREA_EPS >= minA
-      );
+  const areaCandidates = (r) => {
+    if (r.parsedAreaInTargetUnit != null && !Number.isNaN(r.parsedAreaInTargetUnit)) {
+      return [r.parsedAreaInTargetUnit];
     }
-    if (hasAreaMax && !isNaN(maxA)) {
-      items = items.filter(
-        (r) => r.parsedAreaInTargetUnit !== null && r.parsedAreaInTargetUnit - AREA_EPS <= maxA
-      );
-    }
+    const yards = inferredYardages(r);
+    if (!yards || !yards.length) return [];
+    return yards
+      .map((y) => convertAreaValue(y, 'Sq. Yd.', targetUnit))
+      .filter((n) => n != null && !Number.isNaN(n));
+  };
+  if (hasAreaMin || hasAreaMax) {
+    items = items.filter((r) => {
+      const vals = areaCandidates(r);
+      if (!vals.length) return false;
+      return vals.some((n) => {
+        if (hasAreaMin && hasAreaMax && !isNaN(minA) && !isNaN(maxA) && minA === maxA) {
+          return Math.abs(n - minA) <= AREA_EPS;
+        }
+        if (hasAreaMin && !isNaN(minA) && n + AREA_EPS < minA) return false;
+        if (hasAreaMax && !isNaN(maxA) && n - AREA_EPS > maxA) return false;
+        return true;
+      });
+    });
   }
 
   // Sorting

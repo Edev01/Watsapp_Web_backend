@@ -1,9 +1,13 @@
 const db = require('./db');
 
-const DEFAULT_MODEL = process.env.NORMALIZE_MODEL || 'openai/gpt-oss-20b';
+const DEFAULT_MODEL =
+  process.env.EXTRACT_PROVIDER
+    ? 'extract-v2'
+    : process.env.NORMALIZE_MODEL || 'openai/gpt-oss-20b';
 
 /**
  * Counts for one portal user's normalization progress.
+ * Pending = raw messages with no normalized_messages row (any model), matching the worker.
  */
 async function getNormalizeCounts(userId, model = DEFAULT_MODEL) {
   const uid = Number(userId);
@@ -16,24 +20,27 @@ async function getNormalizeCounts(userId, model = DEFAULT_MODEL) {
     ),
     db.query(
       `SELECT COUNT(*)::int AS c
-       FROM normalized_messages n
-       JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
-       WHERE m.user_id = $1 AND n.model_used = $2`,
-      [uid, model]
+       FROM whatsapp_messages m
+       WHERE m.user_id = $1
+         AND m.message IS NOT NULL AND TRIM(m.message) <> ''
+         AND EXISTS (
+           SELECT 1 FROM normalized_messages n WHERE n.whatsapp_message_id = m.id
+         )`,
+      [uid]
     ),
     db.query(
       `SELECT COUNT(*)::int AS c
        FROM normalized_messages n
        JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
-       WHERE m.user_id = $1 AND n.model_used = $2 AND n.is_property = true`,
-      [uid, model]
+       WHERE m.user_id = $1 AND n.is_property = true`,
+      [uid]
     ),
     db.query(
       `SELECT COUNT(*)::int AS c
        FROM message_embeddings e
        JOIN whatsapp_messages m ON m.id = e.whatsapp_message_id
-       WHERE m.user_id = $1 AND e.model_used = $2`,
-      [uid, model]
+       WHERE m.user_id = $1`,
+      [uid]
     )
   ]);
 

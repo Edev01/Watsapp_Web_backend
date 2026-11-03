@@ -79,10 +79,60 @@ def normalize_fingerprint_text(s: str) -> str:
     return _WS_RE.sub(" ", t).strip()
 
 
-def body_dedupe_key(text: str, min_len: int = 8, max_len: int = 500) -> Optional[str]:
-    """Aggressive same-body key — letters/digits/spaces only."""
-    n = normalize_fingerprint_text(text)
-    n = re.sub(r"[./-]+", " ", n)
+_PHONE_RE = re.compile(r"(?:\+?92|0)?3\d{2}[\s-]?\d{7}|\+?\d{10,15}")
+_CONTACT_LINE_RE = re.compile(
+    r"^(?:contact|whats?app|wa|call|mobile|phone|cell|number|regards|thanks|thank\s+you|sent\s+by|for\s+details)\b[:.\-\s]*",
+    re.I,
+)
+_PROPERTY_NAME_BLOCK = re.compile(
+    r"\b(?:phase|plot|yard|gaz|flat|house|bungalow|shop|demand|budget|street|dha|defence|commercial|size|sq)\b",
+    re.I,
+)
+
+
+def _is_name_line(line: str) -> bool:
+    t = re.sub(r"[.,!]", "", str(line or "")).strip()
+    if not t or len(t) > 48 or re.search(r"\d", t):
+        return False
+    if _PROPERTY_NAME_BLOCK.search(t):
+        return False
+    words = [w for w in t.split() if w]
+    return 1 <= len(words) <= 4 and re.fullmatch(r"[\w\s.'-]+", t, re.UNICODE) is not None
+
+
+def _is_contact_or_name_line(line: str) -> bool:
+    t = str(line or "").strip()
+    if not t:
+        return True
+    if _PHONE_RE.search(t):
+        return True
+    if _CONTACT_LINE_RE.match(t):
+        return True
+    return _is_name_line(t)
+
+
+def strip_trailing_contact_and_name(raw: str) -> str:
+    lines = [ln.strip() for ln in str(raw or "").replace("\r", "").split("\n")]
+    while lines:
+        last = lines[-1]
+        if not last or _is_contact_or_name_line(last):
+            lines.pop()
+            continue
+        without_phone = _WS_RE.sub(" ", _PHONE_RE.sub(" ", last)).strip()
+        if without_phone != last:
+            if not without_phone or _is_contact_or_name_line(without_phone):
+                lines.pop()
+                continue
+            lines[-1] = without_phone
+            continue
+        break
+    return "\n".join(lines).strip()
+
+
+def body_dedupe_key(text: str, min_len: int = 8, max_len: int = 800) -> Optional[str]:
+    """Same body except trailing contact/name. Any other character keeps both."""
+    n = strip_trailing_contact_and_name(text).lower()
+    n = _MD_RE.sub(" ", n)
     n = _WS_RE.sub(" ", n).strip()
     if len(n) < min_len:
         return None
@@ -105,15 +155,10 @@ def pick_listing_body_text(row: Dict[str, Any]) -> str:
 
 
 def bodies_are_same(a: str, b: str) -> bool:
-    """Exact body match, or near-identical (title prefix / punct variant)."""
+    """Exact body match after contact/name strip. One different character = two messages."""
     if not a or not b:
         return False
-    if a == b:
-        return True
-    short, long = (a, b) if len(a) <= len(b) else (b, a)
-    if len(short) >= 32 and len(short) / len(long) >= 0.72 and short in long:
-        return True
-    return False
+    return a == b
 
 
 def short_key(s: str) -> str:

@@ -520,6 +520,77 @@ function buildSmartLocationSql(parsed, searchableExpr, params) {
   };
 }
 
+/** Regex that matches a written phase other than `want` (1–12). */
+function buildOtherPhaseRegex(want) {
+  const skip = Number(want);
+  const parts = [];
+  for (let n = 1; n <= 12; n += 1) {
+    if (n === skip) continue;
+    parts.push(buildPhaseRegex(n));
+  }
+  return parts.join('|');
+}
+
+function locationPhaseText(row) {
+  return [row?.area, row?.vicinity, row?.city, row?.location_text, row?.street_text]
+    .map((x) => String(x || ''))
+    .join(' ');
+}
+
+/** The card's own place line names a different phase, and not the one searched. */
+function locationNamesOtherPhase(row, want) {
+  const text = locationPhaseText(row);
+  if (textHasPhase(text, want)) return false;
+  for (let n = 1; n <= 12; n += 1) {
+    if (n !== Number(want) && textHasPhase(text, n)) return true;
+  }
+  return false;
+}
+
+/**
+ * Keep a card for a phase search.
+ * A place line that says another phase is out, even when the stored phase
+ * number matches or the message body mentions this phase.
+ */
+function isDefenceViewPlace(row) {
+  return /\bdefen[cs]e\s+view\b/i.test(locationPhaseText(row));
+}
+
+function isCliftonOnlyPlace(row) {
+  const text = locationPhaseText(row);
+  return /\bclifton\b/i.test(text) && !/\b(dha|d\.h\.a)\b/i.test(text);
+}
+
+function listingCoversPhase(row, want) {
+  const wanted = Number(want);
+  const phase = row?.phase == null || row?.phase === '' ? null : Number(row.phase);
+  const max = row?.phase_max == null || row?.phase_max === '' ? phase : Number(row.phase_max);
+  if (phase == null) return false;
+  if (phase === wanted) return true;
+  if (max != null && phase <= wanted && max >= wanted) return true;
+  return false;
+}
+
+function phaseSearchKeeps(row, want, areas) {
+  const wanted = Number(want);
+  if (!wanted) return true;
+  if (isDefenceViewPlace(row) || isCliftonOnlyPlace(row)) return false;
+  if (listingCoversPhase(row, wanted)) {
+    const phase = Number(row.phase);
+    const max = row.phase_max == null || row.phase_max === '' ? phase : Number(row.phase_max);
+    if (max !== phase) return true;
+    if (locationNamesOtherPhase(row, wanted)) return false;
+    return true;
+  }
+  if (locationNamesOtherPhase(row, wanted)) return false;
+  const loc = locationPhaseText(row).toLowerCase();
+  if (textHasPhase(loc, wanted)) return true;
+  return (areas || []).some((name) => {
+    const n = String(name || '').toLowerCase().trim();
+    return n.length >= 4 && loc.includes(n);
+  });
+}
+
 /** JS-side guard: does text contain phase N with proper boundaries? */
 function textHasPhase(text, num) {
   const t = String(text || '').toLowerCase();
@@ -559,9 +630,16 @@ function scoreLocationMatch(row, parsed) {
     else score -= 100;
   }
 
+  const googleAreas = Array.isArray(parsed.googlePhaseAreas) ? parsed.googlePhaseAreas : [];
+  const areaHit = googleAreas.some((name) => {
+    const n = String(name || '').toLowerCase().trim();
+    return n.length >= 4 && text.includes(n);
+  });
+  if (areaHit) score += 60;
+
   if (parsed.phaseNumber != null) {
     if (textHasPhase(text, parsed.phaseNumber)) score += 100;
-    else if (score < 80) score -= 100;
+    else if (!areaHit && score < 80) score -= 100;
     // Penalize other phases dominating vicinity/area
     for (let p = 1; p <= 12; p += 1) {
       if (p === parsed.phaseNumber) continue;
@@ -585,6 +663,70 @@ function scoreLocationMatch(row, parsed) {
   return score;
 }
 
+const DHA_ONLY = /^(?:dha|defence|defense|defance)(?:\s+karachi)?$/;
+const GENERIC_TAIL = new Set([
+  'city', 'town', 'area', 'society', 'karachi', 'pakistan', 'housing', 'authority'
+]);
+
+/**
+ * DHA / phase queries stay one search. They are not split into
+ * "dha" plus the rest (that union returns every DHA listing).
+ * - "dha" → every DHA listing
+ * - "dha phase 6" → that phase only
+ * - "dha bukhari" → that area only
+ */
+/** Scraped WhatsApp row id: "12377", "#12377", "id:12377". */
+function parseScrapedMessageId(raw) {
+  const text = String(raw || '').trim();
+  const match = text.match(/^(?:id\s*[:=]?\s*|#)?(\d+)$/i);
+  if (!match) return null;
+  const id = Number(match[1]);
+  if (!Number.isInteger(id) || id < 1) return null;
+  return id;
+}
+
+function interpretDhaSearch(raw) {
+  let text = correctPhaseTypos(String(raw || ''));
+  text = normalizeSpaces(text.replace(/[,]+/g, ' ')).toLowerCase().replace(/\./g, '');
+  if (!text) return { kind: 'other', phaseNumber: null, area: '' };
+  if (parseScrapedMessageId(raw) != null) {
+    return { kind: 'message-id', phaseNumber: null, area: '', messageId: parseScrapedMessageId(raw) };
+  }
+
+  if (/^(dck|d c k)$/.test(text) || /^dha city/.test(text)) {
+    return { kind: 'phrase', phaseNumber: null, area: 'dha city' };
+  }
+  if (/\bdefen[cs]e\s+view\b/.test(text)) {
+    return { kind: 'other', phaseNumber: null, area: text };
+  }
+  if (/\bclifton\b/.test(text)) {
+    return { kind: 'other', phaseNumber: null, area: text };
+  }
+  if (/\b(?:sector|precinct)\b/.test(text) && !/\bphase\b/.test(text)) {
+    return { kind: 'other', phaseNumber: null, area: text };
+  }
+
+  const phaseRe =
+    /\b(?:phase|pahse|phse|fase|ph)\s*([ivxlcdm]{1,6}|\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b/i;
+  const phaseMatch = text.match(phaseRe);
+  if (phaseMatch) {
+    const phaseNumber = parsePhaseNumber(phaseMatch[1]);
+    if (phaseNumber) return { kind: 'phase', phaseNumber, area: '' };
+  }
+
+  if (DHA_ONLY.test(text)) return { kind: 'dha-all', phaseNumber: null, area: '' };
+
+  const prefixed = text.match(/^(?:dha|defence|defense|defance)\s+(.+)$/);
+  if (!prefixed) return { kind: 'other', phaseNumber: null, area: '' };
+
+  const area = prefixed[1].trim();
+  const tailTokens = area.split(/\s+/).filter(Boolean);
+  if (!area || tailTokens.every((tok) => GENERIC_TAIL.has(tok))) {
+    return { kind: 'phrase', phaseNumber: null, area: text };
+  }
+  return { kind: 'area', phaseNumber: null, area };
+}
+
 module.exports = {
   parseSmartLocationQuery,
   buildSmartLocationSql,
@@ -592,8 +734,16 @@ module.exports = {
   buildStreetRegex,
   textHasPhase,
   textHasStreet,
+  buildOtherPhaseRegex,
+  locationNamesOtherPhase,
+  phaseSearchKeeps,
   streetMatchText,
   scoreLocationMatch,
   khayabanForms,
-  correctPhaseTypos
+  correctPhaseTypos,
+  interpretDhaSearch,
+  listingCoversPhase,
+  isDefenceViewPlace,
+  isCliftonOnlyPlace,
+  parseScrapedMessageId
 };

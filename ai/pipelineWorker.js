@@ -1,8 +1,17 @@
 const db = require('../db');
 const { getConfig, getConfigSafe } = require('./config');
-const { LLMClient } = require('./llmClient');
-const { processUnnormalizedMessages } = require('./normalizer');
-const { generateAndStoreEmbeddings } = require('./embeddings');
+const { processUnnormalizedMessages, useExtractV2 } = require('./normalizer');
+
+async function generateAndStoreEmbeddings(opts) {
+  try {
+    return await require('./embeddings').generateAndStoreEmbeddings(opts);
+  } catch (err) {
+    if (err.code === 'MODULE_NOT_FOUND') {
+      return { successCount: 0, failCount: 0, skipped: true, error: err.message };
+    }
+    throw err;
+  }
+}
 
 let wakeResolve = null;
 let wakePromise = null;
@@ -13,6 +22,15 @@ let shuttingDown = false;
 let runLock = false;
 let llmClient = null;
 
+function ensureLlmClient() {
+  if (useExtractV2()) return null;
+  if (!llmClient) {
+    const { LLMClient } = require('./llmClient');
+    llmClient = new LLMClient();
+  }
+  return llmClient;
+}
+
 const stats = {
   running: false,
   lastRun: null,
@@ -21,8 +39,48 @@ const stats = {
   totalNormalized: 0,
   totalEmbedded: 0,
   lastError: null,
-  currentUserId: null
+  currentUserId: null,
+  consecutiveQuotaBatches: 0,
+  lastQuotaEmailAt: null
 };
+
+const QUOTA_EMAIL_STREAK = Number(process.env.RENORMALIZE_QUOTA_ABORT_STREAK || 3);
+const QUOTA_EMAIL_COOLDOWN_MS = 30 * 60 * 1000;
+
+async function maybeEmailQuotaStop({ gemini = 0, together = 0, detail = '' } = {}) {
+  const now = Date.now();
+  if (stats.lastQuotaEmailAt && now - stats.lastQuotaEmailAt < QUOTA_EMAIL_COOLDOWN_MS) {
+    return;
+  }
+  stats.lastQuotaEmailAt = now;
+  try {
+    const { sendRenormalizeStopEmail } = require('../mailHelper');
+    await sendRenormalizeStopEmail({
+      stopReason: 'live_pipeline_quota_pause',
+      dryRun: false,
+      userId: stats.currentUserId,
+      extractProvider: process.env.EXTRACT_PROVIDER || 'together',
+      extractFallback: process.env.EXTRACT_FALLBACK_PROVIDER || '',
+      total: 0,
+      done: stats.totalNormalized,
+      errors: stats.consecutiveQuotaBatches,
+      property: 0,
+      rateLimit: {
+        gemini429: gemini,
+        together429: together > 0 && !/402|credit/i.test(detail) ? together : 0,
+        together402: /402|credit/i.test(detail) ? Math.max(together, 1) : 0,
+        geminiOther: 0,
+        togetherOther: 0
+      },
+      rateLimitNote: detail || 'Live pipeline hit API quota/rate limits and paused this drain cycle.',
+      sampleErrors: [detail].filter(Boolean),
+      finishedAt: new Date().toISOString()
+    });
+    console.warn('[pipeline] Quota stop email sent');
+  } catch (e) {
+    console.warn('[pipeline] Quota stop email failed:', e.message);
+  }
+}
 
 function armWake() {
   if (!wakePromise) {
@@ -178,7 +236,7 @@ async function processJob(job) {
 
   while (!shuttingDown && idleWaves < 2) {
     const result = await processUnnormalizedMessages({
-      llmClient,
+      llmClient: ensureLlmClient(),
       modelName: model,
       batchSize,
       userId,
@@ -186,6 +244,21 @@ async function processJob(job) {
     });
 
     totalNorm += result.successCount;
+    if (result.rateLimited > 0 && result.successCount === 0) {
+      stats.consecutiveQuotaBatches += 1;
+      if (stats.consecutiveQuotaBatches >= QUOTA_EMAIL_STREAK) {
+        await maybeEmailQuotaStop({
+          gemini: result.quotaHits?.gemini || 0,
+          together: result.quotaHits?.together || 0,
+          detail: `Batch all rate/quota limited (gemini=${result.quotaHits?.gemini || 0}, together=${result.quotaHits?.together || 0})`
+        });
+        console.warn('[pipeline] Pausing job drain after consecutive quota batches');
+        break;
+      }
+    } else if (result.successCount > 0) {
+      stats.consecutiveQuotaBatches = 0;
+    }
+
     if (result.successCount > 0) {
       await bumpJobProgress(userId, result.successCount);
       idleWaves = 0;
@@ -265,7 +338,7 @@ async function drainOnce(preferredUserId = null) {
     // Opportunistic fair drain for any pending without a job row (legacy / auto)
     const cfg = getConfig();
     const result = await processUnnormalizedMessages({
-      llmClient,
+      llmClient: ensureLlmClient(),
       modelName: cfg.defaultModel,
       batchSize: Math.max(32, cfg.normalizeConcurrency * 2),
       userId: preferredUserId,
@@ -273,16 +346,19 @@ async function drainOnce(preferredUserId = null) {
     });
     let embedded = 0;
     let embedError = null;
-    try {
-      const emb = await generateAndStoreEmbeddings({
-        targetLlmModel: cfg.defaultModel,
-        userId: preferredUserId,
-        limit: 200
-      });
-      embedded = emb.successCount;
-      if (emb.error) embedError = emb.error;
-    } catch (err) {
-      embedError = err.message;
+    // Skip embeddings when local Ollama/openai deps aren't installed — normalize still runs.
+    if (process.env.EMBEDDING_BASE_URL && !/localhost|127\.0\.0\.1/.test(process.env.EMBEDDING_BASE_URL)) {
+      try {
+        const emb = await generateAndStoreEmbeddings({
+          targetLlmModel: cfg.defaultModel,
+          userId: preferredUserId,
+          limit: 200
+        });
+        embedded = emb.successCount;
+        if (emb.error && !/Cannot find module/.test(String(emb.error))) embedError = emb.error;
+      } catch (err) {
+        if (!/Cannot find module/.test(String(err.message))) embedError = err.message;
+      }
     }
     return {
       normalized: result.successCount,
@@ -303,9 +379,9 @@ async function drainOnce(preferredUserId = null) {
 
 async function runLoop() {
   const cfg = getConfig();
-  llmClient = new LLMClient();
+  ensureLlmClient();
   console.info(
-    `[pipeline] Worker started (model=${cfg.defaultModel}, concurrency=${cfg.normalizeConcurrency}, mode=${cfg.pipelineMode})`
+    `[pipeline] Worker started (extract-v2=${useExtractV2()} model=${cfg.defaultModel}, concurrency=${cfg.normalizeConcurrency}, mode=${cfg.pipelineMode})`
   );
 
   while (!shuttingDown) {
