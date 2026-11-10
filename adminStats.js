@@ -183,7 +183,26 @@ async function listUsers(db) {
     ) mon ON TRUE
     ORDER BY u.id ASC
   `);
-  return rows;
+  const { daysRemaining, hasAccess, GRACE_DAYS } = require('./billing');
+  return rows.map((row) => {
+    const sub = {
+      status: row.billing_status || 'unpaid',
+      grace_until: row.grace_until,
+      current_period_end: row.current_period_end
+    };
+    const allowed = String(row.role || '').toLowerCase() === 'admin'
+      ? true
+      : hasAccess(sub);
+    return {
+      ...row,
+      days_left: String(row.role || '').toLowerCase() === 'admin'
+        ? null
+        : daysRemaining(sub),
+      allowed,
+      paywall: !allowed,
+      grace_days: GRACE_DAYS
+    };
+  });
 }
 
 async function usageSummary(db, {

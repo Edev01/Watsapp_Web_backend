@@ -384,8 +384,16 @@ async function runMigrationSteps(client) {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`,
     `CREATE INDEX IF NOT EXISTS idx_payments_user ON payments (user_id, created_at DESC)`,
-    `INSERT INTO subscriptions (user_id, status, amount_pkr)
-     SELECT id, 'complimentary', 7000 FROM users
+    // Non-admins missing a row start unpaid with no grace (must subscribe day one).
+    `INSERT INTO subscriptions (user_id, status, amount_pkr, current_period_start, current_period_end, grace_until)
+     SELECT
+       id,
+       'unpaid',
+       7000,
+       NULL,
+       NULL,
+       NULL
+     FROM users
       WHERE LOWER(COALESCE(role, 'user')) <> 'admin'
      ON CONFLICT (user_id) DO NOTHING`,
     `INSERT INTO subscriptions (user_id, status, amount_pkr)

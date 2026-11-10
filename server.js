@@ -676,13 +676,24 @@ app.post('/api/users', authenticateToken, isAdmin, async (req, res) => {
       [email, passwordHash, 'user', true, name || null, phone_number || null]
     );
     const created = result.rows[0];
+    let createdBilling = null;
     try {
-      await billing.ensureSubscription(db, created, { existingFree: false });
+      const sub = await billing.ensureSubscription(db, created, { existingFree: false });
+      createdBilling = billing.publicBilling(sub);
+      created.billing = createdBilling;
     } catch (billErr) {
       console.warn('[billing] create-user subscription failed:', billErr.message);
     }
 
-    return sendResponse(res, 201, false, created, 'User account created successfully');
+    return sendResponse(
+      res,
+      201,
+      false,
+      created,
+      createdBilling
+        ? `User created. Must subscribe (PKR ${billing.PLAN_AMOUNT_PKR}/month) before using the portal.`
+        : 'User account created successfully'
+    );
   } catch (err) {
     console.error('Create user error:', err);
     return sendResponse(res, 500, true, null, err.message || 'Server error');
@@ -736,9 +747,16 @@ app.post('/api/billing/checkout', authenticateToken, async (req, res) => {
       return sendResponse(res, 400, true, null, 'Admins are not billed');
     }
     await billing.ensureSubscription(db, req.user);
+    const profile = await db.query(
+      'SELECT id, email, name, phone_number FROM users WHERE id = $1',
+      [req.user.id]
+    );
+    const userRow = profile.rows[0] || req.user;
     const checkout = await safepayClient.createSubscriptionCheckout({
-      userId: req.user.id,
-      email: req.user.email
+      userId: userRow.id || req.user.id,
+      email: userRow.email || req.user.email,
+      name: userRow.name || '',
+      phone: userRow.phone_number || ''
     });
     return sendResponse(res, 200, false, checkout, 'Checkout created');
   } catch (err) {
@@ -834,8 +852,12 @@ app.post('/api/users/:id/billing', authenticateToken, isAdmin, async (req, res) 
         periodEnd: sub?.current_period_end
       }).catch(() => {});
     } else if (action === 'unpaid' || action === 'refund') {
-      const grace = billing.graceUntilFrom(new Date());
-      sub = await billing.setStatus(db, targetId, 'unpaid', { graceUntil: grace, clearSafepay: action === 'refund' });
+      // Immediate paywall (day-one / revoked). Renewal grace is only after a paid month ends.
+      sub = await billing.setStatus(db, targetId, 'unpaid', {
+        graceUntil: null,
+        currentPeriodEnd: null,
+        clearSafepay: action === 'refund'
+      });
       if (action === 'refund') {
         await billing.recordPayment(db, {
           userId: targetId,

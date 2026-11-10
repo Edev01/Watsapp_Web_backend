@@ -1,8 +1,11 @@
 /**
- * Monthly Safepay subscription (PKR 7000) + 10-day grace + 6-month chat window.
+ * Monthly Safepay subscription (PKR 7000).
+ * - New users: paywall from day one (no free trial).
+ * - After a paid month ends: 5-day grace, then lock.
+ * - 6-month chat retention window.
  */
 const PLAN_AMOUNT_PKR = 7000;
-const GRACE_DAYS = 10;
+const GRACE_DAYS = 5;
 const RETENTION_MONTHS = 6;
 
 function pktParts(date = new Date()) {
@@ -50,17 +53,47 @@ function addOneMonth(from) {
   return d;
 }
 
+/** Grace applies only after a paid month ends — never for brand-new unpaid accounts. */
+function inRenewalGrace(sub, now = new Date()) {
+  if (!sub) return false;
+  const status = String(sub.status || '').toLowerCase();
+  const grace = sub.grace_until ? new Date(sub.grace_until) : null;
+  if (!grace || Number.isNaN(grace.getTime()) || now.getTime() > grace.getTime()) return false;
+  if (status === 'complimentary' || status === 'canceled') return false;
+  // Must have been a paying subscriber (or mid-renewal past_due/active after period end).
+  if (status === 'past_due' || status === 'active') return true;
+  return Boolean(sub.last_paid_at);
+}
+
 function hasAccess(sub, now = new Date()) {
   if (!sub) return false;
   const status = String(sub.status || '').toLowerCase();
   if (status === 'complimentary') return true;
-  const grace = sub.grace_until ? new Date(sub.grace_until) : null;
-  if (grace && now.getTime() <= grace.getTime()) return true;
   if (status === 'active') {
     const end = sub.current_period_end ? new Date(sub.current_period_end) : null;
     if (end && now.getTime() <= end.getTime()) return true;
   }
+  if (inRenewalGrace(sub, now)) return true;
   return false;
+}
+
+function daysRemaining(sub, now = new Date()) {
+  if (!sub) return 0;
+  const status = String(sub.status || '').toLowerCase();
+  if (status === 'complimentary') return null;
+  if (!hasAccess(sub, now)) return 0;
+  const grace = sub.grace_until ? new Date(sub.grace_until) : null;
+  const periodEnd = sub.current_period_end ? new Date(sub.current_period_end) : null;
+  let end = null;
+  if (status === 'active' && periodEnd && now.getTime() <= periodEnd.getTime()) {
+    end = periodEnd;
+  } else if (inRenewalGrace(sub, now)) {
+    end = grace;
+  } else {
+    end = periodEnd;
+  }
+  if (!end || Number.isNaN(end.getTime())) return null;
+  return Math.max(0, Math.ceil((end.getTime() - now.getTime()) / (24 * 60 * 60 * 1000)));
 }
 
 function publicBilling(sub, now = new Date()) {
@@ -72,6 +105,7 @@ function publicBilling(sub, now = new Date()) {
     amountPkr: PLAN_AMOUNT_PKR,
     interval: 'month',
     graceDays: GRACE_DAYS,
+    daysLeft: daysRemaining(sub, now),
     currentPeriodStart: sub?.current_period_start || null,
     currentPeriodEnd: sub?.current_period_end || null,
     graceUntil: sub?.grace_until || null,
@@ -89,14 +123,13 @@ async function ensureSubscription(db, user, { existingFree = false } = {}) {
   const status = existingFree || String(user.role || '').toLowerCase() === 'admin'
     ? 'complimentary'
     : 'unpaid';
-  const periodEnd = addOneMonth(now);
-  const grace = status === 'complimentary' ? null : graceUntilFrom(now);
+  // New billed users: no grace_until — must subscribe on day one.
   const inserted = await db.query(
     `INSERT INTO subscriptions
        (user_id, status, amount_pkr, current_period_start, current_period_end, grace_until)
      VALUES ($1, $2, $3, $4, $5, $6)
      RETURNING *`,
-    [userId, status, PLAN_AMOUNT_PKR, now, periodEnd, grace]
+    [userId, status, PLAN_AMOUNT_PKR, null, null, null]
   );
   return inserted.rows[0];
 }
@@ -266,6 +299,8 @@ module.exports = {
   graceUntilFrom,
   addOneMonth,
   hasAccess,
+  inRenewalGrace,
+  daysRemaining,
   publicBilling,
   ensureSubscription,
   getSubscription,
