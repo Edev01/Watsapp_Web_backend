@@ -18,20 +18,36 @@ function tenantId(userId) {
 }
 
 async function alreadyNormalizedSameBody(job) {
-  const { userMessageFingerprint } = require('../contentFingerprint');
-  const fp = userMessageFingerprint(tenantId(job.user_id), job.message);
-  if (!fp) return false;
+  // Skip OpenAI only for true duplicates: same body + same footer.
+  // Same body + different footer must normalize (new agent/contact).
+  const {
+    userMessageFingerprint,
+    userMessageBodyFingerprint
+  } = require('../contentFingerprint');
+  const uid = tenantId(job.user_id);
+  const fullFp = userMessageFingerprint(uid, job.message);
+  const bodyFp = userMessageBodyFingerprint(uid, job.message);
+  if (!fullFp) return false;
+
   const { rows } = await db.query(
-    `SELECT 1
+    `SELECT m.message, m.content_fingerprint
        FROM whatsapp_messages m
        JOIN normalized_messages n ON n.whatsapp_message_id = m.id
       WHERE m.user_id IS NOT DISTINCT FROM $1
         AND m.id <> $2
-        AND m.content_fingerprint = $3
-      LIMIT 1`,
-    [job.user_id, job.id, fp]
+        AND (
+          m.content_fingerprint = $3
+          OR ($4::text IS NOT NULL AND m.content_fingerprint = $4)
+        )
+      LIMIT 30`,
+    [job.user_id, job.id, fullFp, bodyFp]
   );
-  return rows.length > 0;
+  for (const r of rows) {
+    if (r.content_fingerprint === fullFp) return true;
+    // Legacy body-only fingerprints: compare live full fingerprint from message text.
+    if (userMessageFingerprint(uid, r.message) === fullFp) return true;
+  }
+  return false;
 }
 
 /**
@@ -64,7 +80,7 @@ async function normalizeOneExtractV2(job) {
         rows[0].model_used = 'extract-v2';
       }
       await saveMessageRows(db, job.id, rows);
-      console.info(`[ai] Message ${job.id} skipped OpenAI — same body already normalized`);
+      console.info(`[ai] Message ${job.id} skipped OpenAI — same body+footer already normalized`);
       return { id: job.id, ok: true, listings: 0, provider: 'dup-skip' };
     }
 

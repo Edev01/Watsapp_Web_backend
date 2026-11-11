@@ -500,7 +500,11 @@ function buildRows(extraction, ctx) {
     applyBtkListing(row, `${excerpt || ''} ${ctx.messageText || ''}`);
     row.content_fingerprint = userListingFingerprint
       ? userListingFingerprint(ctx.userId == null ? 1 : Number(ctx.userId), {
-          listing_excerpt: row.listing_excerpt, summary: row.summary, purpose: row.purpose
+          listing_excerpt: row.listing_excerpt,
+          summary: row.summary,
+          purpose: row.purpose,
+          rawMessage: ctx.messageText || '',
+          contact_number: row.contact_number
         })
       : null;
     rows.push(row);

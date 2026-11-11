@@ -11,7 +11,7 @@ const billing = require('./billing');
 const safepayClient = require('./safepayClient');
 const { listUsers, getUserDetail, usageSummary, parseUsageQuery } = require('./adminStats');
 const { filterAndSortProperties, PROPERTY_STATUSES, normalizePropertyStatus, isValidPropertyStatus, expandLocationQuery } = require('./propertyHelper');
-const { userMessageFingerprint } = require('./contentFingerprint');
+const { userMessageFingerprint, userMessageBodyFingerprint } = require('./contentFingerprint');
 const { setExtraLocalities, correctLocalityTypos, canonicalizePlaceText, normalizePlaceKey, isKhayabanFamilyToken } = require('./pakistanLocalities');
 const { parseSmartLocationQuery, buildSmartLocationSql, buildPhaseRegex, buildOtherPhaseRegex, scoreLocationMatch, textHasStreet, interpretDhaSearch, phaseSearchKeeps, isDefenceViewPlace, isCliftonOnlyPlace, parseScrapedMessageId } = require('./smartLocationSearch');
 const { discoverPhaseAreas, discoverDhaAreas, correctDefenceArea } = require('./ai/googlePhaseMap');
@@ -1685,8 +1685,10 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
           [userId, canonicalJid]
         );
 
-        // Same listing body except trailing contact/name: newest message wins.
-        // Existing cards are moved onto the new row so OpenAI is not called again.
+        // Duplicate rules (header ignored aside from "Forwarded" strip):
+        // - same body + same footer  → true duplicate: keep old, do not insert new
+        // - same body + diff footer  → delete old (+ its norm rows), insert new (re-normalize)
+        // - diff body (any footer)   → keep both
         const prior = await client.query(
           `SELECT id, message FROM whatsapp_messages
            WHERE user_id = $1
@@ -1695,29 +1697,62 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
            LIMIT 20000`,
           [userId]
         );
-        const seenBodies = new Map();
+        const priorByFull = new Map(); // fullFp → [ids]
+        const priorByBody = new Map(); // bodyFp → [{ id, fullFp }]
         for (const r of prior.rows) {
-          const fp = userMessageFingerprint(userId, r.message);
-          if (!fp) continue;
-          if (!seenBodies.has(fp)) seenBodies.set(fp, []);
-          seenBodies.get(fp).push(r.id);
-        }
-        const replaceByFp = new Map();
-        const byFp = new Map();
-        const uniqueRows = [];
-        for (const row of toInsert) {
-          const fp = userMessageFingerprint(userId, row.messageText);
-          const next = { ...row, contentFingerprint: fp || null };
-          if (fp && seenBodies.has(fp)) {
-            replaceByFp.set(fp, seenBodies.get(fp));
+          const fullFp = userMessageFingerprint(userId, r.message);
+          const bodyFp = userMessageBodyFingerprint(userId, r.message);
+          if (fullFp) {
+            if (!priorByFull.has(fullFp)) priorByFull.set(fullFp, []);
+            priorByFull.get(fullFp).push(r.id);
           }
-          if (!fp) {
+          if (bodyFp) {
+            if (!priorByBody.has(bodyFp)) priorByBody.set(bodyFp, []);
+            priorByBody.get(bodyFp).push({ id: r.id, fullFp: fullFp || null });
+          }
+        }
+
+        const replaceOldIdsByFull = new Map(); // new fullFp → old message ids to delete
+        const byBodyLast = new Map(); // same body in this batch → keep newest only
+        const uniqueRows = [];
+        let dupSkipped = 0;
+        for (const row of toInsert) {
+          const fullFp = userMessageFingerprint(userId, row.messageText);
+          const bodyFp = userMessageBodyFingerprint(userId, row.messageText);
+          const next = {
+            ...row,
+            contentFingerprint: fullFp || null,
+            bodyFingerprint: bodyFp || null
+          };
+
+          // True duplicate: same body + same footer already in DB → do not insert.
+          if (fullFp && priorByFull.has(fullFp)) {
+            dupSkipped += 1;
+            continue;
+          }
+
+          // Same body, different footer → insert new and delete prior body matches.
+          if (bodyFp && priorByBody.has(bodyFp)) {
+            const oldIds = priorByBody
+              .get(bodyFp)
+              .filter((x) => x.fullFp !== fullFp)
+              .map((x) => Number(x.id))
+              .filter((id) => Number.isFinite(id));
+            if (oldIds.length && fullFp) {
+              replaceOldIdsByFull.set(fullFp, oldIds);
+            }
+          }
+
+          if (!bodyFp) {
+            // Too short / no stable body key — insert as-is (still capped by exact ON CONFLICT).
             uniqueRows.push(next);
             continue;
           }
-          byFp.set(fp, next);
+          // Within this scrape batch: same body → last wins (diff footer replaces earlier).
+          byBodyLast.set(bodyFp, next);
         }
-        uniqueRows.push(...byFp.values());
+        uniqueRows.push(...byBodyLast.values());
+        skippedCount += dupSkipped;
 
         if (!uniqueRows.length) {
           await client.query('COMMIT');
@@ -1752,20 +1787,12 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
         skippedCount += uniqueRows.length - addedCount;
         for (const inserted of result.rows) {
           const fp = inserted.content_fingerprint;
-          if (!fp || !replaceByFp.has(fp)) continue;
-          const oldIds = [...new Set(replaceByFp.get(fp))]
+          if (!fp || !replaceOldIdsByFull.has(fp)) continue;
+          const oldIds = [...new Set(replaceOldIdsByFull.get(fp))]
             .map((id) => Number(id))
             .filter((id) => Number.isFinite(id) && id !== Number(inserted.id));
           if (!oldIds.length) continue;
-          const keepOld = Math.max(...oldIds);
-          await client.query(
-            `UPDATE normalized_messages
-                SET whatsapp_message_id = $1,
-                    chat_jid = $2,
-                    sender = $3
-              WHERE whatsapp_message_id = $4`,
-            [inserted.id, canonicalJid, inserted.sender, keepOld]
-          );
+          // Drop old message + its listings entirely; new message will normalize fresh.
           await client.query(
             `DELETE FROM normalized_messages WHERE whatsapp_message_id = ANY($1::int[])`,
             [oldIds]

@@ -70,12 +70,17 @@ function stripForwardedHeader(raw) {
     .trim();
 }
 
-/** Drop trailing contact / agent-name lines. Rest of the body stays character-exact. */
-function stripTrailingContactAndName(raw) {
-  const lines = String(raw || '')
+/**
+ * Split offer text into body + trailing footer (phone / agent name lines).
+ * Header "Forwarded" wrappers are stripped from the body side only.
+ */
+function splitBodyAndFooter(raw) {
+  const cleaned = stripForwardedHeader(raw);
+  const lines = String(cleaned || '')
     .replace(/\r/g, '')
     .split('\n')
     .map((line) => line.trim());
+  const footerLines = [];
   while (lines.length) {
     const last = lines[lines.length - 1];
     if (!last) {
@@ -83,22 +88,44 @@ function stripTrailingContactAndName(raw) {
       continue;
     }
     if (isContactOrNameLine(last)) {
-      lines.pop();
+      footerLines.unshift(lines.pop());
       continue;
     }
+    const phones = last.match(PHONE_RE);
+    PHONE_RE.lastIndex = 0;
     const withoutPhone = last.replace(PHONE_RE, ' ').replace(/\s+/g, ' ').trim();
     PHONE_RE.lastIndex = 0;
-    if (withoutPhone !== last) {
+    if (phones && phones.length) {
       if (!withoutPhone || isContactOrNameLine(withoutPhone)) {
-        lines.pop();
+        footerLines.unshift(lines.pop());
         continue;
       }
+      // Mixed line: keep non-phone text in body, phone(s) in footer.
+      footerLines.unshift(phones.join(' '));
       lines[lines.length - 1] = withoutPhone;
       continue;
     }
     break;
   }
-  return lines.join('\n').trim();
+  return {
+    body: lines.join('\n').trim(),
+    footer: footerLines.join('\n').trim()
+  };
+}
+
+/** Drop trailing contact / agent-name lines. Rest of the body stays character-exact. */
+function stripTrailingContactAndName(raw) {
+  return splitBodyAndFooter(raw).body;
+}
+
+function normalizeKeyPart(s, maxLen) {
+  const n = String(s || '')
+    .toLowerCase()
+    .replace(/[*_`~#>|]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!n) return '';
+  return maxLen ? n.slice(0, maxLen) : n;
 }
 
 /**
@@ -106,14 +133,30 @@ function stripTrailingContactAndName(raw) {
  * Any remaining character difference keeps two messages separate.
  */
 function bodyExactKey(text, { minLen = 8, maxLen = 800 } = {}) {
-  const stripped = stripTrailingContactAndName(stripForwardedHeader(text));
-  const n = String(stripped || '')
-    .toLowerCase()
+  const stripped = stripTrailingContactAndName(text);
+  const n = normalizeKeyPart(stripped, maxLen);
+  if (n.length < minLen) return null;
+  return n;
+}
+
+/** Normalized footer key (phone + agent name). Empty string if none. */
+function footerExactKey(text, { maxLen = 200 } = {}) {
+  const { footer } = splitBodyAndFooter(text);
+  if (!footer) return '';
+  let t = String(footer).toLowerCase();
+  t = t.replace(PHONE_RE, (m) => {
+    let d = String(m).replace(/\D/g, '');
+    if (d.startsWith('92') && d.length >= 12) d = `0${d.slice(2)}`;
+    if (/^3\d{9}$/.test(d)) d = `0${d}`;
+    return d;
+  });
+  PHONE_RE.lastIndex = 0;
+  t = t
     .replace(/[*_`~#>|]+/g, ' ')
+    .replace(/[^\p{L}\p{N}\s]+/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-  if (n.length < minLen) return null;
-  return n.slice(0, maxLen);
+  return t ? t.slice(0, maxLen) : '';
 }
 
 /** Offer text for dedupe. Excerpt first, so two plots in one chat stay separate and reposts collapse. */
@@ -127,16 +170,28 @@ function pickListingBodyText(row) {
 }
 
 /**
- * Fingerprint for raw WhatsApp message bodies (ingest / skip-normalize).
+ * Body-only fingerprint (footer stripped). Used to detect "same listing body".
  * Returns null for short messages so we do not block "ok" / OTPs.
  */
-function messageContentFingerprint(text, { minLen = 40, maxLen = 800 } = {}) {
+function messageBodyFingerprint(text, { minLen = 40, maxLen = 800 } = {}) {
   return bodyExactKey(text, { minLen, maxLen });
+}
+
+/**
+ * Full message fingerprint = body + footer (phone / agent name).
+ * Same body + same footer → identical. Same body + different footer → different.
+ */
+function messageContentFingerprint(text, { minLen = 40, maxLen = 800, footerMaxLen = 200 } = {}) {
+  const body = bodyExactKey(text, { minLen, maxLen });
+  if (!body) return null;
+  const footer = footerExactKey(text, { maxLen: footerMaxLen });
+  return `${body}|f:${footer || '-'}`;
 }
 
 /**
  * Fingerprint for a normalized listing row / search card.
  * Prefer the full offer text (raw/excerpt) so reposts with different AI summaries still collapse.
+ * Include footer from raw message / contact when present so same body + different agent stays distinct.
  */
 function listingContentFingerprint(row, { minLen = 8, maxLen = 800 } = {}) {
   const body = bodyExactKey(pickListingBodyText(row), { minLen, maxLen });
@@ -145,7 +200,13 @@ function listingContentFingerprint(row, { minLen = 8, maxLen = 800 } = {}) {
   const purpose = String(row.purpose || '')
     .toLowerCase()
     .trim();
-  return `${body}|${purpose}`;
+  const footerSrc = String(
+    row.rawMessage || row.raw_message || row.message || row.contact_number || row.contactNumber || ''
+  ).trim();
+  const footer = footerSrc
+    ? (footerExactKey(footerSrc) || normalizeKeyPart(footerSrc, 200))
+    : '';
+  return `${body}|f:${footer || '-'}|${purpose}`;
 }
 
 /** Per-user scoped listing fingerprint (safe for unique index). */
@@ -155,9 +216,16 @@ function userListingFingerprint(userId, row, opts) {
   return `u${Number(userId) || 0}|${base}`;
 }
 
-/** Per-user scoped message body fingerprint. */
+/** Per-user scoped full message fingerprint (body + footer). */
 function userMessageFingerprint(userId, text, opts) {
   const base = messageContentFingerprint(text, opts);
+  if (!base) return null;
+  return `u${Number(userId) || 0}|${base}`;
+}
+
+/** Per-user scoped body-only fingerprint (footer ignored). */
+function userMessageBodyFingerprint(userId, text, opts) {
+  const base = messageBodyFingerprint(text, opts);
   if (!base) return null;
   return `u${Number(userId) || 0}|${base}`;
 }
@@ -167,11 +235,15 @@ module.exports = {
   normalizeFingerprintText,
   bodyDedupeKey,
   bodyExactKey,
+  footerExactKey,
+  splitBodyAndFooter,
   stripTrailingContactAndName,
   stripForwardedHeader,
   pickListingBodyText,
+  messageBodyFingerprint,
   messageContentFingerprint,
   listingContentFingerprint,
   userListingFingerprint,
-  userMessageFingerprint
+  userMessageFingerprint,
+  userMessageBodyFingerprint
 };
