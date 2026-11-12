@@ -261,45 +261,123 @@ async function createOneTimeCheckout({
   }
 }
 
+/** Safepay Payments UI sends order_id inside payment_metadata[{meta_key, meta_value}]. */
+function metaFromPaymentMetadata(data) {
+  const rows = []
+    .concat(data?.payment_metadata || [])
+    .concat(data?.metadata || [])
+    .concat(payloadArraySafe(data?.meta));
+  const out = {};
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') continue;
+    const key = String(row.meta_key || row.key || row.name || '').trim();
+    const val = row.meta_value ?? row.value ?? row.val;
+    if (key && val != null && String(val).trim() !== '') out[key] = String(val).trim();
+  }
+  return out;
+}
+
+function payloadArraySafe(v) {
+  return Array.isArray(v) ? v : [];
+}
+
 function parseWebhook(body) {
   const payload = body && typeof body === 'object' ? body : {};
-  const data = payload.data || payload.payload || payload;
-  const tracker = data.tracker || payload.tracker || {};
+  // Safepay may wrap as { data: {...} } or send notification at the root.
+  const data = payload.data && typeof payload.data === 'object' && !Array.isArray(payload.data)
+    ? payload.data
+    : (payload.payload && typeof payload.payload === 'object' ? payload.payload : payload);
+  // Live deliveries nest amount/state/metadata under data.notification.
+  const notice = (data.notification && typeof data.notification === 'object')
+    ? data.notification
+    : data;
+  const tracker = notice.tracker || data.tracker || payload.tracker || {};
+  const trackerObj = tracker && typeof tracker === 'object' ? tracker : {};
+  const meta = {
+    ...metaFromPaymentMetadata(notice),
+    ...metaFromPaymentMetadata(data),
+  };
+  // object-style metadata: { order_id, source }
+  for (const src of [notice.metadata, data.metadata, payload.metadata]) {
+    if (src && typeof src === 'object' && !Array.isArray(src)) {
+      for (const [k, v] of Object.entries(src)) {
+        if (v != null && String(v).trim() !== '' && meta[k] == null) meta[k] = String(v).trim();
+      }
+    }
+  }
+  const headerType = String(
+    payload.headers?.['x-sfpy-event-type']
+    || payload['X-SFPY-EVENT-TYPE']
+    || ''
+  );
   const type = String(
-    payload.type || payload.event || payload.name || data.type || tracker.state || ''
+    payload.type
+    || payload.event
+    || payload.name
+    || payload.event_type
+    || data.type
+    || data.event
+    || data.event_type
+    || notice.type
+    || trackerObj.state
+    || headerType
+    || ''
   ).toLowerCase();
   const blob = JSON.stringify(payload);
   const reference = String(
-    data.reference
+    meta.order_id
+    || meta.reference
+    || notice.reference
+    || notice.metadata?.order_id
+    || notice.metadata?.reference
+    || data.reference
     || data.metadata?.reference
     || data.metadata?.order_id
+    || (typeof data.metadata === 'object' && !Array.isArray(data.metadata) ? data.metadata.order_id : null)
     || payload.reference
-    || tracker.reference
-    || tracker.metadata?.order_id
-    || tracker.metadata?.reference
-    || data.tracker?.reference
+    || trackerObj.reference
+    || trackerObj.metadata?.order_id
+    || trackerObj.metadata?.reference
     || data.order_id
     || (blob.match(/user-\d+-\d+/) || [''])[0]
     || ''
   );
-  const userIdMatch = blob.match(/user-(\d+)/i) || reference.match(/user-(\d+)/i);
+  // Prefer user-N from order_id; ignore bare tracker references like "738987".
+  const orderRef = String(meta.order_id || notice.metadata?.order_id || data.metadata?.order_id || '')
+    || (String(reference).match(/^user-\d+/i) ? reference : '')
+    || (blob.match(/user-\d+-\d+/) || [''])[0]
+    || reference;
+  const userIdMatch = String(orderRef).match(/user-(\d+)/i) || blob.match(/user-(\d+)/i);
   const userId = userIdMatch
     ? Number(userIdMatch[1])
-    : Number(data.user_id || data.customer?.metadata?.user_id || 0) || null;
+    : Number(notice.user_id || data.user_id || data.customer?.metadata?.user_id || 0) || null;
   const subscriptionId = data.subscription_id || data.subscription?.id || data.id || null;
-  const paid =
-    /success|succeeded|paid|charged|completed|tracker_ended|payment_complete/i.test(type) ||
-    /success|succeeded|paid|completed|ended/i.test(String(data.state || data.status || tracker.state || ''));
-  const failed = /fail|declined|unpaid/i.test(type) || /fail|declined/i.test(String(data.state || data.status || ''));
-  const canceled = /cancel/i.test(type) || /cancel/i.test(String(data.state || data.status || ''));
+  const state = String(
+    notice.state || notice.status || data.state || data.status || trackerObj.state || data.payment_status || ''
+  ).toLowerCase();
+  const amount = notice.amount ?? data.amount;
+  const fee = notice.fee ?? data.fee;
+  const net = notice.net ?? data.net;
+  const successType = /success|succeeded|paid|charged|completed|tracker_ended|payment_complete|payment\.completed|payment:succeeded|payment\.succeeded/i.test(type);
+  const successState = /success|succeeded|paid|completed|ended|captured|complete/i.test(state);
+  const failed = /fail|declined|unpaid|rejected/i.test(type) || /fail|declined|rejected/i.test(state);
+  const canceled = /cancel|void/i.test(type) || /cancel|void/i.test(state);
+  const isRefund = /refund/i.test(type) || /refund/i.test(String(notice.intent || data.intent || ''));
+  // payment:created + notification.state=PAID (or amount/fee) + order_id → unlock
+  const paymentNoticeWithOrder = Boolean(orderRef && userId)
+    && (amount != null || fee != null || net != null || successState)
+    && !isRefund
+    && (!type || /payment|created|success|complete|paid|tracker/i.test(type));
+  const paid = Boolean(successType || successState || paymentNoticeWithOrder);
   return {
     type,
     userId,
-    reference,
+    reference: orderRef || reference,
     subscriptionId,
-    paid,
+    paid: paid && !failed && !canceled,
     failed,
     canceled,
+    meta,
     payload
   };
 }

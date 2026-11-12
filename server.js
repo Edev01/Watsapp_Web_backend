@@ -767,8 +767,20 @@ app.post('/api/billing/checkout', authenticateToken, async (req, res) => {
 
 app.post('/api/billing/webhook', async (req, res) => {
   try {
-    console.info('[billing] webhook body keys:', Object.keys(req.body || {}));
-    const event = safepayClient.parseWebhook(req.body || {});
+    const raw = req.body || {};
+    const event = safepayClient.parseWebhook(raw);
+    const preview = JSON.stringify(raw);
+    console.info('[billing] webhook', {
+      keys: Object.keys(raw),
+      type: event.type,
+      userId: event.userId,
+      reference: event.reference,
+      paid: event.paid,
+      failed: event.failed,
+      canceled: event.canceled,
+      meta: event.meta || null,
+      bodyPreview: preview.length > 1500 ? `${preview.slice(0, 1500)}…` : preview
+    });
     if (!event.userId) {
       return sendResponse(res, 200, false, { ignored: true }, 'No user on webhook');
     }
@@ -785,7 +797,8 @@ app.post('/api/billing/webhook', async (req, res) => {
       await billing.recordPayment(db, {
         userId: event.userId,
         status: 'succeeded',
-        safepayRef: event.reference || event.subscriptionId,
+        source: 'safepay-webhook',
+        safepayRef: event.reference || event.subscriptionId || event.type || 'webhook',
         payload: event.payload
       });
       sendBillingEmail({
@@ -794,6 +807,7 @@ app.post('/api/billing/webhook', async (req, res) => {
         amountPkr: billing.PLAN_AMOUNT_PKR,
         periodEnd: sub?.current_period_end
       }).catch((e) => console.warn('[billing] email paid:', e.message));
+      return sendResponse(res, 200, false, { ok: true, marked: 'paid', userId: event.userId }, 'Webhook processed');
     } else if (event.canceled) {
       await billing.setStatus(db, event.userId, 'canceled', { clearSafepay: false });
       sendBillingEmail({ to: owner.rows[0].email, kind: 'canceled' })
@@ -803,13 +817,14 @@ app.post('/api/billing/webhook', async (req, res) => {
       await billing.recordPayment(db, {
         userId: event.userId,
         status: 'failed',
+        source: 'safepay-webhook',
         safepayRef: event.reference,
         payload: event.payload
       });
       sendBillingEmail({ to: owner.rows[0].email, kind: 'failed' })
         .catch((e) => console.warn('[billing] email failed:', e.message));
     }
-    return sendResponse(res, 200, false, { ok: true }, 'Webhook processed');
+    return sendResponse(res, 200, false, { ok: true, marked: null, userId: event.userId }, 'Webhook processed');
   } catch (err) {
     console.error('[billing] webhook:', err);
     return sendResponse(res, 500, true, null, err.message || 'Webhook failed');
