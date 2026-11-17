@@ -47,6 +47,8 @@ kind = REQUIREMENT only when someone wants to buy or rent a property: "req", "Re
 Return one listings[] entry per distinct property (max 40).
 - A header ("DHA PHASE 8", "Defence Phase VI") applies to the offers under it until the next header, unless that offer names a place in a different Defence phase. Then write the place's phase, not the header. Under "DHA PHASE 08", Sahil and Zone D stay Phase 8. Khayaban-e-Tanzeem is Phase 5, so that listing's phase is 5.
 - One offer line is one listing. A header line alone is not a listing.
+- Lines starting with 👉, or Bahria codes like P29 / P48 / P10B, are separate listings even when packed in one WhatsApp message. Do not drop any of them.
+- Bahria Town / BTK / Precinct / P## is never DHA. Do not put "DHA" in place_tags or area for those offers.
 - listing_excerpt = the exact lines of this offer only.
 
 ## Fields search stores (fill these yourself)

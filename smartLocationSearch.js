@@ -134,27 +134,36 @@ function societyForms(token) {
   return [...forms];
 }
 
-/** Boundary-safe "street 10" / "st 10" (not 100, not 10th, not St 10.60 sizes). */
+/** Boundary-safe "street/road 10" / "st/rd 10" (not 100, not 10th, not St 10.60 sizes). */
 function buildStreetRegex(num) {
   const n = String(parseInt(num, 10));
-  // Negative lookahead: reject Street 100 and St 10.60 (size decimals)
-  return `(^|[^a-z0-9])(street|st\\.?)[[:space:]\\-#]*${n}(?![0-9.])`;
+  // Negative lookahead: reject Street 100 and St/Rd 10.60 (size decimals)
+  return `(^|[^a-z0-9])(street|st\\.?|road|rd\\.?)[[:space:]\\-#]*${n}(?![0-9.])`;
 }
 
 function textHasStreet(text, num) {
   const t = String(text || '').toLowerCase();
   const n = String(parseInt(num, 10));
-  const re = new RegExp(`(^|[^a-z0-9])(street|st\\.?)[\\s\\-#]*${n}(?![0-9.])`, 'i');
+  const re = new RegExp(`(^|[^a-z0-9])(street|st\\.?|road|rd\\.?)[\\s\\-#]*${n}(?![0-9.])`, 'i');
   return re.test(t);
 }
 
 /** Prefer structured place fields — raw dumps often list many streets. */
 function streetMatchText(row) {
   // Join with a barrier so "...Street" + "10)..." cannot form "Street 10"
-  return [row.area, row.vicinity, row.listing_excerpt, row.summary]
+  return [row.area, row.vicinity, row.location_text, row.street_text, row.listing_excerpt, row.summary]
     .map((x) => String(x || '').trim())
     .filter(Boolean)
     .join(' | ');
+}
+
+/** Pull Street/Road N from free-text queries (e.g. "Precinct 48, Road 5"). */
+function extractStreetNumber(raw) {
+  const t = String(raw || '');
+  const m = t.match(/\b(?:street|st\.?|road|rd\.?)\s*[#\-:]?\s*(\d{1,3})\b/i);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  return Number.isFinite(n) ? n : null;
 }
 
 function khayabanForms(name) {
@@ -233,9 +242,9 @@ function parseSmartLocationQuery(raw) {
     };
   }
 
-  // "street 10" / "st 10" / "st-10" — dedicated matcher (never bare %10%)
+  // "street 10" / "st 10" / "road 5" / "rd-5" — dedicated matcher (never bare %10%)
   const streetOnly = input.match(
-    /^\s*(?:street|st\.?)\s*[#\-:]?\s*(\d{1,3})\s*$/i
+    /^\s*(?:street|st\.?|road|rd\.?)\s*[#\-:]?\s*(\d{1,3})\s*$/i
   );
   if (streetOnly) {
     const streetNumber = parseInt(streetOnly[1], 10);
@@ -374,7 +383,7 @@ function parseSmartLocationQuery(raw) {
     placeOnlyGroups,
     searchRegexes,
     phaseNumber,
-    streetNumber: null,
+    streetNumber: extractStreetNumber(input),
     displayQuery: text,
     rawQuery: input,
     rejectAll
@@ -734,6 +743,7 @@ module.exports = {
   buildStreetRegex,
   textHasPhase,
   textHasStreet,
+  extractStreetNumber,
   buildOtherPhaseRegex,
   locationNamesOtherPhase,
   phaseSearchKeeps,

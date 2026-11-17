@@ -101,8 +101,8 @@ async function normalizeOneExtractV2(job) {
       return { id: job.id, ok: true, listings: 0 };
     }
 
-    const { extraction, model, provider } = await extractMessage(job);
-    const rows = buildRows(extraction, {
+    let { extraction, model, provider } = await extractMessage(job);
+    let rows = buildRows(extraction, {
       messageId: job.id,
       chatJid: job.chat_jid,
       sender: job.sender,
@@ -111,6 +111,59 @@ async function normalizeOneExtractV2(job) {
       userId: job.user_id,
       model
     });
+
+    // Multi-offer broadcasts (👉 / P29 / P48…) sometimes come back as one non-property
+    // blob. Split heuristically and extract each chunk so precincts are not dropped.
+    const propCount = rows.filter((r) => r.is_property).length;
+    if (propCount === 0) {
+      let splitPropertyOffers = null;
+      try {
+        ({ splitPropertyOffers } = require('./listingSplitter'));
+      } catch (_) { /* optional */ }
+      const chunks = typeof splitPropertyOffers === 'function'
+        ? splitPropertyOffers(job.message || '')
+        : [];
+      if (chunks.length >= 2) {
+        const mergedListings = [];
+        let usedModel = model;
+        let usedProvider = provider;
+        for (const chunk of chunks.slice(0, 12)) {
+          try {
+            const part = await extractMessage({
+              ...job,
+              message: chunk
+            });
+            usedModel = part.model || usedModel;
+            usedProvider = part.provider || usedProvider;
+            const partRows = buildRows(part.extraction, {
+              messageId: job.id,
+              chatJid: job.chat_jid,
+              sender: job.sender,
+              senderPhone: job.sender_phone,
+              messageText: chunk,
+              userId: job.user_id,
+              model: part.model
+            });
+            for (const r of partRows) {
+              if (r.is_property) mergedListings.push(r);
+            }
+          } catch (chunkErr) {
+            console.info(
+              `[ai] Message ${job.id} chunk extract skipped: ${String(chunkErr.message || chunkErr).slice(0, 100)}`
+            );
+          }
+        }
+        if (mergedListings.length) {
+          rows = mergedListings.map((r, idx) => ({ ...r, listing_index: idx }));
+          model = usedModel;
+          provider = usedProvider;
+          console.info(
+            `[ai] Message ${job.id} recovered ${mergedListings.length} listing(s) via offer-split fallback`
+          );
+        }
+      }
+    }
+
     await correctSplitListingPhases(rows);
     try {
       await fillMissingPhases(db, rows);

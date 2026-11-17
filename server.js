@@ -13,9 +13,18 @@ const { listUsers, getUserDetail, usageSummary, parseUsageQuery } = require('./a
 const { filterAndSortProperties, PROPERTY_STATUSES, normalizePropertyStatus, isValidPropertyStatus, expandLocationQuery } = require('./propertyHelper');
 const { userMessageFingerprint, userMessageBodyFingerprint } = require('./contentFingerprint');
 const { setExtraLocalities, correctLocalityTypos, canonicalizePlaceText, normalizePlaceKey, isKhayabanFamilyToken } = require('./pakistanLocalities');
-const { parseSmartLocationQuery, buildSmartLocationSql, buildPhaseRegex, buildOtherPhaseRegex, scoreLocationMatch, textHasStreet, interpretDhaSearch, phaseSearchKeeps, isDefenceViewPlace, isCliftonOnlyPlace, parseScrapedMessageId } = require('./smartLocationSearch');
+const { parseSmartLocationQuery, buildSmartLocationSql, buildPhaseRegex, buildOtherPhaseRegex, scoreLocationMatch, textHasStreet, streetMatchText, interpretDhaSearch, phaseSearchKeeps, isDefenceViewPlace, isCliftonOnlyPlace, parseScrapedMessageId } = require('./smartLocationSearch');
 const { discoverPhaseAreas, discoverDhaAreas, correctDefenceArea } = require('./ai/googlePhaseMap');
-const { interpretBtkSearch, precinctRegexes, btkSearchKeeps, chipLabels: btkChipLabels } = require('./ai/btkPrecincts');
+const {
+  interpretBtkSearch,
+  precinctRegexes,
+  btkSearchKeeps,
+  chipLabels: btkChipLabels,
+  listingPrecincts,
+  precinctLabel,
+  normPrecinct,
+  parentOf
+} = require('./ai/btkPrecincts');
 const {
   classifyLocationQuery,
   norm: placeNorm,
@@ -2503,8 +2512,38 @@ app.get('/api/ml/dataset', async (req, res) => {
  * Shared filter + location WHERE builder used by search AND suggest counts
  * so dropdown hits always equal properties returned for the same query.
  */
+/** Structured place line — used to keep DHA and Bahria from bleeding into each other. */
+function listingPlaceLineSql(alias = 'n') {
+  return (
+    `LOWER(CONCAT_WS(' ', COALESCE(${alias}.area,''), COALESCE(${alias}.vicinity,''), COALESCE(${alias}.city,''), ` +
+    `COALESCE(${alias}.location_text,''), COALESCE(${alias}.street_text,''), ` +
+    `COALESCE(array_to_string(${alias}.place_tags, ' '), '')))`
+  );
+}
+
+/** True SQL predicate: listing looks like Bahria Town Karachi / precinct inventory. */
+function sqlIsBahriaPlace(alias = 'n') {
+  const place = listingPlaceLineSql(alias);
+  return (
+    `(${place} ~* '\\m(bahria|btk)\\M' OR ${place} ~* '\\mprecincts?\\M' ` +
+    `OR ${place} ~* '(^|[^[:alnum:]])p[[:space:].\\-]*[0-9]{1,2}[a-z]?([^[:alnum:]]|$)')`
+  );
+}
+
+/** True SQL predicate: listing looks like DHA / Defence (not Bahria). */
+function sqlIsDhaPlace(alias = 'n') {
+  const place = listingPlaceLineSql(alias);
+  return (
+    `(${place} ~* '\\m(dha|d\\\\.h\\\\.a|defence|defense|defance|dck)\\M' ` +
+    `OR ${alias}.phase IS NOT NULL)`
+  );
+}
+
 function btkAreaSql(parsed, searchable, params) {
   if (!parsed || !String(parsed.regionMode || '').startsWith('btk')) return { sql: '', parsed };
+  // Never return pure DHA Defence cards on a Bahria / precinct search.
+  const notPureDha =
+    ` AND NOT (${sqlIsDhaPlace('n')} AND NOT ${sqlIsBahriaPlace('n')})`;
   if (parsed.regionMode === 'btk-all') {
     params.push('%bahria%');
     const bahriaIdx = params.length;
@@ -2519,7 +2558,8 @@ function btkAreaSql(parsed, searchable, params) {
         ` AND (${searchable} ILIKE $${bahriaIdx}` +
         ` OR ${searchable} ILIKE $${btkIdx}` +
         ` OR ${searchable} ILIKE $${precIdx}` +
-        ` OR ${searchable} ~* $${pCodeIdx})`,
+        ` OR ${searchable} ~* $${pCodeIdx})` +
+        notPureDha,
       parsed
     };
   }
@@ -2530,7 +2570,7 @@ function btkAreaSql(parsed, searchable, params) {
     params.push(re);
     parts.push(`${searchable} ~* $${params.length}`);
   }
-  return { sql: ` AND (${parts.join(' OR ')})`, parsed };
+  return { sql: ` AND (${parts.join(' OR ')})` + notPureDha, parsed };
 }
 
 function phaseAreaSql(parsed, searchable, params) {
@@ -2548,9 +2588,7 @@ function phaseAreaSql(parsed, searchable, params) {
   }
   params.push(buildOtherPhaseRegex(want));
   const otherIdx = params.length;
-  const placeLine =
-    `LOWER(CONCAT_WS(' ', COALESCE(n.area,''), COALESCE(n.vicinity,''), COALESCE(n.city,''), ` +
-    `COALESCE(n.location_text,''), COALESCE(n.street_text,'')))`;
+  const placeLine = listingPlaceLineSql('n');
   return {
     sql:
       ` AND (n.phase IS NULL OR n.phase = $${phaseIdx}` +
@@ -2561,7 +2599,8 @@ function phaseAreaSql(parsed, searchable, params) {
       ` AND NOT (${placeLine} ~* $${otherIdx} AND NOT (${placeLine} ~* $${reIdx})` +
       ` AND NOT (n.phase_max IS NOT NULL AND n.phase <= $${phaseIdx} AND n.phase_max >= $${phaseIdx})) ` +
       ` AND ${placeLine} !~* 'defen[cs]e\\s+view'` +
-      ` AND NOT (${placeLine} ~* '\\mclifton\\M' AND ${placeLine} !~* '\\m(dha|d\\\\.h\\\\.a)\\M')`,
+      ` AND NOT (${placeLine} ~* '\\mclifton\\M' AND ${placeLine} !~* '\\m(dha|d\\\\.h\\\\.a)\\M')` +
+      ` AND NOT ${sqlIsBahriaPlace('n')}`,
     parsed
   };
 }
@@ -2569,20 +2608,30 @@ function phaseAreaSql(parsed, searchable, params) {
 function dhaAllSql(parsed, searchable, params) {
   params.push(['%dha%', '%defence%', '%defense%', '%defance%', '%d.h.a%', '%dck%']);
   const dhaIdx = params.length;
-  const areas = (parsed.googlePhaseAreas || []).map((name) => `%${String(name).toLowerCase()}%`);
+  // Drop Bahria / generic junk that sometimes lands in google_phase area sets.
+  const areas = (parsed.googlePhaseAreas || [])
+    .map((name) => String(name || '').trim())
+    .filter((name) => {
+      const k = name.toLowerCase();
+      if (!k || k.length < 3) return false;
+      if (/\b(bahria|btk|precinct)\b/.test(k)) return false;
+      if (/^(tower|estate|area|commercial|comm|street|st|lane|road)$/.test(k)) return false;
+      return true;
+    })
+    .map((name) => `%${name.toLowerCase()}%`);
   let areaClause = 'FALSE';
   if (areas.length) {
     params.push(areas);
     areaClause = `${searchable} LIKE ANY($${params.length})`;
   }
-  const placeLine =
-    `LOWER(CONCAT_WS(' ', COALESCE(n.area,''), COALESCE(n.vicinity,''), COALESCE(n.city,''), ` +
-    `COALESCE(n.location_text,''), COALESCE(n.street_text,'')))`;
+  const placeLine = listingPlaceLineSql('n');
   return {
     sql:
       ` AND (${searchable} ILIKE ANY($${dhaIdx}) OR ${areaClause})` +
       ` AND ${placeLine} !~* 'defen[cs]e\\s+view'` +
-      ` AND NOT (${placeLine} ~* '\\mclifton\\M' AND ${placeLine} !~* '\\m(dha|d\\\\.h\\\\.a)\\M')`,
+      ` AND NOT (${placeLine} ~* '\\mclifton\\M' AND ${placeLine} !~* '\\m(dha|d\\\\.h\\\\.a)\\M')` +
+      // Bare "dha" must not pull Bahria Town / precinct cards (area list used to include "bahria").
+      ` AND NOT ${sqlIsBahriaPlace('n')}`,
     parsed
   };
 }
@@ -2591,6 +2640,7 @@ async function buildPropertySearchWhere(filters, userId) {
   let queryText = `
       FROM normalized_messages n
       INNER JOIN whatsapp_messages m ON m.id = n.whatsapp_message_id
+      LEFT JOIN whatsapp_chats chat ON chat.user_id = m.user_id AND chat.jid = m.chat_jid
       WHERE m.user_id = $1
         AND n.is_property IS TRUE
         AND (
@@ -2612,6 +2662,7 @@ async function buildPropertySearchWhere(filters, userId) {
       queryText: `
       FROM whatsapp_messages m
       LEFT JOIN normalized_messages n ON n.whatsapp_message_id = m.id
+      LEFT JOIN whatsapp_chats chat ON chat.user_id = m.user_id AND chat.jid = m.chat_jid
       WHERE m.user_id = $1 AND m.id = $2
       `,
       params,
@@ -3000,6 +3051,112 @@ async function countPropertySearch(filters, userId) {
   return result.rows[0]?.hits || 0;
 }
 
+const GENERIC_AREA_CHIP_RE =
+  /^(dha|defence|defense|defence housing authority|dha karachi|dha city|karachi|pakistan|commercial|street|lane|office|food street|gulshan|johar|hafiz|shaheen|paragon|dynasty|emmar|emaar|qasim|roomi|hilal|ghazi|khadda|seaview|sea view|phase\s*\d+)$/i;
+
+const PLACE_TYPE_HINT_RE =
+  /\b(street|st\b|lane|ln\b|sector|zone|commercial|khayaban|beach|creek|avenue|market|villa|tower|block|cutting|belt|extension|precinct|bukhari|ittehad|nishat|sehar|seher|saher|muslim|rahat|toheed|touheed|tauheed|saba|zamzama|sahil|zulfiqar|babar|ghalib|iqbal|coastal|peninsula|emaar|views|coral)\b/i;
+
+function escapeRegExp(s) {
+  return String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function isWeakAreaChip(label) {
+  const n = String(label || '').toLowerCase().replace(/[–—]/g, '-').replace(/\s+/g, ' ').trim();
+  if (!n || n.length < 5) return true;
+  if (GENERIC_AREA_CHIP_RE.test(n)) return true;
+  // One short vague token with no place-type hint → noise from Google scrapes
+  const words = n.split(/\s+/).filter(Boolean);
+  if (words.length === 1 && n.length < 12 && !PLACE_TYPE_HINT_RE.test(n)) return true;
+  if (/to\s+\S+\s+morh|chowrangi|nagan/i.test(n)) return true;
+  return false;
+}
+
+/** Vicinity / street / tags only — area is often just "DHA" and causes false chip hits. */
+function listingPlaceBlob(row) {
+  const tags = (Array.isArray(row.place_tags) ? row.place_tags : [])
+    .map((x) => String(x || ''))
+    .filter((t) => t && !/^(dha|defence|defense|btk|bahria town(?: karachi)?|plot|house|flat|apartment|other)$/i.test(t.trim()));
+  return [
+    row.vicinity,
+    row.location_text,
+    row.street_text,
+    ...tags
+  ]
+    .map((x) => String(x || '').toLowerCase())
+    .filter(Boolean)
+    .join(' | ')
+    .replace(/[–—]/g, '-');
+}
+
+/** Does a listing card belong to a chip label (Precinct N / Google sub-area)? */
+function listingMatchesAreaChip(row, label) {
+  const needle = String(label || '').toLowerCase().replace(/[–—]/g, '-').replace(/\s+/g, ' ').trim();
+  if (!needle || isWeakAreaChip(needle)) return false;
+
+  const precinctHit = needle.match(/\bprecincts?\s*[-:]?\s*(\d{1,2}[a-z]?)\b/i);
+  if (precinctHit) {
+    const want = normPrecinct(precinctHit[1]);
+    if (!want) return false;
+    const have = listingPrecincts(row);
+    return have.some((code) => {
+      const c = normPrecinct(code);
+      if (!c) return false;
+      // Exact precinct only (P10A chip ≠ P10 parent unless listing is bare P10)
+      return c === want;
+    });
+  }
+
+  const hay = listingPlaceBlob(row);
+  if (!hay) return false;
+  try {
+    const re = new RegExp(`(^|[^a-z0-9])${escapeRegExp(needle)}([^a-z0-9]|$)`, 'i');
+    if (re.test(hay)) return true;
+  } catch (_) {
+    if (hay.includes(needle)) return true;
+  }
+  return false;
+}
+
+/**
+ * Build sub-area chips from inventory only (DHA / Bahria / phase).
+ * Never return the full Google/static map list.
+ */
+function filterPhaseAreasByInventory(candidates, rows, regionMode) {
+  const pool = Array.isArray(rows) ? rows : [];
+  if (!pool.length) return [];
+
+  const mode = String(regionMode || '');
+
+  // Bahria / precinct searches: chips = precincts present on cards
+  if (mode.startsWith('btk')) {
+    const codes = new Set();
+    for (const row of pool) {
+      for (const code of listingPrecincts(row)) {
+        const c = normPrecinct(code);
+        if (c) codes.add(c);
+      }
+    }
+    return [...codes]
+      .sort((a, b) => {
+        const na = parseInt(a, 10);
+        const nb = parseInt(b, 10);
+        if (na !== nb) return na - nb;
+        return String(a).localeCompare(String(b));
+      })
+      .map((c) => precinctLabel(c))
+      .filter(Boolean);
+  }
+
+  // DHA / phase: keep Google candidate labels that actually appear on inventory place fields
+  const labels = (Array.isArray(candidates) ? candidates : [])
+    .map((x) => String(x || '').trim())
+    .filter((label) => label && !isWeakAreaChip(label));
+
+  if (!labels.length) return [];
+  return labels.filter((label) => pool.some((row) => listingMatchesAreaChip(row, label)));
+}
+
 const runPropertySearch = async (req) => {
   // Warm place_regions seed once (non-blocking if fails)
   ensurePlaceRegionsSeeded().catch(() => {});
@@ -3050,7 +3207,9 @@ const runPropertySearch = async (req) => {
              n.location_text, n.street_text,
              m.message AS raw_message,
              m.timestamp AS message_timestamp, m.from_me, m.user_id,
-             m.seq_in_chat, m.seq_in_chat AS "seqInChat"
+             m.seq_in_chat, m.seq_in_chat AS "seqInChat",
+             chat.name AS chat_name,
+             chat.name AS "chatName"
       ${whereSql}
       ORDER BY n.id DESC, n.whatsapp_message_id DESC, COALESCE(n.listing_index, 0) ASC
     ) uniq
@@ -3107,7 +3266,27 @@ const runPropertySearch = async (req) => {
     }
 
     if (parsedLocation && parsedLocation.regionMode === 'dha-all') {
-      rows = rows.filter((r) => !isDefenceViewPlace(r) && !isCliftonOnlyPlace(r));
+      rows = rows.filter((r) => {
+        if (isDefenceViewPlace(r) || isCliftonOnlyPlace(r)) return false;
+        const place = `${r.area || ''} ${r.vicinity || ''} ${r.city || ''} ${(r.place_tags || []).join(' ')}`.toLowerCase();
+        // DHA search must not surface Bahria Town / precinct inventory.
+        if (/\b(bahria|btk)\b/.test(place) || /\bprecincts?\b/.test(place)) return false;
+        if (/(^|[^a-z0-9])p[\.\-\s]?\d{1,2}[a-z]?\b/i.test(place) && !/\b(dha|defence|defense)\b/.test(place)) {
+          return false;
+        }
+        return true;
+      });
+    }
+
+    if (parsedLocation && String(parsedLocation.regionMode || '').startsWith('btk')) {
+      rows = rows.filter((r) => {
+        const place = `${r.area || ''} ${r.vicinity || ''} ${r.city || ''} ${(r.place_tags || []).join(' ')}`.toLowerCase();
+        const bahria = /\b(bahria|btk|precincts?)\b/.test(place) || /(^|[^a-z0-9])p[\.\-\s]?\d{1,2}[a-z]?\b/i.test(place);
+        const dha = /\b(dha|d\.h\.a|defence|defense)\b/.test(place) || r.phase != null;
+        // Bahria search must not surface pure DHA Defence cards.
+        if (dha && !bahria) return false;
+        return true;
+      });
     }
 
     if (parsedLocation && parsedLocation.phaseNumber != null) {
@@ -3131,15 +3310,9 @@ const runPropertySearch = async (req) => {
 
     if (parsedLocation && parsedLocation.streetNumber != null) {
       const wantStreet = parsedLocation.streetNumber;
-      rows = rows.filter((r) =>
-        textHasStreet(
-          [r.area, r.vicinity, r.listing_excerpt, r.summary, r.raw_message]
-            .map((x) => String(x || '').trim())
-            .filter(Boolean)
-            .join(' | '),
-          wantStreet
-        )
-      );
+      // Use this listing's place fields only — never raw WhatsApp body
+      // (sibling offers in the same message would false-match Road/Street N).
+      rows = rows.filter((r) => textHasStreet(streetMatchText(r), wantStreet));
     }
 
     // Relevance rank the pool — do NOT slice to limit yet (dedupe needs headroom)
@@ -3174,7 +3347,7 @@ const runPropertySearch = async (req) => {
     );
     const effectiveTotal = hasJsRangeFilters ? deduped.length : totalMatched;
 
-    const phaseAreas = parsedLocation && (
+    const candidateAreas = parsedLocation && (
       parsedLocation.regionMode === 'phase'
       || parsedLocation.regionMode === 'dha-all'
       || String(parsedLocation.regionMode || '').startsWith('btk')
@@ -3183,6 +3356,12 @@ const runPropertySearch = async (req) => {
         ? parsedLocation.phaseAreaLabels
         : (parsedLocation.googlePhaseAreas || []))
       : [];
+    // Chips = sub-areas that actually appear in this result inventory (not the full Google/static map).
+    const phaseAreas = filterPhaseAreasByInventory(
+      candidateAreas,
+      deduped,
+      parsedLocation && parsedLocation.regionMode
+    );
     return {
       filters,
       userId,
@@ -3231,6 +3410,9 @@ const handlePropertyFilter = async (req, res) => {
       whatsappMessageId: p.whatsappMessageId || p.whatsapp_message_id || null,
       seqInChat: p.seqInChat ?? p.seq_in_chat ?? null,
       seq_in_chat: p.seqInChat ?? p.seq_in_chat ?? null,
+      chatName: p.chatName || p.chat_name || null,
+      chat_name: p.chatName || p.chat_name || null,
+      chatJid: p.chat_jid || p.chatJid || null,
       isFavourite: Boolean(p.isFavourite),
       is_favourite: Boolean(p.isFavourite),
       comments: Array.isArray(p.comments) ? p.comments : []
@@ -3254,6 +3436,7 @@ const handlePropertyFilter = async (req, res) => {
 };
 
 function toDashboardSearchResult(p) {
+  const chatName = p.chatName || p.chat_name || null;
   return {
     id: p.id,
     listing_id: p.id,
@@ -3261,6 +3444,9 @@ function toDashboardSearchResult(p) {
     listing_index: p.listingIndex ?? p.listing_index ?? 0,
     seq_in_chat: p.seqInChat ?? p.seq_in_chat ?? null,
     seqInChat: p.seqInChat ?? p.seq_in_chat ?? null,
+    chat_jid: p.chat_jid || p.chatJid || null,
+    chat_name: chatName,
+    chatName,
     raw_message: p.rawMessage || p.raw_message || '',
     summary: p.summary || '',
     city: p.city || '',

@@ -4,7 +4,7 @@
  */
 
 const OFFER_HINT =
-  /\b(?:yard|yrd|yards|marla|kanal|plot|street|st\b|phase|demand|for sale|for rent|bungalow|banglow|house|flat|apartment|shop|commercial|residential)\b/i;
+  /(?:\b(?:yard|yrd|yards|sq\.?\s*yd|sqyd|marla|kanal|plot|street|st\b|road|rd\b|phase|precinct|demand|dem\b|lac|lacs|lakh|for sale|for rent|bungalow|banglow|house|flat|apartment|shop|commercial|residential|villa|allotment|series|ser\b|block)\b|(?:^|[^A-Za-z])P[\.\-\s]?\d{1,2}[A-Za-z]?\b|\b\d{2,5}\s*s\b)/i;
 
 const SIZE_START =
   /(?:^|\n)\s*\*??\s*(?:\d+\s*\+\s*)?\d+(?:\.\d+)?\s*(?:yard|yrd|yards|sq\.?\s*yd|marla|kanal|sq\.?\s*ft)\b/gi;
@@ -52,11 +52,40 @@ function splitPropertyOffers(rawText) {
   const text = String(rawText || '').replace(/\r\n/g, '\n').trim();
   if (!text) return [];
 
+  // Prefer the candidate that yields the most offer-like chunks.
+  const pickBest = (current, candidate) => {
+    if (!candidate || candidate.length < 2) return current;
+    const curOffers = current.filter(looksLikeOffer).length;
+    const nextOffers = candidate.filter(looksLikeOffer).length;
+    if (nextOffers > curOffers) return candidate;
+    if (nextOffers === curOffers && candidate.length > current.length) return candidate;
+    return current;
+  };
+
   // 1) Split on blank lines first (common in agent broadcasts)
   let parts = text
     .split(/\n\s*\n+/)
     .map((p) => p.trim())
     .filter(Boolean);
+
+  // 1b) Bullet offers with 👉 / P-codes (BTK multi-inventory broadcasts)
+  parts = pickBest(
+    parts,
+    text
+      .split(/(?=👉|(?:^|\n)\s*\*?\s*P\d{1,2}[A-Za-z]?\b)/)
+      .map((p) => p.trim())
+      .filter(Boolean)
+  );
+
+  // 1c) Markdown *location headers* used in BTK broadcasts:
+  //     *Ali Block Near masjid* / *P16 1100s Clear plot*
+  parts = pickBest(
+    parts,
+    text
+      .split(/(?=(?:^|\n)\s*\*[^*\n]{3,80}\*\s*(?:\n|$))/)
+      .map((p) => p.trim())
+      .filter(Boolean)
+  );
 
   // 2) If still one block, split before size markers (100 yard / 100+100 yard)
   if (parts.length < 2) {

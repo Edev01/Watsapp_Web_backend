@@ -47,12 +47,18 @@ const ALL_CODES = [...new Set([
   return a.localeCompare(b);
 });
 
+function isAliBlockText(text) {
+  return /\bali\s*[-]?\s*block\b/i.test(String(text || ''));
+}
+
 function isBtkKarachiText(text) {
   const t = String(text || '');
   if (!t.trim()) return false;
   if (NOT_BTK.test(t) && !/\b(?:btk|bahria town karachi)\b/i.test(t)) return false;
   if (/\b(?:btk|bahria town karachi|bahria town)\b/i.test(t)) return true;
   if (/\bbahria\b/i.test(t) && !/\b(lahore|islamabad|rawalpindi|\brwp\b)\b/i.test(t)) return true;
+  // Ali Block is a Bahria Town Karachi sector (agents often omit "Bahria")
+  if (isAliBlockText(t)) return true;
   if (PRECINCT_WORD.test(t)) return true;
   PRECINCT_WORD.lastIndex = 0;
   return false;
@@ -169,17 +175,24 @@ function applyBtkListing(row, messageText = '', opts = {}) {
     else if (/\bfarm\s*house\b/i.test(`${type} ${blob}`) || type === 'FARMHOUSE') codes = [DATA.farmhousePrecinct];
   }
   if (!codes.length) {
-    if (!/\b(btk|bahria town)/i.test(blob)) return row;
-    row.area = row.area && !/\bdha\b/i.test(row.area) ? row.area : 'Bahria Town Karachi';
+    if (!/\b(btk|bahria town)/i.test(blob) && !isAliBlockText(blob)) return row;
+    // Never leave Ali Block / BTK rows tagged as DHA/Defence.
+    if (!row.area || /\b(dha|defence|defense)\b/i.test(String(row.area))) {
+      row.area = 'Bahria Town Karachi';
+    }
     row.phase = null;
     row.phase_max = null;
+    row.society_key = row.society_key || 'btk';
     row.vicinity = stripInventedPhasePhrase(row.vicinity);
     row.location_text = stripInventedPhasePhrase(row.location_text);
+    if (isAliBlockText(blob) && !/\bali\s*[-]?\s*block\b/i.test(String(row.vicinity || ''))) {
+      row.vicinity = 'Ali Block';
+    }
     const tags = (Array.isArray(row.place_tags) ? row.place_tags : []).filter((t) => {
       const s = String(t);
-      return !/^phase\s+\d+/i.test(s) && !/^precinct\s+\d/i.test(s) && !/^p\d{1,2}[a-z]?$/i.test(s);
+      return !/^phase\s+\d+/i.test(s) && !/^precinct\s+\d/i.test(s) && !/^p\d{1,2}[a-z]?$/i.test(s) && !/^(dha|defence|defense)$/i.test(s);
     });
-    for (const label of ['Bahria Town Karachi', 'BTK']) {
+    for (const label of ['Bahria Town Karachi', 'BTK', ...(isAliBlockText(blob) ? ['Ali Block'] : [])]) {
       if (!tags.some((t) => String(t).toLowerCase() === label.toLowerCase())) tags.push(label);
     }
     row.place_tags = tags;

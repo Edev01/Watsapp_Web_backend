@@ -654,13 +654,18 @@ function filterAndSortProperties(rawRows, filters = {}) {
       .filter((n) => n != null && !Number.isNaN(n));
   };
   if (hasAreaMin || hasAreaMax) {
+    const exactArea = hasAreaMin && hasAreaMax && !isNaN(minA) && !isNaN(maxA) && minA === maxA;
     items = items.filter((r) => {
+      // Exact yard filter (min=max): require an explicit written size.
+      // Do NOT match via BTK multi-cutting inference (that floods null-size cards).
+      if (exactArea) {
+        const explicit = r.parsedAreaInTargetUnit;
+        if (explicit == null || Number.isNaN(explicit)) return false;
+        return Math.abs(explicit - minA) <= AREA_EPS;
+      }
       const vals = areaCandidates(r);
       if (!vals.length) return false;
       return vals.some((n) => {
-        if (hasAreaMin && hasAreaMax && !isNaN(minA) && !isNaN(maxA) && minA === maxA) {
-          return Math.abs(n - minA) <= AREA_EPS;
-        }
         if (hasAreaMin && !isNaN(minA) && n + AREA_EPS < minA) return false;
         if (hasAreaMax && !isNaN(maxA) && n - AREA_EPS > maxA) return false;
         return true;

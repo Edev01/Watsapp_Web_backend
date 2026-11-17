@@ -663,6 +663,15 @@ async function discoverPhaseAreasOnce(db, phaseNumber) {
   return { areas: names, labels: labelsFromConfirmed(confirmedNames) };
 }
 
+function isNonDhaAreaName(name) {
+  const k = areaKey(name);
+  if (!k) return true;
+  // Bahria / BTK must never appear as a DHA sub-area chip or match key.
+  if (/\b(bahria|btk|precinct)\b/.test(k)) return true;
+  if (/^(tower|estate|area|commercial|comm|street|st|lane|road|western)$/.test(k)) return true;
+  return false;
+}
+
 async function discoverDhaAreas(db) {
   const phases = [1, 2, 4, 5, 6, 7, 8];
   const found = await Promise.all(phases.map((n) => discoverPhaseAreas(db, n)));
@@ -671,12 +680,14 @@ async function discoverDhaAreas(db) {
   const labels = [];
   for (const set of found) {
     for (const name of set.areas || []) {
+      if (isNonDhaAreaName(name)) continue;
       const key = areaKey(name);
       if (!key || seen.has(key)) continue;
       seen.add(key);
       areas.push(name);
     }
     for (const name of set.labels || []) {
+      if (isNonDhaAreaName(name)) continue;
       const key = `label:${areaKey(name)}`;
       if (seen.has(key)) continue;
       seen.add(key);
