@@ -1,0 +1,8 @@
+node_modules/
+sessions/
+.env
+*.log
+.DS_Store
+chrome-data/
+.wwebjs_auth/
+.wwebjs_cache/
