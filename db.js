@@ -199,9 +199,13 @@ async function runMigrationSteps(client) {
          BEGIN
            ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS content_fingerprint TEXT;
            ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS sender_phone TEXT;
+           ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS wa_key_id TEXT;
            CREATE INDEX IF NOT EXISTS idx_wm_user_content_fp
              ON whatsapp_messages (user_id, content_fingerprint)
              WHERE content_fingerprint IS NOT NULL;
+           CREATE INDEX IF NOT EXISTS idx_wm_chat_wa_key
+             ON whatsapp_messages (user_id, chat_jid, wa_key_id)
+             WHERE wa_key_id IS NOT NULL;
          EXCEPTION WHEN insufficient_privilege THEN
            RAISE NOTICE 'skip whatsapp_messages fingerprint DDL: not table owner';
          END;

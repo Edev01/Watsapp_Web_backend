@@ -1690,13 +1690,18 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
         skippedCount++;
         continue;
       }
+      const waKeyId = String(
+        msg.keyId || msg.key_id || msg.messageId || msg.message_id || msg.waKeyId || msg.wa_key_id || ''
+      ).trim() || null;
+
       toInsert.push({
         sender: sender || 'unknown',
         senderPhone,
         timestamp: timestamp || 'unknown',
         messageText,
         isFromMe,
-        messageEpoch
+        messageEpoch,
+        waKeyId
       });
     }
 
@@ -1785,7 +1790,7 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
         const values = [];
         let p = 1;
         for (const row of uniqueRows) {
-          values.push(`($${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++})`);
+          values.push(`($${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++})`);
           params.push(
             userId,
             canonicalJid,
@@ -1794,13 +1799,14 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
             row.messageText,
             row.isFromMe,
             row.contentFingerprint,
-            row.senderPhone || null
+            row.senderPhone || null,
+            row.waKeyId || null
           );
         }
         // Never put seq_in_chat on the INSERT. A unique seq collision used to
         // ROLLBACK the whole batch, so the worker "posted" but nothing saved.
         const result = await client.query(
-          `INSERT INTO whatsapp_messages (user_id, chat_jid, sender, timestamp, message, from_me, content_fingerprint, sender_phone)
+          `INSERT INTO whatsapp_messages (user_id, chat_jid, sender, timestamp, message, from_me, content_fingerprint, sender_phone, wa_key_id)
            VALUES ${values.join(',')}
            ON CONFLICT (user_id, chat_jid, sender, timestamp, message)
            DO NOTHING
@@ -2221,15 +2227,58 @@ app.get('/api/scraped-chats/messages', async (req, res) => {
 
   try {
     if (lastTimesOnly === '1' || lastTimesOnly === 'true') {
+      // Per monitored chat: catch-up floor =
+      // - left side of the newest >6h hole (so mid-day gaps can be refilled), else
+      // - latest created_at (fill only what arrived after last save).
+      // Also return newest wa_key_id so the worker can page history without a
+      // local seed (linked devices often get no history sync on reconnect).
       const result = await db.query(
-        `SELECT m.chat_jid,
-                MAX(m.timestamp) AS timestamp,
-                MAX(m.created_at) AS created_at
-         FROM whatsapp_messages m
-         INNER JOIN whatsapp_chats c
-           ON c.user_id = m.user_id AND c.jid = m.chat_jid
-         WHERE m.user_id = $1 AND c.is_monitored = TRUE
-         GROUP BY m.chat_jid`,
+        `WITH ordered AS (
+           SELECT m.chat_jid,
+                  m.created_at,
+                  m.wa_key_id,
+                  m.from_me,
+                  lag(m.created_at) OVER (
+                    PARTITION BY m.chat_jid ORDER BY m.created_at ASC
+                  ) AS prev_at
+           FROM whatsapp_messages m
+           INNER JOIN whatsapp_chats c
+             ON c.user_id = m.user_id AND c.jid = m.chat_jid
+           WHERE m.user_id = $1 AND c.is_monitored = TRUE
+         ),
+         latest AS (
+           SELECT chat_jid, MAX(created_at) AS max_at
+           FROM ordered
+           GROUP BY chat_jid
+         ),
+         hole_floors AS (
+           SELECT DISTINCT ON (chat_jid)
+                  chat_jid,
+                  prev_at AS floor_at
+           FROM ordered
+           WHERE prev_at IS NOT NULL
+             AND EXTRACT(EPOCH FROM (created_at - prev_at)) > 21600
+           ORDER BY chat_jid, created_at DESC
+         ),
+         latest_keys AS (
+           SELECT DISTINCT ON (chat_jid)
+                  chat_jid,
+                  wa_key_id,
+                  from_me,
+                  EXTRACT(EPOCH FROM created_at)::bigint AS seed_ts
+           FROM ordered
+           WHERE wa_key_id IS NOT NULL AND wa_key_id <> ''
+           ORDER BY chat_jid, created_at DESC
+         )
+         SELECT l.chat_jid,
+                COALESCE(h.floor_at, l.max_at) AS created_at,
+                l.max_at AS timestamp,
+                k.wa_key_id,
+                k.from_me,
+                k.seed_ts
+         FROM latest l
+         LEFT JOIN hole_floors h ON h.chat_jid = l.chat_jid
+         LEFT JOIN latest_keys k ON k.chat_jid = l.chat_jid`,
         [userId]
       );
       return sendResponse(res, 200, false, result.rows, 'Last message times retrieved');
