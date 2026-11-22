@@ -1,4 +1,4 @@
-const { shouldSkipMessage } = require('./messageFilter');
+const { isCommonJunkMessage: shouldSkipMessage } = require('./messageFilter');
 
 /**
  * Map a whatsapp-web.js Message into the backend ingest shape.

@@ -33,6 +33,9 @@ class WebSession {
     this._livePosted = 0;
     this._backfillPosted = 0;
     this._stopping = false;
+    this._restarting = false;
+    this._restartTimer = null;
+    this._backfillTimer = null;
     this._proxyAuthDone = false;
   }
 
@@ -69,7 +72,10 @@ class WebSession {
       webVersionCache: { type: 'none' }
     });
 
+    const isCurrent = () => client === this.client;
+
     client.on('qr', async (qr) => {
+      if (!isCurrent()) return;
       try {
         await this.ensureProxyAuth(proxy);
         // Post the raw pairing string (same as Baileys). The portal renders it with
@@ -82,10 +88,12 @@ class WebSession {
     });
 
     client.on('authenticated', () => {
+      if (!isCurrent()) return;
       log.info({ userId: this.userId }, 'authenticated');
     });
 
     client.on('ready', async () => {
+      if (!isCurrent()) return;
       this.ready = true;
       const wid = client.info?.wid?._serialized || null;
       log.info({ userId: this.userId, wid }, 'WhatsApp Web ready');
@@ -95,7 +103,9 @@ class WebSession {
         log.warn({ err: err.message }, 'postQrStatus failed');
       }
       await this.refreshMonitored();
-      await this.runBackfill('ready');
+      this.reportHealth().catch(() => {});
+      // Let WhatsApp Web finish its post-login navigation before touching chats.
+      this.scheduleBackfill('ready', client);
       if (this._monitorTimer) clearInterval(this._monitorTimer);
       this._monitorTimer = setInterval(
         () => this.refreshMonitored().catch(() => {}),
@@ -109,19 +119,21 @@ class WebSession {
     });
 
     client.on('auth_failure', (msg) => {
+      if (!isCurrent()) return;
       this.ready = false;
       log.error({ userId: this.userId, msg }, 'auth_failure');
+      this.reportHealth().catch(() => {});
     });
 
     client.on('disconnected', (reason) => {
+      // destroy() on a replaced client also emits this. Ignore it so one logout
+      // cannot start a second browser and kill the session that just linked.
+      if (!isCurrent()) return;
       this.ready = false;
       log.warn({ userId: this.userId, reason }, 'disconnected');
-      if (this._stopping) return;
-      setTimeout(() => {
-        this.restart().catch((err) =>
-          log.error({ userId: this.userId, err: err.message }, 'restart failed')
-        );
-      }, 5000);
+      this.reportHealth().catch(() => {});
+      if (this._stopping || this._restarting) return;
+      this.scheduleRestart();
     });
 
     client.on('message', (msg) => this.onLiveMessage(msg));
@@ -162,6 +174,27 @@ class WebSession {
     }
   }
 
+  scheduleRestart() {
+    if (this._restartTimer || this._restarting || this._stopping) return;
+    this._restartTimer = setTimeout(() => {
+      this._restartTimer = null;
+      this.restart().catch((err) =>
+        log.error({ userId: this.userId, err: err.message }, 'restart failed')
+      );
+    }, 5000);
+  }
+
+  scheduleBackfill(reason, client) {
+    if (this._backfillTimer) clearTimeout(this._backfillTimer);
+    this._backfillTimer = setTimeout(() => {
+      this._backfillTimer = null;
+      if (client !== this.client || !this.ready || this._restarting) return;
+      this.runBackfill(reason).catch((err) =>
+        log.error({ userId: this.userId, err: err.message }, 'backfill failed')
+      );
+    }, 20000);
+  }
+
   async start() {
     this._stopping = false;
     this._proxyAuthDone = false;
@@ -170,14 +203,24 @@ class WebSession {
   }
 
   async restart() {
-    if (this._stopping) return;
+    if (this._stopping || this._restarting) return;
+    this._restarting = true;
+    if (this._backfillTimer) {
+      clearTimeout(this._backfillTimer);
+      this._backfillTimer = null;
+    }
     log.info({ userId: this.userId }, 'restarting session');
-    try {
-      if (this.client) await this.client.destroy();
-    } catch (_) {}
+    const old = this.client;
     this.client = null;
     this.ready = false;
-    await this.start();
+    try {
+      if (old) await old.destroy();
+    } catch (_) {}
+    try {
+      await this.start();
+    } finally {
+      this._restarting = false;
+    }
   }
 
   async refreshMonitored() {
@@ -305,13 +348,18 @@ class WebSession {
 
   async reportHealth(extra = {}) {
     try {
+      const status = this.ready ? 'ready' : 'offline';
       await backend.postScrapeHealth(this.userId, {
+        status,
+        workerStatus: status,
+        scrapeOk: this.ready === true,
         ready: this.ready,
         engine: 'whatsapp-web',
         monitored: this.monitored.size,
         livePosted: this._livePosted,
         backfillPosted: this._backfillPosted,
         proxy: !!config.proxyUrl,
+        warning: this.ready ? null : 'WhatsApp Web session is down — scan the QR to link again',
         ...extra
       });
     } catch (_) {}
@@ -319,6 +367,8 @@ class WebSession {
 
   async stop() {
     this._stopping = true;
+    if (this._restartTimer) clearTimeout(this._restartTimer);
+    if (this._backfillTimer) clearTimeout(this._backfillTimer);
     if (this._monitorTimer) clearInterval(this._monitorTimer);
     if (this._healthTimer) clearInterval(this._healthTimer);
     this.ready = false;

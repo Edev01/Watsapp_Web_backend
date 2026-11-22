@@ -223,6 +223,14 @@ async function runMigrationSteps(client) {
       last_posted_at TIMESTAMPTZ,
       updated_at TIMESTAMPTZ DEFAULT NOW()
     )`,
+    `CREATE TABLE IF NOT EXISTS scrape_down_alerts (
+      user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      reason VARCHAR(32) NOT NULL,
+      detail TEXT,
+      first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      alerted_at TIMESTAMPTZ,
+      resolved_at TIMESTAMPTZ
+    )`,
     `CREATE TABLE IF NOT EXISTS normalize_jobs (
       user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
       status VARCHAR(32) NOT NULL DEFAULT 'idle',

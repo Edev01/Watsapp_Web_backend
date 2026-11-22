@@ -4993,6 +4993,13 @@ async function refreshLocalityGazetteer() {
   setTimeout(runBillingJobs, 15000);
   setInterval(runBillingJobs, 6 * 60 * 60 * 1000);
 
+  const { watchScrapeHealth } = require('./scrapeWatch');
+  const runScrapeWatch = () => {
+    watchScrapeHealth(db).catch((err) => console.warn('[scrape-watch]', err.message));
+  };
+  setTimeout(runScrapeWatch, 20000);
+  setInterval(runScrapeWatch, 5 * 60 * 1000);
+
   try {
     const started = startPipelineWorker();
     console.log('[pipeline] start result:', started);

@@ -188,8 +188,18 @@ async function callOpenAiCompatible({
     await noteHit(res, attempt + 1);
     if (!res.ok && res.status === 400) {
       const errText = await res.text();
-      if (/response_format|json_object|not supported/i.test(errText)) {
+      let adjusted = false;
+      if (/response_format|json_object/i.test(errText) && body.response_format) {
         delete body.response_format;
+        adjusted = true;
+      }
+      if (/max_tokens|temperature|max_completion_tokens|unsupported_parameter/i.test(errText)) {
+        delete body.temperature;
+        delete body.max_tokens;
+        body.max_completion_tokens = body.max_completion_tokens || 8192;
+        adjusted = true;
+      }
+      if (adjusted) {
         res = await fetch(`${base}/chat/completions`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
@@ -240,7 +250,7 @@ async function callOpenAI({ system, user, model, messageId = null, userId = null
       (process.env.EXTRACT_MODEL && !/^gemini|^qwen/i.test(process.env.EXTRACT_MODEL)
         ? process.env.EXTRACT_MODEL
         : null) ||
-      'gpt-4o-mini',
+      'gpt-5-nano',
     apiKey: process.env.OPENAI_API_KEY,
     baseUrl: process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1',
     label: 'openai',
@@ -261,11 +271,11 @@ function callForProvider(provider) {
 function resolveModelName(provider) {
   const p = String(provider || process.env.EXTRACT_PROVIDER || 'openai').toLowerCase();
   if (p !== 'openai' && p !== 'test') {
-    return process.env.OPENAI_MODEL || 'gpt-4o-mini';
+    return process.env.OPENAI_MODEL || 'gpt-5-nano';
   }
   const explicit = process.env.EXTRACT_MODEL || '';
   if (explicit && /^gpt-/i.test(explicit)) return explicit;
-  return process.env.OPENAI_MODEL || 'gpt-4o-mini';
+  return process.env.OPENAI_MODEL || 'gpt-5-nano';
 }
 
 /* -------------------------------------------------------------- extraction */

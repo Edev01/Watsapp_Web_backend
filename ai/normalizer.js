@@ -429,7 +429,7 @@ async function processUnnormalizedMessages({
 
   console.info(
     `[ai] Processing ${claimed.length} messages ` +
-      `(llm=openai/gpt-4o-mini, workers=${workers}, tenants=${JSON.stringify(tenantCounts)})`
+      `(llm=openai/${process.env.OPENAI_MODEL || process.env.EXTRACT_MODEL || 'gpt-5-nano'}, workers=${workers}, tenants=${JSON.stringify(tenantCounts)})`
   );
 
   const started = Date.now();

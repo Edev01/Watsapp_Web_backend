@@ -357,6 +357,89 @@ async function usageSummary(db, {
   };
 }
 
+function weekStartMonday(ymd) {
+  const [y, m, d] = String(ymd).split('-').map(Number);
+  const day = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+  const delta = day === 0 ? -6 : 1 - day;
+  return addDaysYmd(ymd, delta);
+}
+
+/** Scraped-message window in PKT. Independent of the OpenAI usage query. */
+function parseMessageQuery(query = {}) {
+  const today = pktYmd();
+  const raw = String(query.msgPreset || query.messagePreset || 'today').toLowerCase().replace(/[\s-]+/g, '');
+  let preset = 'today';
+  let from = today;
+  let to = today;
+  if (raw === 'yesterday') {
+    preset = 'yesterday';
+    from = to = addDaysYmd(today, -1);
+  } else if (raw === 'thisweek' || raw === 'week') {
+    preset = 'thisweek';
+    from = weekStartMonday(today);
+    to = today;
+  } else if (raw === 'lastweek') {
+    preset = 'lastweek';
+    const thisMonday = weekStartMonday(today);
+    from = addDaysYmd(thisMonday, -7);
+    to = addDaysYmd(thisMonday, -1);
+  } else if (raw === 'custom') {
+    preset = 'custom';
+    const fromRaw = String(query.msgFrom || '').slice(0, 10);
+    const toRaw = String(query.msgTo || '').slice(0, 10);
+    from = isYmd(fromRaw) ? fromRaw : today;
+    to = isYmd(toRaw) ? toRaw : today;
+    if (from > to) {
+      const swap = from;
+      from = to;
+      to = swap;
+    }
+  }
+  return {
+    preset,
+    from,
+    to,
+    start: pktDayStart(from),
+    end: pktDayStart(addDaysYmd(to, 1)),
+    rangeLabel: formatPktRangeLabel(from, to)
+  };
+}
+
+async function messageBreakdown(db, userId, range) {
+  const total = await db.query(
+    `SELECT count(*)::int AS n
+       FROM whatsapp_messages
+      WHERE user_id = $1
+        AND created_at >= $2::timestamptz
+        AND created_at < $3::timestamptz`,
+    [userId, range.start, range.end]
+  );
+  const chats = await db.query(
+    `SELECT c.jid,
+            COALESCE(NULLIF(BTRIM(c.name), ''), c.jid) AS name,
+            count(m.id)::int AS message_count
+       FROM whatsapp_chats c
+       LEFT JOIN whatsapp_messages m
+         ON m.user_id = c.user_id
+        AND m.chat_jid = c.jid
+        AND m.created_at >= $2::timestamptz
+        AND m.created_at < $3::timestamptz
+      WHERE c.user_id = $1
+        AND c.is_monitored IS TRUE
+      GROUP BY c.jid, c.name
+      ORDER BY message_count DESC, name ASC`,
+    [userId, range.start, range.end]
+  );
+  return {
+    preset: range.preset,
+    from: range.from,
+    to: range.to,
+    rangeLabel: range.rangeLabel,
+    total: total.rows[0]?.n || 0,
+    chats: chats.rows
+  };
+}
+
 async function getUserDetail(db, userId, query = {}) {
   const id = Number(userId);
   const { rows } = await db.query(
@@ -406,11 +489,14 @@ async function getUserDetail(db, userId, query = {}) {
     billing = publicBilling(sub);
   } catch (_) { /* subscriptions table may not exist yet */ }
 
+  const messages = await messageBreakdown(db, id, parseMessageQuery(query));
+
   return {
     user: rows[0],
     counts: counts.rows[0] || {},
     usage,
-    billing
+    billing,
+    messages
   };
 }
 
@@ -418,6 +504,7 @@ module.exports = {
   currentPktYearMonth,
   parseYearMonth,
   parseUsageQuery,
+  parseMessageQuery,
   pktYmd,
   listUsers,
   getUserDetail,
