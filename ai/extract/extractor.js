@@ -13,7 +13,7 @@ const {
   toGeminiSchema,
   buildUserMessage
 } = require('./schema');
-const { cleanText, parsePrice } = require('./parsers');
+const { cleanText, parsePrice, parsePhase, detectBasis, SQFT_PER } = require('./parsers');
 const { looksLikeRequirement } = require('./listingKind');
 const { applyBtkListing } = require('../btkPrecincts');
 const {
@@ -263,7 +263,32 @@ function resolveModelName(provider) {
 function validate(out) {
   if (!out || typeof out !== 'object') throw new Error('extraction: not an object');
   const listings = Array.isArray(out.listings) ? out.listings.filter((l) => l && typeof l === 'object') : [];
-  return { is_property: Boolean(out.is_property), language: out.language || null, listings };
+  const isProperty = out.is_property_listing_or_inquiry != null
+    ? Boolean(out.is_property_listing_or_inquiry)
+    : Boolean(out.is_property);
+  return {
+    is_property: isProperty,
+    language: out.language || null,
+    listings: listings.slice(0, 15),
+    summary: typeof out.summary === 'string' ? out.summary : '',
+    category: out.category || null,
+    intent: typeof out.intent === 'string' ? out.intent : '',
+    sentiment: out.sentiment || null,
+    purpose: out.purpose || null,
+    property_type: out.property_type || null,
+    property_sub_type: out.property_sub_type || null,
+    city: out.city || null,
+    area: out.area || null,
+    vicinity: out.vicinity || null,
+    size: out.size || null,
+    size_value: out.size_value,
+    size_unit: out.size_unit || null,
+    price: out.price || null,
+    price_value: out.price_value,
+    contact_number: out.contact_number || null,
+    entities: out.entities && typeof out.entities === 'object' ? out.entities : null,
+    confidence_score: out.confidence_score
+  };
 }
 
 /**
@@ -317,8 +342,43 @@ async function extractMessage(msg, opts = {}) {
 /* ------------------------------------------------------------- row builder */
 
 const UNIT_LABEL = { SQ_YD: 'Sq. Yd.', SQ_FT: 'Sq. Ft.', SQ_M: 'Sq. M.', MARLA: 'Marla', KANAL: 'Kanal', ACRE: 'Acre' };
+const UNIT_CODE = {
+  SQ_YD: 'SQ_YD', SQ_FT: 'SQ_FT', SQ_M: 'SQ_M', MARLA: 'MARLA', KANAL: 'KANAL', ACRE: 'ACRE',
+  'SQ. YD.': 'SQ_YD', 'SQ. FT.': 'SQ_FT', 'SQ. M.': 'SQ_M'
+};
 const LANG = { en: 'en', ur: 'ur', roman_ur: 'hinglish', mixed: 'hinglish' };
 const PRICE_BASIS = new Set(['TOTAL', 'PER_MONTH', 'PER_SQ_YD', 'PER_SQ_FT', 'PER_FLOOR', 'ON_CALL', 'UNKNOWN']);
+const CATEGORY_SET = new Set(['INQUIRY', 'SUPPORT', 'SALES', 'COMPLAINT', 'GENERAL', 'SPAM']);
+const SENTIMENT_SET = new Set(['POSITIVE', 'NEUTRAL', 'NEGATIVE']);
+
+function mapLanguage(raw) {
+  const s = String(raw || '').trim().toLowerCase();
+  if (!s) return 'en';
+  if (LANG[s]) return LANG[s];
+  if (s === 'urdu') return 'ur';
+  if (s === 'english') return 'en';
+  if (s === 'hinglish' || s === 'roman urdu' || s === 'roman-urdu') return 'hinglish';
+  return s.slice(0, 32);
+}
+
+function unitCode(raw) {
+  const key = String(raw || '').trim().toUpperCase();
+  return UNIT_CODE[key] || null;
+}
+
+function entityBag(raw, extraName) {
+  const src = raw && typeof raw === 'object' ? raw : {};
+  const list = (key) => (Array.isArray(src[key]) ? src[key].map((x) => textOrNull(x)).filter(Boolean) : []);
+  const names = list('names');
+  const extra = textOrNull(extraName);
+  if (extra && !names.some((n) => n.toLowerCase() === extra.toLowerCase())) names.push(extra);
+  return {
+    products: list('products'),
+    dates_mentioned: list('dates_mentioned'),
+    action_items: list('action_items'),
+    names
+  };
+}
 
 function textOrNull(value) {
   const s = cleanText(value || '');
@@ -398,9 +458,38 @@ function tagsFromLlm(value) {
 function buildRows(extraction, ctx) {
   const rows = [];
   const messageText = cleanText(ctx.messageText);
-  const language = LANG[extraction.language] || 'en';
+  const language = mapLanguage(extraction.language);
+  const modelCategory = CATEGORY_SET.has(String(extraction.category || '').toUpperCase())
+    ? String(extraction.category).toUpperCase()
+    : null;
+  const sentiment = SENTIMENT_SET.has(String(extraction.sentiment || '').toUpperCase())
+    ? String(extraction.sentiment).toUpperCase()
+    : 'NEUTRAL';
+  const intent = typeof extraction.intent === 'string' ? extraction.intent : '';
 
-  extraction.listings.forEach((l, idx) => {
+  let listings = Array.isArray(extraction.listings)
+    ? extraction.listings.filter((l) => l && typeof l === 'object')
+    : [];
+  if (!listings.length && extraction.is_property) {
+    listings = [{
+      purpose: extraction.purpose,
+      property_type: extraction.property_type,
+      property_sub_type: extraction.property_sub_type,
+      city: extraction.city,
+      area: extraction.area,
+      vicinity: extraction.vicinity,
+      size: extraction.size,
+      size_value: extraction.size_value,
+      size_unit: extraction.size_unit,
+      price: extraction.price,
+      price_value: extraction.price_value,
+      contact_number: extraction.contact_number,
+      summary: extraction.summary,
+      listing_excerpt: null
+    }];
+  }
+
+  listings.forEach((l, idx) => {
     const purpose = l.purpose === 'SALE' || l.purpose === 'RENT' ? l.purpose : null;
     const city = textOrNull(l.city);
     const area = textOrNull(l.area);
@@ -415,43 +504,79 @@ function buildRows(extraction, ctx) {
     if (phaseMax && phase && phaseMax === phase) phaseMax = null;
     const known = knownPlacePhase(`${excerpt || ''} ${textOrNull(l.area) || ''} ${textOrNull(l.vicinity) || ''} ${textOrNull(l.location_text) || ''}`);
     if (phase == null && known) phase = known;
-    let placeTags = tagsFromLlm(l.place_tags);
-    placeTags = withPhaseTags(placeTags, phase, phaseMax);
     const sizeValue = numOrNull(l.size_value);
+    const code = unitCode(l.size_unit);
+    const sizeUnit = code && UNIT_LABEL[code] ? UNIT_LABEL[code] : textOrNull(l.size_unit);
+    let sizeSqft = numOrNull(l.size_sqft);
+    if (sizeSqft == null && sizeValue != null && code && SQFT_PER[code]) {
+      sizeSqft = Math.round(sizeValue * SQFT_PER[code] * 100) / 100;
+    }
     let priceValue = numOrNull(l.price_value);
     let priceText = textOrNull(l.price);
+    let priceMin = numOrNull(l.price_min);
+    let priceMax = numOrNull(l.price_max);
+    let priceBasis = PRICE_BASIS.has(l.price_basis) ? l.price_basis : null;
     if (priceValue == null && /@\s*\d/.test(`${excerpt || ''} ${priceText || ''} ${ctx.messageText || ''}`)) {
       const parsedAt = parsePrice(excerpt || priceText || ctx.messageText, { purpose });
       if (parsedAt.value) {
         priceValue = parsedAt.value;
         priceText = priceText || ((excerpt || '').match(/@\s*\d+(?:\.\d+)?(?:\s*(?:cr|crore|lac|lakh))?/i) || [])[0] || null;
+        if (priceMin == null) priceMin = parsedAt.min;
+        if (priceMax == null) priceMax = parsedAt.max;
+        if (!priceBasis && PRICE_BASIS.has(parsedAt.basis)) priceBasis = parsedAt.basis;
       }
     }
+    if (priceValue == null && priceText) {
+      const parsed = parsePrice(priceText, { purpose });
+      if (parsed.value != null) {
+        priceValue = parsed.value;
+        if (priceMin == null) priceMin = parsed.min;
+        if (priceMax == null) priceMax = parsed.max;
+        if (!priceBasis && PRICE_BASIS.has(parsed.basis)) priceBasis = parsed.basis;
+      }
+    }
+    if (!priceBasis && priceText) {
+      const detected = detectBasis(priceText);
+      if (detected) priceBasis = detected;
+    }
+    const rawTags = tagsFromLlm(l.place_tags);
+    const hasCore = Boolean(
+      l.property_type || sizeValue != null || priceValue != null
+      || area || vicinity || locationText || streetText || rawTags
+    );
+    if (phase == null && hasCore) {
+      const parsedPhase = parsePhase([vicinity, area, excerpt, textOrNull(l.summary)].filter(Boolean).join(' '));
+      if (parsedPhase.phase) phase = parsedPhase.phase;
+    }
+    const placeTags = withPhaseTags(rawTags, phase, phaseMax);
     const requirement = looksLikeRequirement(l.kind, excerpt);
-    const sizeUnit = l.size_unit && UNIT_LABEL[l.size_unit] ? UNIT_LABEL[l.size_unit] : textOrNull(l.size_unit);
-    const priceBasis = PRICE_BASIS.has(l.price_basis) ? l.price_basis : null;
-
-    const hasSubstance = l.property_type || sizeValue != null || priceValue != null
-      || area || vicinity || locationText || streetText || phase || placeTags;
+    const hasSubstance = hasCore || phase != null;
     if (!hasSubstance) return;
+
+    const listedPhones = Array.isArray(l.contact_numbers) && l.contact_numbers.length
+      ? l.contact_numbers.join(', ')
+      : null;
+    const fromListing = Number(l.confidence);
+    const fromTop = Number(extraction.confidence_score);
+    const confidence = Number.isFinite(fromListing) ? fromListing : (Number.isFinite(fromTop) ? fromTop : null);
 
     const row = {
       whatsapp_message_id: ctx.messageId,
       chat_jid: ctx.chatJid,
       sender: ctx.sender,
-      category: requirement ? 'INQUIRY' : 'SALES',
-      intent: '',
-      sentiment: 'NEUTRAL',
+      category: modelCategory || (requirement ? 'INQUIRY' : 'SALES'),
+      intent,
+      sentiment,
       language,
-      summary: textOrNull(l.summary),
-      entities: JSON.stringify({ products: [], dates_mentioned: [], action_items: [], names: l.agent_name ? [l.agent_name] : [] }),
+      summary: textOrNull(l.summary) || (listings.length === 1 ? textOrNull(extraction.summary) : null),
+      entities: JSON.stringify(entityBag(extraction.entities, l.agent_name)),
       city,
       city_source: city ? 'llm' : null,
       is_property: true,
       listing_kind: requirement ? 'REQUIREMENT' : 'OFFER',
       purpose,
       property_type: l.property_type || null,
-      property_sub_type: null,
+      property_sub_type: textOrNull(l.property_sub_type),
       area,
       society_key: null,
       vicinity,
@@ -463,19 +588,21 @@ function buildRows(extraction, ctx) {
       size: textOrNull(l.size),
       size_value: sizeValue,
       size_unit: sizeUnit,
-      size_sqft: numOrNull(l.size_sqft),
+      size_sqft: sizeSqft,
       price: priceText,
       price_value: priceValue,
-      price_min: numOrNull(l.price_min),
-      price_max: numOrNull(l.price_max),
+      price_min: priceMin,
+      price_max: priceMax,
       price_basis: priceBasis,
       price_inferred: false,
       price_flagged: Boolean(l.price_flagged),
       price_flag_reason: textOrNull(l.price_flag_reason),
       contact_number:
-        (Array.isArray(l.contact_numbers) && l.contact_numbers.length ? l.contact_numbers.join(', ') : null) ||
+        textOrNull(l.contact_number) ||
+        listedPhones ||
+        textOrNull(extraction.contact_number) ||
         normalizePkMobile(ctx.senderPhone) || ctx.senderPhone || null,
-      confidence_score: Number.isFinite(l.confidence) ? l.confidence : null,
+      confidence_score: confidence,
       model_used: 'extract-v2',
       listing_index: idx,
       listing_excerpt: excerpt ? excerpt.slice(0, 2000) : null,
@@ -505,8 +632,10 @@ function buildRows(extraction, ctx) {
   if (!rows.length) {
     rows.push({
       whatsapp_message_id: ctx.messageId, chat_jid: ctx.chatJid, sender: ctx.sender,
-      category: 'GENERAL', intent: '', sentiment: 'NEUTRAL', language,
-      summary: messageText.slice(0, 160), entities: '{}', city: null, city_source: null,
+      category: modelCategory || 'GENERAL', intent, sentiment, language,
+      summary: textOrNull(extraction.summary) || messageText.slice(0, 160),
+      entities: extraction.entities ? JSON.stringify(entityBag(extraction.entities)) : '{}',
+      city: null, city_source: null,
       is_property: false, listing_kind: null, purpose: null, property_type: null, property_sub_type: null,
       area: null, society_key: null, vicinity: null, phase: null, location_text: null, street_text: null,
       size: null, size_value: null, size_unit: null, size_sqft: null,

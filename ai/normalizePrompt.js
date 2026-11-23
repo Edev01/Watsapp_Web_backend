@@ -1,83 +1,79 @@
 /** System prompt for Together / OpenAI-compatible property normalization. */
-const SYSTEM_PROMPT = `You are an expert AI Data Normalizer for WhatsApp real estate conversations in Pakistan.
-Your task is to analyze the given WhatsApp message and extract structured information in strictly valid JSON format.
+const SYSTEM_PROMPT = `Extract structured data from Pakistani WhatsApp real estate messages.
 
-JSON Schema format required:
+Return ONLY valid JSON matching this structure:
 {
-  "is_property_listing_or_inquiry": true or false,
-  "summary": "Concise 1-2 sentence overview of the whole message",
-  "category": "INQUIRY | SUPPORT | SALES | COMPLAINT | GENERAL | SPAM",
-  "intent": "Short summary of user's core intent or query",
-  "sentiment": "POSITIVE | NEUTRAL | NEGATIVE",
-  "purpose": "SALE | RENT or null",
-  "property_type": "PLOT | HOUSE | BUNGALOW | APARTMENT | FLAT | SHOP | COMMERCIAL | FARMHOUSE or null",
-  "property_sub_type": "Single Storey | Double Storey | Triple Storey | Studio | 1 Bed | 2 Bed | 3 Bed | Penthouse | Lower Portion | Upper Portion | Residential Plot | Commercial Plot | Agricultural Land | Industrial Land | Office | Shop | Warehouse | Factory | Building or null",
-  "city": "e.g. Karachi | Lahore | Islamabad or null",
-  "area": "Major housing society or scheme name, e.g. DHA, Bahria Town, Clifton, G-11, Gulberg, North Nazimabad, Bedian Road or null",
-  "vicinity": "Sub-location, Street, Block, Phase, Scheme, e.g. Phase 6, Phase 5, Block H, Block 5, Sector C, 29th Street, Scheme 33 or null",
-  "size": "Size, e.g. 1000 Yards, 2 Kanal, 120 Sq. Yd, 2250 Sq. Ft. or null",
-  "size_value": 1000,
-  "size_unit": "Sq. Ft. | Sq. Yd. | Kanal | Sq. M. or null (prefer Sq. Ft.; do not use Marla)",
-  "price": "Price mentioned, e.g. 15 Crore, 45,000 / month, 1.8 Cr or null",
-  "price_value": 15000000,
-  "contact_number": "Phone number(s) mentioned in message, or null",
-  "listings": [
-    {
-      "purpose": "SALE | RENT or null",
-      "property_type": "PLOT | HOUSE | ... or null",
-      "property_sub_type": "... or null",
-      "city": "... or null",
-      "area": "... or null",
-      "vicinity": "... or null",
-      "size": "... or null",
-      "size_value": 100,
-      "size_unit": "Sq. Yd. or null",
-      "price": "Price for THIS offer only, or null if Demand?/on call",
-      "price_value": null,
-      "contact_number": "phones or null",
-      "summary": "1 sentence about THIS offer only",
-      "listing_excerpt": "Exact text slice from the message for THIS offer only"
-    }
-  ],
+  "is_property_listing_or_inquiry": false,
+  "summary": "",
+  "category": "GENERAL",
+  "intent": "",
+  "sentiment": "NEUTRAL",
+  "purpose": null,
+  "property_type": null,
+  "property_sub_type": null,
+  "city": null,
+  "area": null,
+  "vicinity": null,
+  "size": null,
+  "size_value": null,
+  "size_unit": null,
+  "price": null,
+  "price_value": null,
+  "contact_number": null,
+  "listings": [],
   "entities": {
     "products": [],
     "dates_mentioned": [],
     "action_items": [],
     "names": []
   },
-  "language": "en | ur | hinglish | etc.",
-  "confidence_score": 0.95
+  "language": "",
+  "confidence_score": 0
 }
 
-Rules:
-1. "is_property_listing_or_inquiry" MUST be true if the message describes a property deal, listing, or real estate inquiry. It MUST be false if the message is general greeting, chat, spam, or unrelated discussion.
-2. Output ONLY one valid JSON object. No markdown fences, no comments, no trailing text. Do not write thinking or analysis before the JSON.
-3. If text is Urdu written in English (Roman Urdu/Hinglish), analyze its true meaning correctly.
-4. Ensure all quotes inside values are properly escaped.
-5. CRITICAL - Purpose field rules:
-   - Use "SALE" when property is advertised FOR SALE / FOR SELLING / AVAILABLE FOR PURCHASE
-   - Use "RENT" when property is advertised FOR RENT / TO RENT / FOR LEASE / RENTAL
-   - NEVER use "BUY" - use "SALE" instead
-6. Location hierarchy:
-   - "area" = Major housing society/neighborhood (DHA, Bahria Town, Clifton, North Nazimabad, Korangi, etc.)
-   - "vicinity" = Sub-location (Phase 6, Block H, Scheme 33, Street 3, Main Street 5, etc.)
-   - Roman Urdu "mein" / "mai" / bare "main" usually means "in" (e.g. "Korangi mein" = in Korangi). Do NOT store "main" or "mein" as area or vicinity by itself.
-   - For "Main DHA Phase 8", area="DHA", vicinity="Phase 8" (phase is the strong signal; do not use area="Main" or "Main DHA").
-   - Streets like "Main Central Drive" / "Sector 2D" in Karachi DHA ads are real street names (keep them in vicinity). They are often in the Khayaban corridor — set area="DHA" when DHA/Defence context is clear; do NOT invent "Khayaban" unless the message says it or clearly names a Khayaban street.
-7. Normalize city names: "Karachi", "Lahore", "Islamabad", "Rawalpindi", "Faisalabad", etc.
-8. Handle spelling variations: "Cliftn" -> "Clifton", "Krachi" -> "Karachi", "kroangi/korngi" -> "Korangi"
-9. CRITICAL NUMERIC RULES:
-   - size_value and price_value MUST be a single number or null. NEVER an array.
-   - property_type must be ONE value (e.g. "HOUSE"), never "HOUSE | PLOT".
-   - intent must always be a string (use "" if none), never null.
-   - If price is missing, "Demand?", "on call", or "Price on Call" → price=null and price_value=null. NEVER invent a price from phone numbers.
-10. MULTI-LISTING RULES (CRITICAL):
-   - Agent broadcast messages often pack MANY separate offers in one WhatsApp message.
-   - If there are 2+ distinct property offers, put EACH offer in "listings" (max 15).
-   - Each listings[] item MUST have its own size/location/price/summary and a "listing_excerpt" copied from the message for that offer only (do not paste the whole message).
-   - Top-level purpose/property_type/city/area/vicinity/size/price/contact_number MUST mirror the FIRST listing (backward compatible).
-   - If only one property offer exists, set "listings" to a one-element array OR omit listings (top-level fields are enough).
-   - Do NOT merge different streets/sizes into one listing.
+RULES:
+1. Detect property listings and inquiries, including Roman Urdu, Urdu, English, and Hinglish. Set is_property_listing_or_inquiry=true for real estate offers or inquiries; otherwise false.
+
+2. category: INQUIRY, SUPPORT, SALES, COMPLAINT, GENERAL, SPAM.
+   sentiment: POSITIVE, NEUTRAL, NEGATIVE.
+
+3. purpose: SALE or RENT only. Never BUY.
+   property_type: PLOT, HOUSE, BUNGALOW, APARTMENT, FLAT, SHOP, COMMERCIAL, FARMHOUSE.
+   property_sub_type: Single Storey, Double Storey, Triple Storey, Studio, 1 Bed, 2 Bed, 3 Bed, Penthouse, Lower Portion, Upper Portion, Residential Plot, Commercial Plot, Agricultural Land, Industrial Land, Office, Shop, Warehouse, Factory, Building.
+
+4. Location: area=major society/neighborhood; vicinity=phase, block, sector, street or sub-location. Normalize city and spelling variations (Krachi=Karachi, Cliftn=Clifton).
+
+5. Size: preserve original text in size; convert numeric quantity into size_value and unit into size_unit (Marla, Kanal, Sq. Ft., Sq. Yd., Sq. M.).
+
+6. Price: preserve original text in price; convert into PKR numeric price_value. Missing, Demand?, on call or Price on Call = null for both fields. Never infer prices.
+
+7. size_value and price_value must be single numbers or null, never arrays. property_type must be one value. intent must be a string, never null.
+
+8. MULTI-LISTINGS: Identify each distinct property offer separately (maximum 15). Never merge different properties, streets, sizes or prices.
+Each listing must contain:
+{
+  "purpose": null,
+  "property_type": null,
+  "property_sub_type": null,
+  "city": null,
+  "area": null,
+  "vicinity": null,
+  "size": null,
+  "size_value": null,
+  "size_unit": null,
+  "price": null,
+  "price_value": null,
+  "contact_number": null,
+  "summary": "",
+  "listing_excerpt": ""
+}
+Each listing must contain only its own information. listing_excerpt must be an exact text slice from the original message.
+
+9. Top-level property fields and contact_number must mirror the FIRST listing. For one offer, listings must contain one item. For no offers, use [].
+
+10. Extract phone numbers, names, dates, products and action items into their respective fields. Do not invent missing information.
+
+11. summary: concise 1-2 sentences. Each listing summary: one sentence. confidence_score: 0-1.
 `;
 
 const CATEGORIES = new Set([

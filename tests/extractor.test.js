@@ -193,16 +193,94 @@ test('extractMessage uses injected model and cleans the text it sends', async ()
   assert.equal(out.extraction.is_property, false);
 });
 
-test('gemini schema asks for stored search fields', () => {
+test('gemini schema matches the normalizer prompt', () => {
   const g = toGeminiSchema(EXTRACTION_SCHEMA);
   const l = g.properties.listings.items.properties;
   assert.equal(g.type, 'OBJECT');
+  assert.equal(g.properties.is_property_listing_or_inquiry.type, 'BOOLEAN');
   assert.equal(l.price.type, 'STRING');
   assert.equal(l.price.nullable, true);
   assert.equal(l.price_value.type, 'NUMBER');
   assert.equal(l.vicinity.type, 'STRING');
-  assert.equal(l.phase.type, 'INTEGER');
-  assert.equal(l.place_tags.type, 'ARRAY');
+  assert.equal(l.property_sub_type.type, 'STRING');
+  assert.ok(l.size_unit.enum.includes('Marla'));
   assert.ok(!l.purpose.enum.includes(null));
-  assert.equal(g.properties.listings.maxItems, '40');
+  assert.equal(g.properties.listings.maxItems, '15');
+  assert.ok(g.properties.category.enum.includes('SALES'));
+  assert.equal(g.properties.phase, undefined);
+});
+
+test('extractMessage sends the normalizer prompt', async () => {
+  let system;
+  await extractMessage({ message: 'hello there friends', sender: 'a' }, {
+    model: 'mock',
+    callModel: async ({ system: prompt }) => {
+      system = prompt;
+      return { is_property_listing_or_inquiry: false, listings: [] };
+    }
+  });
+  assert.match(system, /is_property_listing_or_inquiry/);
+  assert.match(system, /Never BUY/);
+});
+
+test('new prompt JSON is stored as a listing row', async () => {
+  const text = '5 Marla house for sale in DHA Phase 6, 2.5 crore. Call 03001234567';
+  const out = await extractMessage({ message: text, sender: 'a' }, {
+    model: 'mock',
+    callModel: async () => ({
+      is_property_listing_or_inquiry: true,
+      summary: 'House for sale in DHA Phase 6.',
+      category: 'SALES',
+      intent: 'Selling a 5 marla house',
+      sentiment: 'NEUTRAL',
+      purpose: 'SALE',
+      property_type: 'HOUSE',
+      property_sub_type: 'Single Storey',
+      city: 'Karachi',
+      area: 'DHA',
+      vicinity: 'Phase 6',
+      size: '5 Marla',
+      size_value: 5,
+      size_unit: 'Marla',
+      price: '2.5 crore',
+      price_value: 25000000,
+      contact_number: '03001234567',
+      listings: [{
+        purpose: 'SALE',
+        property_type: 'HOUSE',
+        property_sub_type: 'Single Storey',
+        city: 'Karachi',
+        area: 'DHA',
+        vicinity: 'Phase 6',
+        size: '5 Marla',
+        size_value: 5,
+        size_unit: 'Marla',
+        price: '2.5 crore',
+        price_value: 25000000,
+        contact_number: '03001234567',
+        summary: '5 marla house for sale in DHA Phase 6.',
+        listing_excerpt: '5 Marla house for sale in DHA Phase 6'
+      }],
+      entities: { products: [], dates_mentioned: [], action_items: [], names: ['Ali'] },
+      language: 'en',
+      confidence_score: 0.86
+    })
+  });
+  assert.equal(out.extraction.is_property, true);
+  const [row] = buildRows(out.extraction, ctx(text));
+  assert.equal(row.is_property, true);
+  assert.equal(row.property_type, 'HOUSE');
+  assert.equal(row.property_sub_type, 'Single Storey');
+  assert.equal(row.area, 'DHA');
+  assert.equal(row.vicinity, 'Phase 6');
+  assert.equal(row.phase, 6);
+  assert.equal(row.size_unit, 'Marla');
+  assert.equal(row.size_value, 5);
+  assert.equal(row.size_sqft, 1125);
+  assert.equal(row.price_value, 25000000);
+  assert.equal(row.contact_number, '03001234567');
+  assert.equal(row.category, 'SALES');
+  assert.equal(row.intent, 'Selling a 5 marla house');
+  assert.equal(row.confidence_score, 0.86);
+  assert.deepEqual(JSON.parse(row.entities).names, ['Ali']);
 });
