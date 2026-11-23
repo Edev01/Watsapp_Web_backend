@@ -20,6 +20,16 @@ function classifyExtractError(err) {
 
   out.is429 = out.status === 429 || /\b429\b/.test(msg);
   out.is402 = out.status === 402 || /credit limit exceeded/i.test(msg);
+  out.isAuth =
+    out.status === 401 ||
+    out.status === 403 ||
+    /\b401\b|\b403\b|unauthorized|forbidden|invalid.?api.?key/i.test(msg);
+  out.isHitCap = /hit_cap/i.test(msg) || Boolean(err?.hitCap);
+  out.isHardFail =
+    out.isAuth ||
+    out.status === 400 ||
+    out.isHitCap ||
+    (/^\w+ 4\d\d:/.test(msg) && !out.is429);
   out.isQuota =
     out.is429 ||
     out.is402 ||

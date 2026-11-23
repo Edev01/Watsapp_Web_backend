@@ -223,14 +223,6 @@ async function runMigrationSteps(client) {
       last_posted_at TIMESTAMPTZ,
       updated_at TIMESTAMPTZ DEFAULT NOW()
     )`,
-    `CREATE TABLE IF NOT EXISTS scrape_down_alerts (
-      user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-      reason VARCHAR(32) NOT NULL,
-      detail TEXT,
-      first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      alerted_at TIMESTAMPTZ,
-      resolved_at TIMESTAMPTZ
-    )`,
     `CREATE TABLE IF NOT EXISTS normalize_jobs (
       user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
       status VARCHAR(32) NOT NULL DEFAULT 'idle',
@@ -370,6 +362,17 @@ async function runMigrationSteps(client) {
     )`,
     `CREATE INDEX IF NOT EXISTS idx_openai_api_hits_hit_at ON openai_api_hits (hit_at DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_openai_api_hits_message ON openai_api_hits (message_id)`,
+    // Content-dup scrape skips still ack wa_key so reconcile does not re-push forever.
+    `CREATE TABLE IF NOT EXISTS whatsapp_seen_wa_keys (
+      user_id INTEGER NOT NULL,
+      chat_jid TEXT NOT NULL,
+      wa_key_id TEXT NOT NULL,
+      content_fingerprint TEXT,
+      seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (user_id, chat_jid, wa_key_id)
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_whatsapp_seen_wa_keys_chat
+       ON whatsapp_seen_wa_keys (user_id, chat_jid)`,
     `CREATE TABLE IF NOT EXISTS subscriptions (
       user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
       status TEXT NOT NULL DEFAULT 'unpaid',

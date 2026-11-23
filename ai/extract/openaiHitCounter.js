@@ -2,6 +2,27 @@
  * Exact OpenAI Chat Completions hit log + running counter.
  * One row (and +1) per HTTP request that left this process for api.openai.com.
  */
+
+function maxHitsPerMessage() {
+  const n = Number(process.env.MAX_OPENAI_HITS_PER_MESSAGE);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 1;
+}
+
+async function countHitsForMessage(messageId) {
+  if (messageId == null) return 0;
+  try {
+    const db = require('../../db');
+    const { rows } = await db.query(
+      `SELECT count(*)::int AS n FROM openai_api_hits WHERE message_id = $1`,
+      [Number(messageId)]
+    );
+    return rows[0]?.n || 0;
+  } catch (err) {
+    console.warn('[openai] hit count failed:', err.message);
+    return 0;
+  }
+}
+
 async function recordOpenAiHit({
   messageId = null,
   userId = null,
@@ -49,4 +70,4 @@ async function recordOpenAiHit({
   }
 }
 
-module.exports = { recordOpenAiHit };
+module.exports = { recordOpenAiHit, countHitsForMessage, maxHitsPerMessage };

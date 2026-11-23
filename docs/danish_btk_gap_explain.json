@@ -1,0 +1,432 @@
+{
+  "buckets": {
+    "total_raw": 1622,
+    "pending_no_norm_row": 23,
+    "norm_not_property": 298,
+    "norm_property": 1301,
+    "raw_has_precinct": 1239,
+    "raw_no_precinct": 383,
+    "prec_pending": 23,
+    "prec_not_property": 195,
+    "prec_property_with_precinct": 788,
+    "prec_property_missing_precinct": 233,
+    "raw_msgs_multi_precinct": 685,
+    "raw_precinct_mentions_sum": 4509
+  },
+  "topGapParents": [
+    {
+      "parent": "27",
+      "raw": 341,
+      "pending": 2,
+      "not_prop": 60,
+      "prop_ok": 87,
+      "prop_miss": 192,
+      "lost": 254
+    },
+    {
+      "parent": "15",
+      "raw": 332,
+      "pending": 0,
+      "not_prop": 67,
+      "prop_ok": 81,
+      "prop_miss": 184,
+      "lost": 251
+    },
+    {
+      "parent": "10",
+      "raw": 266,
+      "pending": 0,
+      "not_prop": 62,
+      "prop_ok": 40,
+      "prop_miss": 164,
+      "lost": 226
+    },
+    {
+      "parent": "8",
+      "raw": 196,
+      "pending": 2,
+      "not_prop": 49,
+      "prop_ok": 31,
+      "prop_miss": 114,
+      "lost": 165
+    },
+    {
+      "parent": "6",
+      "raw": 192,
+      "pending": 4,
+      "not_prop": 39,
+      "prop_ok": 33,
+      "prop_miss": 116,
+      "lost": 159
+    },
+    {
+      "parent": "16",
+      "raw": 205,
+      "pending": 1,
+      "not_prop": 35,
+      "prop_ok": 49,
+      "prop_miss": 120,
+      "lost": 156
+    },
+    {
+      "parent": "31",
+      "raw": 193,
+      "pending": 1,
+      "not_prop": 35,
+      "prop_ok": 45,
+      "prop_miss": 112,
+      "lost": 148
+    },
+    {
+      "parent": "11",
+      "raw": 171,
+      "pending": 0,
+      "not_prop": 42,
+      "prop_ok": 25,
+      "prop_miss": 104,
+      "lost": 146
+    },
+    {
+      "parent": "29",
+      "raw": 172,
+      "pending": 0,
+      "not_prop": 39,
+      "prop_ok": 30,
+      "prop_miss": 103,
+      "lost": 142
+    },
+    {
+      "parent": "30",
+      "raw": 162,
+      "pending": 0,
+      "not_prop": 31,
+      "prop_ok": 43,
+      "prop_miss": 88,
+      "lost": 119
+    },
+    {
+      "parent": "28",
+      "raw": 135,
+      "pending": 0,
+      "not_prop": 31,
+      "prop_ok": 26,
+      "prop_miss": 78,
+      "lost": 109
+    },
+    {
+      "parent": "4",
+      "raw": 124,
+      "pending": 1,
+      "not_prop": 30,
+      "prop_ok": 21,
+      "prop_miss": 72,
+      "lost": 103
+    },
+    {
+      "parent": "32",
+      "raw": 126,
+      "pending": 0,
+      "not_prop": 24,
+      "prop_ok": 23,
+      "prop_miss": 79,
+      "lost": 103
+    },
+    {
+      "parent": "1",
+      "raw": 115,
+      "pending": 2,
+      "not_prop": 27,
+      "prop_ok": 19,
+      "prop_miss": 67,
+      "lost": 96
+    },
+    {
+      "parent": "33",
+      "raw": 108,
+      "pending": 1,
+      "not_prop": 23,
+      "prop_ok": 16,
+      "prop_miss": 68,
+      "lost": 92
+    }
+  ],
+  "samples": {
+    "not_property": [
+      {
+        "id": 21869,
+        "codes": [
+          "30",
+          "15",
+          "15A",
+          "10B",
+          "15B",
+          "4",
+          "7",
+          "6",
+          "51",
+          "48",
+          "17",
+          "29",
+          "33",
+          "32",
+          "27A"
+        ],
+        "type": null,
+        "preview": "*BAHRIA TOWN KARACHI* *ONE CALL DEALS ✅* P30 Plot 500sr Corner 325 Yards Allotment Attractive Rates 💯 P15 Plot •1105 Jinnah Back •1215 "
+      },
+      {
+        "id": 21870,
+        "codes": [
+          "31",
+          "1",
+          "6",
+          "18"
+        ],
+        "type": null,
+        "preview": "*BHARIA TOWN KARACHI* Bahria Heights Tower A 6th Floor Outer Westopen Key in mantinance @130 Ali Block street 34 Designer Villa 3121 @22"
+      },
+      {
+        "id": 15202,
+        "codes": [
+          "15A",
+          "15B",
+          "27"
+        ],
+        "type": null,
+        "preview": "*BAHRIA TOWN KARACHI* *P15A P15B P27* WITH ALLOTMENT PLOTS AVAILABLE *TAQI ZAIDI* 0324-827-4073"
+      },
+      {
+        "id": 15216,
+        "codes": [
+          "27"
+        ],
+        "type": null,
+        "preview": "**-Chance Deal**_ *P27 Jinnah Face 560series Allotment in Hand Level Plot Video Available @49 Final* ** *Ali amir *Estate World 🌎* *03"
+      },
+      {
+        "id": 21890,
+        "codes": [
+          "23"
+        ],
+        "type": null,
+        "preview": "*CONFIRM REQUIRD P 23 GENRAL LOW BUDGET PLOT REQUIRD*"
+      },
+      {
+        "id": 28687,
+        "codes": [
+          "32",
+          "30",
+          "26A",
+          "22"
+        ],
+        "type": null,
+        "preview": "*Sports city villa* strt 31 No 9 grill sanitory Dmnd 232 *Ali block 250 sqy* Plot 4608 alotmnt Dmnd 60 *P 32 park face* Strt 31 plot 8 a"
+      },
+      {
+        "id": 38585,
+        "codes": [
+          "30",
+          "15",
+          "10B",
+          "15A"
+        ],
+        "type": null,
+        "preview": "*BHARIA TOWN KARACHI* *ONE CALL DEALS ✅* P30 Plot 500sr Corner Prime Location 325 Yards Allotment @80 Lac P15 Plot 1215 Road 4 100% Le"
+      },
+      {
+        "id": 38587,
+        "codes": [
+          "1",
+          "30",
+          "12",
+          "10B"
+        ],
+        "type": null,
+        "preview": "*FoR RenT* Precinct-1 villa Street 27 ready to move near school *RenT:- 160K* *Precinct-1 Portion* Upper Portion Fully Furnished West Ope"
+      }
+    ],
+    "missing_precinct": [
+      {
+        "id": 15195,
+        "rawCodes": [
+          "31",
+          "15",
+          "11B",
+          "34",
+          "6",
+          "23",
+          "24",
+          "29"
+        ],
+        "vicinity": "Street 43",
+        "tags": [
+          "Sports City",
+          "Bahria Town Karachi",
+          "BTK",
+          "Street 43"
+        ],
+        "preview": "📍*P31 125 Sq Yadz*📍 *Road 21 Plot 1860 Series With Allotment @ 37 Final* *750 Series With Allotment @ 33 Final* *640 Series With Allotme"
+      },
+      {
+        "id": 15197,
+        "rawCodes": [
+          "31",
+          "30"
+        ],
+        "vicinity": "Golf City, Street 83",
+        "tags": [
+          "Golf City",
+          "Street 83",
+          "Bahria Town Karachi",
+          "BTK"
+        ],
+        "preview": "*Bahria Town Karachi* 125yrds Ali Block Plot No 1500s Demand 60 Lac 125yrds Ali Block Plot No 3190s Demand 74 Lac 125yrds Ali Block "
+      },
+      {
+        "id": 15203,
+        "rawCodes": [
+          "10B",
+          "26A",
+          "15B",
+          "15",
+          "32",
+          "47",
+          "16",
+          "29",
+          "6",
+          "17"
+        ],
+        "vicinity": "Ali Block",
+        "tags": [
+          "Ali Block",
+          "Bahria Town Karachi",
+          "BTK"
+        ],
+        "preview": "*BTK CHANCE DEAL* *P10B STREET 2 ALLOTMENT* Demand 52 Lac *P26A 3040 SERIES NEAR JINNAH* Non Paid Demand 22 Lac *P15B 2210 SERIES NON PAI"
+      },
+      {
+        "id": 15212,
+        "rawCodes": [
+          "32"
+        ],
+        "vicinity": null,
+        "tags": [
+          "Bahria Town Karachi",
+          "BTK"
+        ],
+        "preview": "*P 32 park face* Strt 31 avl for sale Dmnd 42 close offer req 03333100554"
+      },
+      {
+        "id": 24075,
+        "rawCodes": [
+          "10A",
+          "10",
+          "10B",
+          "11A"
+        ],
+        "vicinity": "Precinct 19",
+        "tags": [
+          "Bahria Town Karachi",
+          "BTK",
+          "Precinct 19",
+          "P19"
+        ],
+        "preview": "*Auto Reply* 💯 Confirm inventory* One Call Done ✅ *کراچی بحریہ ٹاؤن* Chance deal 2Bed lounge Apartment Saifi heights 2nd floor b.n"
+      },
+      {
+        "id": 15220,
+        "rawCodes": [
+          "27"
+        ],
+        "vicinity": "Ali Block",
+        "tags": [
+          "Bahria Town Karachi",
+          "BTK"
+        ],
+        "preview": "P27 3490 series Allotment Demand 37 Golf Road 25 70s 506 sq yard Demand 65 Ali block Road 13 2090 series Allotment 74 bottom"
+      },
+      {
+        "id": 15221,
+        "rawCodes": [
+          "6",
+          "12",
+          "10A",
+          "15B",
+          "20",
+          "23",
+          "24",
+          "25",
+          "28",
+          "31",
+          "40",
+          "11A"
+        ],
+        "vicinity": null,
+        "tags": [
+          "Sports City",
+          "BTK",
+          "Bahria Town Karachi"
+        ],
+        "preview": "*Auto Reply* 💯 Confirm inventory BTK P6 1280s@125 P12 300s west open @ 68F P12 2100s @75 P12 2000s @75 P12 1425s@72F P12 villa @154F P1"
+      },
+      {
+        "id": 21899,
+        "rawCodes": [
+          "15",
+          "33"
+        ],
+        "vicinity": "Ali Block, Road 13",
+        "tags": [
+          "Ali Block"
+        ],
+        "preview": "Join My Broadcast Group https://chat.whatsapp.com/CdbgIghP0AyCs10HmEN5DF?s=hd&p=i&mlu=4&ilr=4&iam=2 Bahria Hills Street 1 Plot no 30serie"
+      }
+    ],
+    "pending": [
+      {
+        "id": 10711,
+        "codes": [
+          "7"
+        ],
+        "preview": "CHANCE DEAL 🤝 P7 CORNER 💚 PU PIAD Extra land 237 not paid Video AVAILABLE Sale SALE SALE From SALMAN Ali 0303"
+      },
+      {
+        "id": 10713,
+        "codes": [
+          "7"
+        ],
+        "preview": "P7 plot 1000 yards with allotment chance deal 225 number"
+      },
+      {
+        "id": 11060,
+        "codes": [
+          "47"
+        ],
+        "preview": "*P47 GoKart Boulevard Corner Available* Road 14 & 15 Ka 1 Number 516 Yds Demand 1.05cr All Paid"
+      },
+      {
+        "id": 11062,
+        "codes": [
+          "17"
+        ],
+        "preview": "CHANCE DEAL p17 CORNER 💚 P17 500 yard plot Hot location FOR sale SALE From SALMAN 0303 5565557"
+      },
+      {
+        "id": 11103,
+        "codes": [
+          "1",
+          "6",
+          "8"
+        ],
+        "preview": "Urgent Required Villa for Rent P1 P6 P8 5 bedroom Villa Mubashir Estate 03332173625"
+      }
+    ]
+  },
+  "note": {
+    "avg_precincts_per_raw_msg_with_p": 3.64
+  },
+  "danishNormRows": {
+    "n": 8739,
+    "props": 7185
+  }
+}

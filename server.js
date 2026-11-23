@@ -1616,7 +1616,23 @@ app.get('/api/scraped-chats/wa-keys', async (req, res) => {
       sql += ` AND timestamp ~ '^[0-9]+$' AND timestamp::bigint >= $3::bigint`;
     }
     const rows = await db.query(sql, params);
-    const keys = rows.rows.map((r) => r.wa_key_id);
+    const keySet = new Set(rows.rows.map((r) => r.wa_key_id).filter(Boolean));
+    // Include content-dup acks so reconcile does not re-post forever.
+    const seenParams = [userId, chatJid];
+    let seenSql = `
+      SELECT wa_key_id FROM whatsapp_seen_wa_keys
+      WHERE user_id = $1 AND chat_jid = $2
+    `;
+    // sinceEpoch filter only applies to message timestamps; seen keys are always included.
+    try {
+      const seen = await db.query(seenSql, seenParams);
+      for (const r of seen.rows) {
+        if (r.wa_key_id) keySet.add(String(r.wa_key_id));
+      }
+    } catch (seenErr) {
+      if (!/whatsapp_seen_wa_keys/i.test(String(seenErr.message || ''))) throw seenErr;
+    }
+    const keys = [...keySet];
     return sendResponse(res, 200, false, { chatJid, count: keys.length, keys }, 'ok');
   } catch (err) {
     console.error('wa-keys error:', err);
@@ -1748,13 +1764,12 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
           [userId, canonicalJid]
         );
 
-        // Duplicate rules (scoped per chat so cross-posted listings are kept per group):
+        // Duplicate rules (per user — never store same body+footer twice):
         // - same wa_key_id in this chat → skip
-        // - same body + same footer in this chat → skip
-        // - same body + diff footer in this chat → delete old, insert new
-        // - same text in a different chat → allow (separate scrape row)
+        // - same full content_fingerprint for this user (any chat) → skip (+ ack wa_key)
+        // - same body + diff footer → store (new agent)
         const prior = await client.query(
-          `SELECT id, message, wa_key_id FROM whatsapp_messages
+          `SELECT id, message, wa_key_id, content_fingerprint FROM whatsapp_messages
            WHERE user_id = $1
              AND chat_jid = $2
              AND id > (SELECT COALESCE(MAX(id),0) - 20000 FROM whatsapp_messages WHERE user_id = $1 AND chat_jid = $2)
@@ -1767,7 +1782,8 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
         const priorWaKeys = new Set();
         for (const r of prior.rows) {
           if (r.wa_key_id) priorWaKeys.add(String(r.wa_key_id));
-          const fullFp = userMessageFingerprint(userId, r.message);
+          const fullFp =
+            r.content_fingerprint || userMessageFingerprint(userId, r.message);
           const bodyFp = userMessageBodyFingerprint(userId, r.message);
           if (fullFp) {
             if (!priorByFull.has(fullFp)) priorByFull.set(fullFp, []);
@@ -1779,10 +1795,44 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
           }
         }
 
+        const batchFps = [
+          ...new Set(
+            toInsert
+              .map((row) => userMessageFingerprint(userId, row.messageText))
+              .filter(Boolean)
+          )
+        ];
+        const priorUserFull = new Set();
+        if (batchFps.length) {
+          const existingFp = await client.query(
+            `SELECT DISTINCT content_fingerprint
+               FROM whatsapp_messages
+              WHERE user_id = $1
+                AND content_fingerprint = ANY($2::text[])`,
+            [userId, batchFps]
+          );
+          for (const r of existingFp.rows) {
+            if (r.content_fingerprint) priorUserFull.add(String(r.content_fingerprint));
+          }
+        }
+
         const replaceOldIdsByFull = new Map(); // new fullFp → old message ids to delete
         const byBodyLast = new Map(); // same body in this batch → keep newest only (no wa_key)
         const uniqueRows = [];
+        const seenKeysToAck = []; // { waKeyId, contentFingerprint }
         let dupSkipped = 0;
+
+        const ackContentDup = (row, fullFp) => {
+          dupSkipped += 1;
+          if (row.waKeyId) {
+            seenKeysToAck.push({
+              waKeyId: String(row.waKeyId),
+              contentFingerprint: fullFp || null
+            });
+            priorWaKeys.add(String(row.waKeyId));
+          }
+        };
+
         for (const row of toInsert) {
           const fullFp = userMessageFingerprint(userId, row.messageText);
           const bodyFp = userMessageBodyFingerprint(userId, row.messageText);
@@ -1798,20 +1848,23 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
             continue;
           }
 
-          // New wa_key_id for this chat = real WhatsApp message. Always keep it.
-          // Fingerprint dedupe was dropping distinct listings that normalized alike
-          // and blocking true-miss reconcile. wa_key_id is the scrape source of truth.
+          // Same body+footer already stored for this user (any chat) → never re-store.
+          if (fullFp && (priorUserFull.has(fullFp) || priorByFull.has(fullFp))) {
+            ackContentDup(row, fullFp);
+            continue;
+          }
+
           if (row.waKeyId) {
             uniqueRows.push(next);
             priorWaKeys.add(String(row.waKeyId));
             if (fullFp) {
               if (!priorByFull.has(fullFp)) priorByFull.set(fullFp, []);
-              // no id yet; just prevent footer-replace logic from deleting unrelated rows
+              priorUserFull.add(fullFp);
             }
             continue;
           }
 
-          // Legacy rows without wa_key_id: keep prior fingerprint behavior (per chat).
+          // Legacy rows without wa_key_id: fingerprint behavior (per chat + user).
           if (fullFp && priorByFull.has(fullFp)) {
             dupSkipped += 1;
             continue;
@@ -1830,12 +1883,32 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
 
           if (!bodyFp) {
             uniqueRows.push(next);
+            if (fullFp) priorUserFull.add(fullFp);
             continue;
           }
           byBodyLast.set(bodyFp, next);
         }
-        uniqueRows.push(...byBodyLast.values());
+        for (const row of byBodyLast.values()) {
+          if (row.contentFingerprint) priorUserFull.add(row.contentFingerprint);
+          uniqueRows.push(row);
+        }
         skippedCount += dupSkipped;
+
+        if (seenKeysToAck.length) {
+          const ackParams = [];
+          const ackValues = [];
+          let ap = 1;
+          for (const ack of seenKeysToAck) {
+            ackValues.push(`($${ap++},$${ap++},$${ap++},$${ap++})`);
+            ackParams.push(userId, canonicalJid, ack.waKeyId, ack.contentFingerprint);
+          }
+          await client.query(
+            `INSERT INTO whatsapp_seen_wa_keys (user_id, chat_jid, wa_key_id, content_fingerprint)
+             VALUES ${ackValues.join(',')}
+             ON CONFLICT (user_id, chat_jid, wa_key_id) DO NOTHING`,
+            ackParams
+          );
+        }
 
         if (!uniqueRows.length) {
           await client.query('COMMIT');
@@ -1975,11 +2048,16 @@ app.post('/api/scraped-chats/messages', async (req, res) => {
     // Auto-queue AI normalization for this tenant (no PC / manual step).
     // Render Background Worker (auto_pipeline) or AI_BOT_URL picks it up.
     if (addedCount > 0) {
-      queueNormalizeJob(userId, { embed: true }).then(({ job, alreadyActive }) => {
+      queueNormalizeJob(userId, { embed: true }).then(({ job, alreadyActive, paused }) => {
+        if (paused) {
+          console.log(`[normalize] user=${userId} job paused — skip wake`);
+          return;
+        }
+        // Already running/queued: do not spam wake on every scrape/reconcile batch.
+        if (alreadyActive) return;
         try {
           wakePipeline(userId);
         } catch (_) {}
-        if (alreadyActive) return;
         return notifyNormalizeBot(userId, job).then((botNotify) => {
           if (!botNotify.notified) {
             console.log(

@@ -16,7 +16,11 @@ const {
 const { cleanText, parsePrice } = require('./parsers');
 const { looksLikeRequirement } = require('./listingKind');
 const { applyBtkListing } = require('../btkPrecincts');
-const { recordOpenAiHit } = require('./openaiHitCounter');
+const {
+  recordOpenAiHit,
+  countHitsForMessage,
+  maxHitsPerMessage
+} = require('./openaiHitCounter');
 
 let userListingFingerprint = null;
 let normalizePkMobile = (p) => p || null;
@@ -140,7 +144,7 @@ async function callAnthropic({ system, user, model }) {
   throw lastErr;
 }
 
-/** OpenAI-compatible chat completions (Together or OpenAI). */
+/** OpenAI-compatible chat completions. Exactly one HTTP attempt per message (no retries). */
 async function callOpenAiCompatible({
   system,
   user,
@@ -155,76 +159,52 @@ async function callOpenAiCompatible({
   const base = String(baseUrl || '').replace(/\/$/, '');
   if (!base) throw new Error(`${label}: base URL not set`);
   if (!model) throw new Error(`${label}: model not set`);
+
+  if (label === 'openai' && messageId != null) {
+    const prior = await countHitsForMessage(messageId);
+    const maxHits = maxHitsPerMessage();
+    if (prior >= maxHits) {
+      const err = new Error(`${label} hit_cap: message ${messageId} already has ${prior} hit(s)`);
+      err.hitCap = true;
+      throw err;
+    }
+  }
+
   const schemaNote =
     'Return one JSON object only (no markdown). Schema:\n' + JSON.stringify(EXTRACTION_SCHEMA);
-  const noteHit = async (res, attempt) => {
-    if (label !== 'openai') return;
+  // Prefer params that work on current OpenAI models; one request only (no retry storm).
+  const body = {
+    model,
+    max_completion_tokens: 8192,
+    messages: [
+      { role: 'system', content: `${system}\n\n${schemaNote}` },
+      { role: 'user', content: user }
+    ],
+    response_format: { type: 'json_object' }
+  };
+  const res = await fetch(`${base}/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify(body)
+  });
+  if (label === 'openai') {
     await recordOpenAiHit({
       messageId,
       userId,
       model,
-      ok: Boolean(res && res.ok),
-      httpStatus: res && res.status,
-      attempt
+      ok: Boolean(res.ok),
+      httpStatus: res.status,
+      attempt: 1
     });
-  };
-  let lastErr;
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    const body = {
-      model,
-      temperature: 0,
-      max_tokens: 8192,
-      messages: [
-        { role: 'system', content: `${system}\n\n${schemaNote}` },
-        { role: 'user', content: user }
-      ],
-      response_format: { type: 'json_object' }
-    };
-    let res = await fetch(`${base}/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify(body)
-    });
-    await noteHit(res, attempt + 1);
-    if (!res.ok && res.status === 400) {
-      const errText = await res.text();
-      let adjusted = false;
-      if (/response_format|json_object/i.test(errText) && body.response_format) {
-        delete body.response_format;
-        adjusted = true;
-      }
-      if (/max_tokens|temperature|max_completion_tokens|unsupported_parameter/i.test(errText)) {
-        delete body.temperature;
-        delete body.max_tokens;
-        body.max_completion_tokens = body.max_completion_tokens || 8192;
-        adjusted = true;
-      }
-      if (adjusted) {
-        res = await fetch(`${base}/chat/completions`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-          body: JSON.stringify(body)
-        });
-        await noteHit(res, attempt + 1);
-      } else {
-        throw new Error(`${label} ${res.status}: ${errText.slice(0, 200)}`);
-      }
-    }
-    if (res.ok) {
-      const data = await res.json();
-      const text = data.choices?.[0]?.message?.content;
-      if (!text) throw new Error(`${label}: empty response`);
-      return parseJsonFromLlm(text);
-    }
-    const errBody = await res.text();
-    lastErr = new Error(`${label} ${res.status}: ${errBody.slice(0, 200)}`);
-    if (res.status === 429 || res.status >= 500) {
-      await sleep(800 * (attempt + 1));
-      continue;
-    }
-    throw lastErr;
   }
-  throw lastErr;
+  if (res.ok) {
+    const data = await res.json();
+    const text = data.choices?.[0]?.message?.content;
+    if (!text) throw new Error(`${label}: empty response`);
+    return parseJsonFromLlm(text);
+  }
+  const errBody = await res.text();
+  throw new Error(`${label} ${res.status}: ${errBody.slice(0, 200)}`);
 }
 
 /** Together.ai (OpenAI-compatible). Uses LLM_BASE_URL + LLM_API_KEY from .env. */

@@ -50,6 +50,111 @@ async function alreadyNormalizedSameBody(job) {
   return false;
 }
 
+const NON_REUSE_INTENTS = new Set(['extract_failed', 'duplicate']);
+const NON_REUSE_MODELS = new Set(['skip-auth', 'dup-skip', 'hit-cap', 'none']);
+
+/**
+ * If any other user already extracted the same body+footer, copy their rows (0 OpenAI).
+ */
+async function copyCrossUserExtraction(job) {
+  const {
+    messageContentFingerprint,
+    userListingFingerprint
+  } = require('../contentFingerprint');
+  const globalFp = messageContentFingerprint(job.message);
+  if (!globalFp) return null;
+
+  const { rows: srcMsgs } = await db.query(
+    `SELECT m.id
+       FROM whatsapp_messages m
+      WHERE m.id <> $1
+        AND m.content_fingerprint IS NOT NULL
+        AND regexp_replace(m.content_fingerprint, '^u[0-9]+\\|', '') = $2
+        AND EXISTS (
+          SELECT 1 FROM normalized_messages n
+           WHERE n.whatsapp_message_id = m.id
+             AND COALESCE(n.intent, '') <> ALL($3::text[])
+             AND COALESCE(n.model_used, '') <> ALL($4::text[])
+        )
+      ORDER BY m.id ASC
+      LIMIT 1`,
+    [job.id, globalFp, [...NON_REUSE_INTENTS], [...NON_REUSE_MODELS]]
+  );
+  if (!srcMsgs.length) return null;
+
+  const srcId = srcMsgs[0].id;
+  const { rows: srcRows } = await db.query(
+    `SELECT * FROM normalized_messages
+      WHERE whatsapp_message_id = $1
+      ORDER BY listing_index ASC`,
+    [srcId]
+  );
+  if (!srcRows.length) return null;
+
+  const uid = tenantId(job.user_id);
+  const copied = srcRows.map((r) => {
+    const {
+      id: _id,
+      created_at: _ca,
+      place_resolved_at: _pra,
+      ...rest
+    } = r;
+    const row = {
+      ...rest,
+      whatsapp_message_id: job.id,
+      chat_jid: job.chat_jid,
+      sender: job.sender,
+      model_used: 'cross-user-reuse',
+      extract_trace: JSON.stringify({
+        reused_from_message_id: srcId,
+        prior_model: r.model_used
+      })
+    };
+    if (row.is_property && userListingFingerprint) {
+      row.content_fingerprint = userListingFingerprint(uid, {
+        listing_excerpt: row.listing_excerpt,
+        summary: row.summary,
+        purpose: row.purpose,
+        rawMessage: job.message || '',
+        contact_number: row.contact_number
+      });
+    }
+    return row;
+  });
+
+  const { saveMessageRows } = require('./extract/persist');
+  await saveMessageRows(db, job.id, copied);
+  const props = copied.filter((r) => r.is_property).length;
+  console.info(
+    `[ai] Message ${job.id} (user ${uid}) cross-user-reuse from msg ${srcId} → ${props} listing(s)`
+  );
+  return { id: job.id, ok: true, listings: props, provider: 'cross-user-reuse' };
+}
+
+async function deadLetterMessage(job, { intent = 'extract_failed', model = 'skip-auth', summary = '' } = {}) {
+  const { buildRows } = require('./extract/extractor');
+  const { saveMessageRows } = require('./extract/persist');
+  const rows = buildRows(
+    { is_property: false, language: 'en', listings: [] },
+    {
+      messageId: job.id,
+      chatJid: job.chat_jid,
+      sender: job.sender,
+      senderPhone: job.sender_phone,
+      messageText: job.message || '',
+      userId: job.user_id,
+      model
+    }
+  );
+  if (rows[0]) {
+    rows[0].intent = intent;
+    rows[0].summary = summary || `[${intent}]`;
+    rows[0].model_used = model;
+    rows[0].category = 'skipped';
+  }
+  await saveMessageRows(db, job.id, rows);
+}
+
 /**
  * Extract v2 path: one LLM call, then Google corrects a header phase when
  * one offer in a multi-listing names a place in a different phase.
@@ -77,12 +182,15 @@ async function normalizeOneExtractV2(job) {
       if (rows[0]) {
         rows[0].intent = 'duplicate';
         rows[0].summary = '[skipped duplicate listing content]';
-        rows[0].model_used = 'extract-v2';
+        rows[0].model_used = 'dup-skip';
       }
       await saveMessageRows(db, job.id, rows);
       console.info(`[ai] Message ${job.id} skipped OpenAI — same body+footer already normalized`);
       return { id: job.id, ok: true, listings: 0, provider: 'dup-skip' };
     }
+
+    const reused = await copyCrossUserExtraction(job);
+    if (reused) return reused;
 
     if (!job.message || String(job.message).trim().length < 12) {
       const rows = buildRows(
@@ -101,6 +209,7 @@ async function normalizeOneExtractV2(job) {
       return { id: job.id, ok: true, listings: 0 };
     }
 
+    // Exactly one OpenAI HTTP per message — no multi-chunk extract retries.
     let { extraction, model, provider } = await extractMessage(job);
     let rows = buildRows(extraction, {
       messageId: job.id,
@@ -111,58 +220,6 @@ async function normalizeOneExtractV2(job) {
       userId: job.user_id,
       model
     });
-
-    // Multi-offer broadcasts (👉 / P29 / P48…) sometimes come back as one non-property
-    // blob. Split heuristically and extract each chunk so precincts are not dropped.
-    const propCount = rows.filter((r) => r.is_property).length;
-    if (propCount === 0) {
-      let splitPropertyOffers = null;
-      try {
-        ({ splitPropertyOffers } = require('./listingSplitter'));
-      } catch (_) { /* optional */ }
-      const chunks = typeof splitPropertyOffers === 'function'
-        ? splitPropertyOffers(job.message || '')
-        : [];
-      if (chunks.length >= 2) {
-        const mergedListings = [];
-        let usedModel = model;
-        let usedProvider = provider;
-        for (const chunk of chunks.slice(0, 12)) {
-          try {
-            const part = await extractMessage({
-              ...job,
-              message: chunk
-            });
-            usedModel = part.model || usedModel;
-            usedProvider = part.provider || usedProvider;
-            const partRows = buildRows(part.extraction, {
-              messageId: job.id,
-              chatJid: job.chat_jid,
-              sender: job.sender,
-              senderPhone: job.sender_phone,
-              messageText: chunk,
-              userId: job.user_id,
-              model: part.model
-            });
-            for (const r of partRows) {
-              if (r.is_property) mergedListings.push(r);
-            }
-          } catch (chunkErr) {
-            console.info(
-              `[ai] Message ${job.id} chunk extract skipped: ${String(chunkErr.message || chunkErr).slice(0, 100)}`
-            );
-          }
-        }
-        if (mergedListings.length) {
-          rows = mergedListings.map((r, idx) => ({ ...r, listing_index: idx }));
-          model = usedModel;
-          provider = usedProvider;
-          console.info(
-            `[ai] Message ${job.id} recovered ${mergedListings.length} listing(s) via offer-split fallback`
-          );
-        }
-      }
-    }
 
     await correctSplitListingPhases(rows);
     try {
@@ -185,17 +242,33 @@ async function normalizeOneExtractV2(job) {
     const reason = `${err.name || 'Error'}: ${err.message}`;
     if (classified.isQuota || classified.is429 || classified.is402) {
       console.warn(`[ai] Rate/quota on message ${job.id} (${classified.provider || '?'}): ${reason.slice(0, 160)}`);
+      // One-shot policy: dead-letter so this message is never retried for OpenAI.
+      try {
+        await deadLetterMessage(job, {
+          intent: 'extract_failed',
+          model: 'skip-quota',
+          summary: `[quota/rate] ${reason.slice(0, 160)}`
+        });
+      } catch (_) { /* ignore */ }
       return {
         id: job.id,
         ok: false,
         rateLimited: true,
         quotaProvider: classified.provider,
-        is402: classified.is402
+        is402: classified.is402,
+        authFailed: false
       };
     }
     if (err.primaryError) {
       const p = classifyExtractError(err.primaryError);
       if (p.isQuota || p.is429 || p.is402) {
+        try {
+          await deadLetterMessage(job, {
+            intent: 'extract_failed',
+            model: 'skip-quota',
+            summary: `[quota/rate] ${String(err.primaryError.message || '').slice(0, 160)}`
+          });
+        } catch (_) { /* ignore */ }
         return {
           id: job.id,
           ok: false,
@@ -210,8 +283,22 @@ async function normalizeOneExtractV2(job) {
       modelName: EXTRACT_V2_MODEL,
       reason
     });
+    const model =
+      classified.isHitCap ? 'hit-cap' : classified.isAuth ? 'skip-auth' : 'skip-fail';
+    try {
+      await deadLetterMessage(job, {
+        intent: 'extract_failed',
+        model,
+        summary: `[${model}] ${reason.slice(0, 160)}`
+      });
+    } catch (_) { /* ignore */ }
     console.error(`[ai] Error processing message ${job.id}: ${reason}`);
-    return { id: job.id, ok: false };
+    return {
+      id: job.id,
+      ok: false,
+      authFailed: Boolean(classified.isAuth),
+      hardFail: Boolean(classified.isHardFail)
+    };
   } finally {
     await releaseClaim(job.id, EXTRACT_V2_MODEL);
   }
@@ -409,16 +496,34 @@ async function processUnnormalizedMessages({
   const workers = concurrency || cfg.normalizeConcurrency;
   const perUser = cfg.normalizePerUser;
 
+  if (userId != null) {
+    const paused = await db.query(
+      `SELECT 1 FROM normalize_jobs WHERE user_id = $1 AND status = 'paused' LIMIT 1`,
+      [Number(userId)]
+    );
+    if (paused.rowCount > 0) {
+      console.info(`[ai] Skip normalize; user=${userId} job is paused`);
+      return {
+        successCount: 0,
+        failCount: 0,
+        claimed: 0,
+        rateLimited: 0,
+        authFailed: 0,
+        paused: true
+      };
+    }
+  }
+
   loadSkippedIds();
   await releaseStaleClaims(targetModel);
 
   const window = Math.max(batchSize * 4, 80);
-  const candidates = await loadPendingJobs(targetModel, userId, window, { ignoreSkips: true });
+  const candidates = await loadPendingJobs(targetModel, userId, window, { ignoreSkips: false });
   const selected = fairPick(candidates, batchSize, perUser);
   const claimed = await claimJobs(selected, targetModel);
 
   if (!claimed.length) {
-    return { successCount: 0, failCount: 0, claimed: 0, rateLimited: 0 };
+    return { successCount: 0, failCount: 0, claimed: 0, rateLimited: 0, authFailed: 0 };
   }
 
   const tenantCounts = {};
@@ -438,15 +543,18 @@ async function processUnnormalizedMessages({
   let successCount = 0;
   let failCount = 0;
   let rateLimited = 0;
-  const quotaHits = { gemini: 0, together: 0 };
+  let authFailed = 0;
+  const quotaHits = { gemini: 0, together: 0, openai: 0 };
   for (const o of outcomes) {
     if (o?.ok) successCount += 1;
     else {
       failCount += 1;
+      if (o?.authFailed) authFailed += 1;
       if (o?.rateLimited) {
         rateLimited += 1;
         if (o.quotaProvider === 'gemini') quotaHits.gemini += 1;
-        if (o.quotaProvider === 'together') quotaHits.together += 1;
+        else if (o.quotaProvider === 'together') quotaHits.together += 1;
+        else quotaHits.openai += 1;
       }
     }
   }
@@ -455,10 +563,18 @@ async function processUnnormalizedMessages({
   console.info(
     `[ai] Batch complete: ${successCount}/${claimed.length} normalized, ${failCount} failed` +
       (rateLimited ? ` (${rateLimited} rate/quota)` : '') +
+      (authFailed ? ` (${authFailed} auth)` : '') +
       ` in ${elapsed.toFixed(1)}s`
   );
 
-  return { successCount, failCount, claimed: claimed.length, rateLimited, quotaHits };
+  return {
+    successCount,
+    failCount,
+    claimed: claimed.length,
+    rateLimited,
+    authFailed,
+    quotaHits
+  };
 }
 
 module.exports = {

@@ -89,6 +89,10 @@ async function queueNormalizeJob(userId, opts = {}) {
   if (existing && (existing.status === 'running' || existing.status === 'queued')) {
     return { job: existing, alreadyActive: true };
   }
+  // Manual/circuit-breaker pause: scrape must not auto-resume and burn OpenAI.
+  if (existing && existing.status === 'paused') {
+    return { job: existing, alreadyActive: true, paused: true };
+  }
 
   const result = await db.query(
     `INSERT INTO normalize_jobs (
@@ -105,9 +109,15 @@ async function queueNormalizeJob(userId, opts = {}) {
        finished_at = NULL,
        last_error = NULL,
        updated_at = NOW()
+     WHERE normalize_jobs.status IS DISTINCT FROM 'paused'
      RETURNING *`,
     [uid, model, embed, batchSize]
   );
+
+  if (!result.rows[0]) {
+    const paused = await getNormalizeJob(uid);
+    return { job: paused, alreadyActive: true, paused: true };
+  }
 
   return { job: result.rows[0], alreadyActive: false };
 }

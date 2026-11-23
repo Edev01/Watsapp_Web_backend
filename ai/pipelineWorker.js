@@ -211,6 +211,18 @@ async function failJob(userId, message) {
   );
 }
 
+async function pauseJob(userId, message) {
+  await db.query(
+    `UPDATE normalize_jobs
+     SET status = 'paused',
+         finished_at = NOW(),
+         updated_at = NOW(),
+         last_error = $2
+     WHERE user_id = $1 AND status IN ('queued', 'running')`,
+    [Number(userId), String(message || 'Paused').slice(0, 2000)]
+  );
+}
+
 async function processJob(job) {
   const cfg = getConfig();
   const userId = Number(job.user_id);
@@ -244,16 +256,36 @@ async function processJob(job) {
     });
 
     totalNorm += result.successCount;
+
+    // Auth storm (401/403): pause immediately — scrape must not auto-resume.
+    if (
+      result.claimed > 0 &&
+      result.authFailed > 0 &&
+      result.authFailed >= result.claimed &&
+      result.successCount === 0
+    ) {
+      await pauseJob(
+        userId,
+        'OpenAI auth/forbidden — paused (fix OPENAI_API_KEY; resume manually)'
+      );
+      console.warn(`[pipeline] Job user=${userId} paused after auth failures`);
+      return { normalized: totalNorm, embedded: 0, interrupted: false, paused: true };
+    }
+
     if (result.rateLimited > 0 && result.successCount === 0) {
       stats.consecutiveQuotaBatches += 1;
       if (stats.consecutiveQuotaBatches >= QUOTA_EMAIL_STREAK) {
         await maybeEmailQuotaStop({
           gemini: result.quotaHits?.gemini || 0,
           together: result.quotaHits?.together || 0,
-          detail: `Batch all rate/quota limited (gemini=${result.quotaHits?.gemini || 0}, together=${result.quotaHits?.together || 0})`
+          detail: `Batch all rate/quota limited (openai=${result.quotaHits?.openai || 0}, gemini=${result.quotaHits?.gemini || 0}, together=${result.quotaHits?.together || 0})`
         });
-        console.warn('[pipeline] Pausing job drain after consecutive quota batches');
-        break;
+        await pauseJob(
+          userId,
+          'OpenAI rate/quota storm — paused (do not auto-resume)'
+        );
+        console.warn('[pipeline] Pausing job after consecutive quota batches');
+        return { normalized: totalNorm, embedded: 0, interrupted: false, paused: true };
       }
     } else if (result.successCount > 0) {
       stats.consecutiveQuotaBatches = 0;
@@ -332,10 +364,29 @@ async function processJob(job) {
   return { normalized: totalNorm, embedded, interrupted: false, embedError };
 }
 
+async function isUserPaused(userId) {
+  if (userId == null) return false;
+  const { rows } = await db.query(
+    `SELECT status FROM normalize_jobs WHERE user_id = $1`,
+    [Number(userId)]
+  );
+  return rows[0]?.status === 'paused';
+}
+
 async function drainOnce(preferredUserId = null) {
+  if (preferredUserId != null && (await isUserPaused(preferredUserId))) {
+    console.info(`[pipeline] Skip drain; user=${preferredUserId} is paused`);
+    return { normalized: 0, embedded: 0, hadJob: false, paused: true };
+  }
+
   const job = await claimNextJob(preferredUserId);
   if (!job) {
-    // Opportunistic fair drain for any pending without a job row (legacy / auto)
+    // Opportunistic fair drain for any pending without a job row (legacy / auto).
+    // Never run this path when any user is paused without an explicit job —
+    // it would bypass pause and burn OpenAI. Only drain a preferred live user.
+    if (preferredUserId == null) {
+      return { normalized: 0, embedded: 0, hadJob: false };
+    }
     const cfg = getConfig();
     const result = await processUnnormalizedMessages({
       llmClient: ensureLlmClient(),
