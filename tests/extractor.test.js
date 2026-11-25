@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { extractMessage, buildRows, LLM_PROVIDERS } = require('../ai/extract/extractor');
+const { extractMessage, extractMessages, buildRows, LLM_PROVIDERS, NORMALIZE_AI_BATCH } = require('../ai/extract/extractor');
 const { EXTRACTION_SCHEMA, toGeminiSchema } = require('../ai/extract/schema');
 
 const ctx = (text) => ({
@@ -283,4 +283,67 @@ test('new prompt JSON is stored as a listing row', async () => {
   assert.equal(row.intent, 'Selling a 5 marla house');
   assert.equal(row.confidence_score, 0.86);
   assert.deepEqual(JSON.parse(row.entities).names, ['Ali']);
+});
+
+test('50 messages are one call and each result keeps its message id', async () => {
+  assert.equal(NORMALIZE_AI_BATCH, 50);
+  const msgs = Array.from({ length: 50 }, (_, i) => ({
+    id: 1000 + i,
+    sender: 'agent',
+    user_id: 4,
+    message: i % 2 === 0
+      ? `5 marla house for sale DHA Phase 6 id ${1000 + i}`
+      : `Salam thanks id ${1000 + i} ok`
+  }));
+  let calls = 0;
+  let seenUser = '';
+  const out = await extractMessages(msgs, {
+    model: 'mock',
+    callModel: async ({ user, batch }) => {
+      calls += 1;
+      seenUser = user;
+      assert.equal(batch, true);
+      const ids = [...user.matchAll(/id=(\d+)/g)].map((m) => Number(m[1]));
+      return {
+        results: ids.map((id) => ({
+          id,
+          is_property_listing_or_inquiry: id % 2 === 0,
+          summary: `msg ${id}`,
+          category: 'SALES',
+          intent: '',
+          sentiment: 'NEUTRAL',
+          listings: [],
+          entities: { products: [], dates_mentioned: [], action_items: [], names: [] },
+          language: 'en',
+          confidence_score: 0.5
+        }))
+      };
+    }
+  });
+  assert.equal(calls, 1);
+  assert.match(seenUser, /id=1000/);
+  assert.match(seenUser, /id=1049/);
+  assert.equal(out.byId.size, 50);
+  assert.equal(out.missing.length, 0);
+  assert.equal(out.byId.get(1000).is_property, true);
+  assert.equal(out.byId.get(1001).is_property, false);
+  assert.equal(out.byId.get(1049).summary, 'msg 1049');
+});
+
+test('a batch result map keyed by id still matches', async () => {
+  const out = await extractMessages([
+    { id: 7, message: 'plot for sale in DHA phase 8' },
+    { id: 8, message: 'flat for rent in Clifton' }
+  ], {
+    model: 'mock',
+    callModel: async () => ({
+      results: {
+        7: { is_property_listing_or_inquiry: true, summary: 'plot', listings: [], language: 'en' },
+        8: { is_property_listing_or_inquiry: true, summary: 'flat', listings: [], language: 'en' }
+      }
+    })
+  });
+  assert.equal(out.byId.get(7).summary, 'plot');
+  assert.equal(out.byId.get(8).summary, 'flat');
+  assert.deepEqual(out.missing, []);
 });

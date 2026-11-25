@@ -11,7 +11,9 @@ const {
   SYSTEM_PROMPT,
   EXTRACTION_SCHEMA,
   toGeminiSchema,
-  buildUserMessage
+  buildUserMessage,
+  buildBatchUserMessage,
+  NORMALIZE_AI_BATCH
 } = require('./schema');
 const { cleanText, parsePrice, parsePhase, detectBasis, SQFT_PER } = require('./parsers');
 const { looksLikeRequirement } = require('./listingKind');
@@ -153,14 +155,15 @@ async function callOpenAiCompatible({
   baseUrl,
   label,
   messageId = null,
-  userId = null
+  userId = null,
+  batch = false
 }) {
   if (!apiKey) throw new Error(`${label}: API key not set`);
   const base = String(baseUrl || '').replace(/\/$/, '');
   if (!base) throw new Error(`${label}: base URL not set`);
   if (!model) throw new Error(`${label}: model not set`);
 
-  if (label === 'openai' && messageId != null) {
+  if (label === 'openai' && !batch && messageId != null) {
     const prior = await countHitsForMessage(messageId);
     const maxHits = maxHitsPerMessage();
     if (prior >= maxHits) {
@@ -170,18 +173,22 @@ async function callOpenAiCompatible({
     }
   }
 
-  const schemaNote =
-    'Return one JSON object only (no markdown). Schema:\n' + JSON.stringify(EXTRACTION_SCHEMA);
+  const schemaNote = batch
+    ? 'Return one JSON object only (no markdown). Shape: {"results":[{"id":<input id>}]}. Each results item includes that id and uses this schema:\n' + JSON.stringify(EXTRACTION_SCHEMA)
+    : 'Return one JSON object only (no markdown). Schema:\n' + JSON.stringify(EXTRACTION_SCHEMA);
+  const batchTokens = Number(process.env.NORMALIZE_BATCH_OUTPUT_TOKENS);
+  const maxTokens = batch ? (Number.isFinite(batchTokens) && batchTokens > 0 ? batchTokens : 65536) : 8192;
   // Prefer params that work on current OpenAI models; one request only (no retry storm).
   const body = {
     model,
-    max_completion_tokens: 8192,
+    max_completion_tokens: maxTokens,
     messages: [
       { role: 'system', content: `${system}\n\n${schemaNote}` },
       { role: 'user', content: user }
     ],
     response_format: { type: 'json_object' }
   };
+  if (batch && /^gpt-5/i.test(model)) body.reasoning_effort = 'minimal';
   const res = await fetch(`${base}/chat/completions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
@@ -189,7 +196,7 @@ async function callOpenAiCompatible({
   });
   if (label === 'openai') {
     await recordOpenAiHit({
-      messageId,
+      messageId: batch ? null : messageId,
       userId,
       model,
       ok: Boolean(res.ok),
@@ -220,7 +227,7 @@ async function callTogether({ system, user, model }) {
 }
 
 /** OpenAI official API. Uses OPENAI_API_KEY (+ optional OPENAI_BASE_URL). */
-async function callOpenAI({ system, user, model, messageId = null, userId = null }) {
+async function callOpenAI({ system, user, model, messageId = null, userId = null, batch = false }) {
   return callOpenAiCompatible({
     system,
     user,
@@ -235,7 +242,8 @@ async function callOpenAI({ system, user, model, messageId = null, userId = null
     baseUrl: process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1',
     label: 'openai',
     messageId,
-    userId
+    userId,
+    batch
   });
 }
 
@@ -337,6 +345,61 @@ async function extractMessage(msg, opts = {}) {
     }
   }
   throw lastErr;
+}
+
+function putResult(byId, id, item) {
+  const n = Number(id);
+  if (!Number.isFinite(n) || !item || typeof item !== 'object') return;
+  byId.set(n, validate(item));
+}
+
+/** Accept {"results":[{id}]} or {"results":{"<id>":{...}}}. */
+function resultsById(raw) {
+  const byId = new Map();
+  if (Array.isArray(raw)) {
+    for (const item of raw) putResult(byId, item && item.id, item);
+    return byId;
+  }
+  if (!raw || typeof raw !== 'object') return byId;
+  if (Array.isArray(raw.results)) {
+    for (const item of raw.results) putResult(byId, item && item.id, item);
+    return byId;
+  }
+  if (raw.results && typeof raw.results === 'object') {
+    for (const [key, item] of Object.entries(raw.results)) {
+      putResult(byId, item && item.id != null ? item.id : key, item);
+    }
+  }
+  return byId;
+}
+
+/**
+ * One OpenAI call for up to NORMALIZE_AI_BATCH messages.
+ * @returns {{byId:Map<number,object>, model:string, provider:string, missing:number[]}}
+ */
+async function extractMessages(msgs, opts = {}) {
+  const list = (msgs || []).filter((m) => m && m.id != null);
+  if (!list.length) return { byId: new Map(), model: null, provider: null, missing: [] };
+
+  const items = list.map((m) => ({
+    id: m.id,
+    sender: m.sender,
+    text: cleanText(m.message).slice(0, 12000)
+  }));
+  const user = buildBatchUserMessage(items);
+  const model = opts.model || resolveModelName('openai');
+  const call = opts.callModel || ((args) => callOpenAI(args));
+  const raw = await call({
+    system: SYSTEM_PROMPT,
+    user,
+    model,
+    batch: true,
+    userId: list[0].user_id != null ? list[0].user_id : list[0].userId,
+    messageIds: list.map((m) => m.id)
+  });
+  const byId = resultsById(raw);
+  const missing = list.map((m) => Number(m.id)).filter((id) => !byId.has(id));
+  return { byId, model, provider: opts.callModel ? 'test' : 'openai', missing };
 }
 
 /* ------------------------------------------------------------- row builder */
@@ -652,6 +715,8 @@ function buildRows(extraction, ctx) {
 
 module.exports = {
   extractMessage,
+  extractMessages,
+  NORMALIZE_AI_BATCH,
   buildRows,
   looksLikeRequirement,
   callGemini,

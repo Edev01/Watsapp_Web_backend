@@ -119,10 +119,32 @@ function toGeminiSchema(node) {
   return out;
 }
 
+/** Messages per OpenAI call. One HTTP request normalizes this many rows. */
+const NORMALIZE_AI_BATCH = 50;
+
 /** User message sent with SYSTEM_PROMPT. Keep SYSTEM_PROMPT byte-identical across calls (prompt caching). */
 function buildUserMessage(cleanedText, { sender } = {}) {
   const who = sender ? `Sender: ${sender}\n` : '';
   return `${who}Message:\n${cleanedText}`;
+}
+
+/**
+ * One user message for a batch. Each block carries the whatsapp_messages id
+ * the model must copy back so the reply can be saved on the right row.
+ */
+function buildBatchUserMessage(items) {
+  const blocks = items.map((item, index) => {
+    const who = item.sender ? `sender: ${item.sender}\n` : '';
+    return `[${index + 1}] id=${item.id}\n${who}${item.text}`;
+  });
+  return [
+    'Normalize every message below in one response.',
+    'Return one JSON object: {"results":[{"id":<the id= number>, ...fields}]}.',
+    'Each results item uses the system schema and must include that same id.',
+    'Include every id exactly once.',
+    '',
+    blocks.join('\n\n')
+  ].join('\n');
 }
 
 module.exports = {
@@ -136,5 +158,7 @@ module.exports = {
   SYSTEM_PROMPT,
   EXTRACTION_SCHEMA,
   toGeminiSchema,
-  buildUserMessage
+  buildUserMessage,
+  buildBatchUserMessage,
+  NORMALIZE_AI_BATCH
 };

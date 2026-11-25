@@ -8,6 +8,13 @@ const {
 
 const EXTRACT_V2_MODEL = 'extract-v2';
 
+// Messages before 25 Nov 2026 00:00 PKT are never sent to OpenAI.
+const NORMALIZE_NOT_BEFORE = process.env.NORMALIZE_NOT_BEFORE || '2026-11-25T00:00:00+05:00';
+
+// Messages already placed in a completed OpenAI batch. They stay unnormalized if the
+// model omitted them, and they do not trigger another call until the process restarts.
+const alreadySentIds = new Set();
+
 /** Normalization is always scraped message → one LLM call → saved fields. */
 function useExtractV2() {
   return true;
@@ -155,171 +162,301 @@ async function deadLetterMessage(job, { intent = 'extract_failed', model = 'skip
   await saveMessageRows(db, job.id, rows);
 }
 
-/**
- * Extract v2 path: one LLM call, then Google corrects a header phase when
- * one offer in a multi-listing names a place in a different phase.
- */
-async function normalizeOneExtractV2(job) {
-  const { extractMessage, buildRows } = require('./extract/extractor');
+function extractionContext(job, model) {
+  return {
+    messageId: job.id,
+    chatJid: job.chat_jid,
+    sender: job.sender,
+    senderPhone: job.sender_phone,
+    messageText: job.message || '',
+    userId: job.user_id,
+    model
+  };
+}
+
+/** Duplicate, already-extracted, or too-short rows. Null means this row needs the model. */
+async function skipWithoutModel(job) {
+  const { buildRows } = require('./extract/extractor');
   const { saveMessageRows } = require('./extract/persist');
-  const { classifyExtractError } = require('./extract/errorClassify');
+
+  if (await alreadyNormalizedSameBody(job)) {
+    const rows = buildRows(
+      { is_property: false, language: 'en', listings: [] },
+      extractionContext(job, 'dup-skip')
+    );
+    if (rows[0]) {
+      rows[0].intent = 'duplicate';
+      rows[0].summary = '[skipped duplicate listing content]';
+      rows[0].model_used = 'dup-skip';
+    }
+    await saveMessageRows(db, job.id, rows);
+    console.info(`[ai] Message ${job.id} skipped OpenAI — same body+footer already normalized`);
+    return { id: job.id, ok: true, listings: 0, provider: 'dup-skip' };
+  }
+
+  const reused = await copyCrossUserExtraction(job);
+  if (reused) return reused;
+
+  if (!job.message || String(job.message).trim().length < 12) {
+    const rows = buildRows(
+      { is_property: false, language: 'en', listings: [] },
+      extractionContext(job, 'none')
+    );
+    await saveMessageRows(db, job.id, rows);
+    return { id: job.id, ok: true, listings: 0 };
+  }
+
+  return null;
+}
+
+async function persistExtraction(job, extraction, model, provider) {
+  const { buildRows } = require('./extract/extractor');
+  const { saveMessageRows } = require('./extract/persist');
   const { correctSplitListingPhases, fillMissingPhases } = require('./googlePhaseMap');
 
+  const rows = buildRows(extraction, extractionContext(job, model));
+  await correctSplitListingPhases(rows);
   try {
-    if (await alreadyNormalizedSameBody(job)) {
-      const rows = buildRows(
-        { is_property: false, language: 'en', listings: [] },
-        {
-          messageId: job.id,
-          chatJid: job.chat_jid,
-          sender: job.sender,
-          senderPhone: job.sender_phone,
-          messageText: job.message || '',
-          userId: job.user_id,
-          model: 'dup-skip'
-        }
-      );
-      if (rows[0]) {
-        rows[0].intent = 'duplicate';
-        rows[0].summary = '[skipped duplicate listing content]';
-        rows[0].model_used = 'dup-skip';
-      }
-      await saveMessageRows(db, job.id, rows);
-      console.info(`[ai] Message ${job.id} skipped OpenAI — same body+footer already normalized`);
-      return { id: job.id, ok: true, listings: 0, provider: 'dup-skip' };
-    }
-
-    const reused = await copyCrossUserExtraction(job);
-    if (reused) return reused;
-
-    if (!job.message || String(job.message).trim().length < 12) {
-      const rows = buildRows(
-        { is_property: false, language: 'en', listings: [] },
-        {
-          messageId: job.id,
-          chatJid: job.chat_jid,
-          sender: job.sender,
-          senderPhone: job.sender_phone,
-          messageText: job.message || '',
-          userId: job.user_id,
-          model: 'none'
-        }
-      );
-      await saveMessageRows(db, job.id, rows);
-      return { id: job.id, ok: true, listings: 0 };
-    }
-
-    // Exactly one OpenAI HTTP per message — no multi-chunk extract retries.
-    let { extraction, model, provider } = await extractMessage(job);
-    let rows = buildRows(extraction, {
-      messageId: job.id,
-      chatJid: job.chat_jid,
-      sender: job.sender,
-      senderPhone: job.sender_phone,
-      messageText: job.message,
-      userId: job.user_id,
-      model
-    });
-
-    await correctSplitListingPhases(rows);
-    try {
-      await fillMissingPhases(db, rows);
-    } catch (err) {
-      console.info(`[extract] google missing-phase fill skipped: ${String(err.message || err).slice(0, 120)}`);
-    }
-    try {
-      const { fillBtkNamedPrecincts } = require('./btkPrecincts');
-      await fillBtkNamedPrecincts(rows);
-    } catch (_) { /* named BTK precinct lookup is optional */ }
-    const saved = await saveMessageRows(db, job.id, rows);
-    const props = rows.filter((r) => r.is_property).length;
-    console.info(
-      `[ai] Message ${job.id} (user ${tenantId(job.user_id)}) extract-v2 [${provider}/${model}] → ${props} listing(s) inserted=${saved.inserted}`
-    );
-    return { id: job.id, ok: true, listings: props, provider };
+    await fillMissingPhases(db, rows);
   } catch (err) {
-    const classified = classifyExtractError(err);
-    const reason = `${err.name || 'Error'}: ${err.message}`;
-    if (classified.isQuota || classified.is429 || classified.is402) {
-      console.warn(`[ai] Rate/quota on message ${job.id} (${classified.provider || '?'}): ${reason.slice(0, 160)}`);
-      // One-shot policy: dead-letter so this message is never retried for OpenAI.
+    console.info(`[extract] google missing-phase fill skipped: ${String(err.message || err).slice(0, 120)}`);
+  }
+  try {
+    const { fillBtkNamedPrecincts } = require('./btkPrecincts');
+    await fillBtkNamedPrecincts(rows);
+  } catch (_) { /* named BTK precinct lookup is optional */ }
+  const saved = await saveMessageRows(db, job.id, rows);
+  const props = rows.filter((r) => r.is_property).length;
+  console.info(
+    `[ai] Message ${job.id} (user ${tenantId(job.user_id)}) extract-v2 [${provider}/${model}] → ${props} listing(s) inserted=${saved.inserted}`
+  );
+  return { id: job.id, ok: true, listings: props, provider };
+}
+
+async function failExtract(job, err) {
+  const { classifyExtractError } = require('./extract/errorClassify');
+  const classified = classifyExtractError(err);
+  const reason = `${err.name || 'Error'}: ${err.message}`;
+  if (classified.isQuota || classified.is429 || classified.is402) {
+    console.warn(`[ai] Rate/quota on message ${job.id} (${classified.provider || '?'}): ${reason.slice(0, 160)}`);
+    try {
+      await deadLetterMessage(job, {
+        intent: 'extract_failed',
+        model: 'skip-quota',
+        summary: `[quota/rate] ${reason.slice(0, 160)}`
+      });
+    } catch (_) { /* ignore */ }
+    return {
+      id: job.id,
+      ok: false,
+      rateLimited: true,
+      quotaProvider: classified.provider,
+      is402: classified.is402,
+      authFailed: false
+    };
+  }
+  if (err.primaryError) {
+    const p = classifyExtractError(err.primaryError);
+    if (p.isQuota || p.is429 || p.is402) {
       try {
         await deadLetterMessage(job, {
           intent: 'extract_failed',
           model: 'skip-quota',
-          summary: `[quota/rate] ${reason.slice(0, 160)}`
+          summary: `[quota/rate] ${String(err.primaryError.message || '').slice(0, 160)}`
         });
       } catch (_) { /* ignore */ }
       return {
         id: job.id,
         ok: false,
         rateLimited: true,
-        quotaProvider: classified.provider,
-        is402: classified.is402,
-        authFailed: false
+        quotaProvider: p.provider,
+        is402: p.is402
       };
     }
-    if (err.primaryError) {
-      const p = classifyExtractError(err.primaryError);
-      if (p.isQuota || p.is429 || p.is402) {
-        try {
-          await deadLetterMessage(job, {
-            intent: 'extract_failed',
-            model: 'skip-quota',
-            summary: `[quota/rate] ${String(err.primaryError.message || '').slice(0, 160)}`
-          });
-        } catch (_) { /* ignore */ }
-        return {
-          id: job.id,
-          ok: false,
-          rateLimited: true,
-          quotaProvider: p.provider,
-          is402: p.is402
-        };
-      }
-    }
-    logNormalizationFailure({
-      messageId: job.id,
-      modelName: EXTRACT_V2_MODEL,
-      reason
+  }
+  logNormalizationFailure({
+    messageId: job.id,
+    modelName: EXTRACT_V2_MODEL,
+    reason
+  });
+  const model = classified.isHitCap ? 'hit-cap' : classified.isAuth ? 'skip-auth' : 'skip-fail';
+  try {
+    await deadLetterMessage(job, {
+      intent: 'extract_failed',
+      model,
+      summary: `[${model}] ${reason.slice(0, 160)}`
     });
-    const model =
-      classified.isHitCap ? 'hit-cap' : classified.isAuth ? 'skip-auth' : 'skip-fail';
-    try {
-      await deadLetterMessage(job, {
-        intent: 'extract_failed',
-        model,
-        summary: `[${model}] ${reason.slice(0, 160)}`
-      });
-    } catch (_) { /* ignore */ }
-    console.error(`[ai] Error processing message ${job.id}: ${reason}`);
-    return {
-      id: job.id,
-      ok: false,
-      authFailed: Boolean(classified.isAuth),
-      hardFail: Boolean(classified.isHardFail)
-    };
+  } catch (_) { /* ignore */ }
+  console.error(`[ai] Error processing message ${job.id}: ${reason}`);
+  return {
+    id: job.id,
+    ok: false,
+    authFailed: Boolean(classified.isAuth),
+    hardFail: Boolean(classified.isHardFail)
+  };
+}
+
+/**
+ * One message. Used when a batch reply omits an id.
+ * The batch path sends 50 messages in one OpenAI call.
+ */
+async function normalizeOneExtractV2(job) {
+  const { extractMessage } = require('./extract/extractor');
+  try {
+    const skipped = await skipWithoutModel(job);
+    if (skipped) return skipped;
+    const { extraction, model, provider } = await extractMessage(job);
+    return await persistExtraction(job, extraction, model, provider);
+  } catch (err) {
+    return failExtract(job, err);
   } finally {
     await releaseClaim(job.id, EXTRACT_V2_MODEL);
   }
 }
 
-async function mapPool(items, concurrency, worker) {
-  const results = new Array(items.length);
-  let next = 0;
-
-  async function run() {
-    while (next < items.length) {
-      const i = next++;
-      results[i] = await worker(items[i], i);
+/**
+ * One OpenAI HTTP for exactly 50 messages.
+ * Fewer than 50 never calls the API. A failed call retries once, then the batch is skipped.
+ * A missing id is released and waits until it can sit in another full batch of 50.
+ */
+async function normalizeAiChunk(jobs) {
+  const { extractMessages, NORMALIZE_AI_BATCH } = require('./extract/extractor');
+  if (jobs.length !== NORMALIZE_AI_BATCH) {
+    console.error(
+      `[ai] Refusing OpenAI call for ${jobs.length} message(s); a call is only made at ${NORMALIZE_AI_BATCH}`
+    );
+    for (const job of jobs) await releaseClaim(job.id, EXTRACT_V2_MODEL);
+    return jobs.map((job) => ({ id: job.id, ok: false, shortBatch: true }));
+  }
+  let extracted;
+  let lastErr;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      extracted = await extractMessages(jobs);
+      lastErr = null;
+      break;
+    } catch (err) {
+      lastErr = err;
+      console.warn(
+        `[ai] OpenAI batch of ${jobs.length} failed (attempt ${attempt}/2): ${String(err.message || err).slice(0, 160)}`
+      );
     }
   }
+  if (lastErr) {
+    const reason = String(lastErr.message || lastErr).slice(0, 160);
+    console.error(`[ai] OpenAI batch of ${jobs.length} failed twice; skipping batch`);
+    const outcomes = [];
+    for (const job of jobs) {
+      try {
+        await deadLetterMessage(job, {
+          intent: 'extract_failed',
+          model: 'skip-fail',
+          summary: `[batch-skip] ${reason}`
+        });
+      } catch (_) { /* ignore */ }
+      await releaseClaim(job.id, EXTRACT_V2_MODEL);
+      outcomes.push({ id: job.id, ok: false, skippedBatch: true });
+    }
+    return outcomes;
+  }
 
-  const runners = Array.from({ length: Math.min(concurrency, items.length) }, () =>
-    run()
+  for (const job of jobs) alreadySentIds.add(Number(job.id));
+
+  const outcomes = [];
+  for (const job of jobs) {
+    const extraction = extracted.byId.get(Number(job.id));
+    if (!extraction) {
+      // Do not call OpenAI again. A solo retry is a full-price call per missed id.
+      console.warn(`[ai] Batch missed message ${job.id}; it will not be sent again`);
+      outcomes.push({ id: job.id, ok: false, missingFromBatch: true });
+      await releaseClaim(job.id, EXTRACT_V2_MODEL);
+      continue;
+    }
+    try {
+      outcomes.push(await persistExtraction(job, extraction, extracted.model, extracted.provider));
+    } catch (err) {
+      outcomes.push(await failExtract(job, err));
+    } finally {
+      await releaseClaim(job.id, EXTRACT_V2_MODEL);
+    }
+  }
+  console.info(
+    `[ai] OpenAI batch ${jobs.length} message(s) → ${extracted.byId.size} matched, ${extracted.missing.length} missing`
   );
-  await Promise.all(runners);
-  return results;
+  return outcomes;
+}
+
+async function normalizeClaimed(jobs) {
+  const { NORMALIZE_AI_BATCH } = require('./extract/extractor');
+  const outcomes = [];
+  const aiJobs = [];
+  for (const job of jobs) {
+    try {
+      const skipped = await skipWithoutModel(job);
+      if (skipped) {
+        outcomes.push(skipped);
+        await releaseClaim(job.id, EXTRACT_V2_MODEL);
+      } else {
+        aiJobs.push(job);
+      }
+    } catch (err) {
+      outcomes.push(await failExtract(job, err));
+      await releaseClaim(job.id, EXTRACT_V2_MODEL);
+    }
+  }
+  const full = aiJobs.length - (aiJobs.length % NORMALIZE_AI_BATCH);
+  for (let i = 0; i < full; i += NORMALIZE_AI_BATCH) {
+    const chunk = aiJobs.slice(i, i + NORMALIZE_AI_BATCH);
+    const part = await normalizeAiChunk(chunk);
+    outcomes.push(...part);
+  }
+  const held = aiJobs.slice(full);
+  for (const job of held) await releaseClaim(job.id, EXTRACT_V2_MODEL);
+  if (held.length) {
+    console.info(
+      `[ai] Held ${held.length} unique message(s); OpenAI waits until ${NORMALIZE_AI_BATCH}`
+    );
+  }
+  return outcomes;
+}
+
+/**
+ * Walk pending rows, clear duplicates without a model call, and return at most
+ * `need` messages that still require OpenAI. Stops once that many are in hand.
+ */
+async function gatherModelJobs(targetModel, userId, need) {
+  const outcomes = [];
+  const aiJobs = [];
+  let cursor = 0;
+  let scanned = 0;
+  let heldFromEarlierBatch = 0;
+  const pageSize = 200;
+  const scanCap = 2000;
+  while (aiJobs.length < need && scanned < scanCap) {
+    const page = await loadPendingJobs(targetModel, userId, pageSize, {
+      ignoreSkips: false,
+      minId: cursor
+    });
+    if (!page.length) break;
+    for (const job of page) {
+      cursor = Number(job.id);
+      scanned += 1;
+      if (alreadySentIds.has(Number(job.id))) {
+        heldFromEarlierBatch += 1;
+        continue;
+      }
+      try {
+        const skipped = await skipWithoutModel(job);
+        if (skipped) outcomes.push(skipped);
+        else aiJobs.push(job);
+      } catch (err) {
+        outcomes.push(await failExtract(job, err));
+      }
+      if (aiJobs.length >= need || scanned >= scanCap) break;
+    }
+    if (page.length < pageSize) break;
+  }
+  return { outcomes, aiJobs: aiJobs.slice(0, need), scanned, heldFromEarlierBatch };
 }
 
 function fairPick(jobs, batchSize, perUser) {
@@ -406,7 +543,7 @@ async function releaseClaim(messageId, modelName) {
   }
 }
 
-async function loadPendingJobs(targetModel, userId, window, { ignoreSkips = true } = {}) {
+async function loadPendingJobs(targetModel, userId, window, { ignoreSkips = true, minId = 0 } = {}) {
   const skipped = [...getSkippedIds()];
   const params = [targetModel];
   let userFilter = '';
@@ -429,12 +566,26 @@ async function loadPendingJobs(targetModel, userId, window, { ignoreSkips = true
   }
 
   // Only messages scraped after this id. Older rows, including removed local-NER cards, stay untouched.
-  const afterId = Number(process.env.NORMALIZE_AFTER_ID || 0);
+  const afterId = Math.max(
+    Number(process.env.NORMALIZE_AFTER_ID || 0),
+    Number(minId) || 0
+  );
   let afterFilter = '';
   if (afterId > 0) {
     params.push(afterId);
     afterFilter = `AND m.id > $${params.length}`;
   }
+
+  params.push(NORMALIZE_NOT_BEFORE);
+  const notBeforeIdx = params.length;
+  const notBeforeFilter = `
+       AND (
+         (m.timestamp ~ '^[0-9]+$' AND to_timestamp(m.timestamp::bigint) >= $${notBeforeIdx}::timestamptz)
+         OR (
+           (m.timestamp IS NULL OR m.timestamp !~ '^[0-9]+$')
+           AND m.created_at >= $${notBeforeIdx}::timestamptz
+         )
+       )`;
 
   params.push(window);
   const limitIdx = params.length;
@@ -466,6 +617,7 @@ async function loadPendingJobs(targetModel, userId, window, { ignoreSkips = true
        ${userFilter}
        ${skipFilter}
        ${afterFilter}
+       ${notBeforeFilter}
      ORDER BY m.id ASC
      LIMIT $${limitIdx}`,
     params
@@ -493,7 +645,6 @@ async function processUnnormalizedMessages({
 } = {}) {
   const cfg = getConfig();
   const targetModel = EXTRACT_V2_MODEL;
-  const workers = concurrency || cfg.normalizeConcurrency;
   const perUser = cfg.normalizePerUser;
 
   if (userId != null) {
@@ -517,13 +668,55 @@ async function processUnnormalizedMessages({
   loadSkippedIds();
   await releaseStaleClaims(targetModel);
 
-  const window = Math.max(batchSize * 4, 80);
-  const candidates = await loadPendingJobs(targetModel, userId, window, { ignoreSkips: false });
-  const selected = fairPick(candidates, batchSize, perUser);
-  const claimed = await claimJobs(selected, targetModel);
+  const { NORMALIZE_AI_BATCH } = require('./extract/extractor');
+  const need = NORMALIZE_AI_BATCH;
+  const gathered = await gatherModelJobs(targetModel, userId, need);
+  const outcomes = gathered.outcomes;
 
-  if (!claimed.length) {
-    return { successCount: 0, failCount: 0, claimed: 0, rateLimited: 0, authFailed: 0 };
+  if (gathered.aiJobs.length < need) {
+    console.info(
+      `[ai] ${gathered.aiJobs.length} new unique unnormalized message(s); OpenAI waits until ${need}` +
+        (gathered.heldFromEarlierBatch
+          ? ` (${gathered.heldFromEarlierBatch} already sent, not called again)`
+          : '')
+    );
+    let successCount = 0;
+    let failCount = 0;
+    for (const o of outcomes) {
+      if (o?.ok) successCount += 1;
+      else failCount += 1;
+    }
+    return {
+      successCount,
+      failCount,
+      claimed: 0,
+      rateLimited: 0,
+      authFailed: 0,
+      waitingForBatch: true,
+      ready: gathered.aiJobs.length
+    };
+  }
+
+  const selected = fairPick(gathered.aiJobs, need, perUser);
+  const claimed = selected.length === need ? await claimJobs(selected, targetModel) : [];
+  if (claimed.length !== need) {
+    for (const job of claimed) await releaseClaim(job.id, EXTRACT_V2_MODEL);
+    console.info(`[ai] Claimed ${claimed.length}/${need}; OpenAI not called`);
+    let successCount = 0;
+    let failCount = 0;
+    for (const o of outcomes) {
+      if (o?.ok) successCount += 1;
+      else failCount += 1;
+    }
+    return {
+      successCount,
+      failCount,
+      claimed: 0,
+      rateLimited: 0,
+      authFailed: 0,
+      waitingForBatch: true,
+      ready: claimed.length
+    };
   }
 
   const tenantCounts = {};
@@ -534,11 +727,11 @@ async function processUnnormalizedMessages({
 
   console.info(
     `[ai] Processing ${claimed.length} messages ` +
-      `(llm=openai/${process.env.OPENAI_MODEL || process.env.EXTRACT_MODEL || 'gpt-5-nano'}, workers=${workers}, tenants=${JSON.stringify(tenantCounts)})`
+      `(llm=openai/${process.env.OPENAI_MODEL || process.env.EXTRACT_MODEL || 'gpt-5-nano'} batch=${need}, tenants=${JSON.stringify(tenantCounts)})`
   );
 
   const started = Date.now();
-  const outcomes = await mapPool(claimed, workers, (job) => normalizeOneExtractV2(job));
+  outcomes.push(...(await normalizeAiChunk(claimed)));
 
   let successCount = 0;
   let failCount = 0;
