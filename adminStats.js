@@ -407,23 +407,37 @@ function parseMessageQuery(query = {}) {
 
 async function messageBreakdown(db, userId, range) {
   const total = await db.query(
-    `SELECT count(*)::int AS n
-       FROM whatsapp_messages
-      WHERE user_id = $1
-        AND created_at >= $2::timestamptz
-        AND created_at < $3::timestamptz`,
+    `SELECT
+        (SELECT count(*)::int
+           FROM whatsapp_messages
+          WHERE user_id = $1
+            AND created_at >= $2::timestamptz
+            AND created_at < $3::timestamptz) AS unique_count,
+        (SELECT count(*)::int
+           FROM whatsapp_seen_wa_keys
+          WHERE user_id = $1
+            AND seen_at >= $2::timestamptz
+            AND seen_at < $3::timestamptz) AS duplicate_count`,
     [userId, range.start, range.end]
   );
+  const uniqueCount = total.rows[0]?.unique_count || 0;
+  const actualCount = uniqueCount + (total.rows[0]?.duplicate_count || 0);
   const chats = await db.query(
     `SELECT c.jid,
             COALESCE(NULLIF(BTRIM(c.name), ''), c.jid) AS name,
-            count(m.id)::int AS message_count
+            count(DISTINCT m.id)::int AS message_count,
+            count(DISTINCT s.wa_key_id)::int AS duplicate_count
        FROM whatsapp_chats c
        LEFT JOIN whatsapp_messages m
          ON m.user_id = c.user_id
         AND m.chat_jid = c.jid
         AND m.created_at >= $2::timestamptz
         AND m.created_at < $3::timestamptz
+       LEFT JOIN whatsapp_seen_wa_keys s
+         ON s.user_id = c.user_id
+        AND s.chat_jid = c.jid
+        AND s.seen_at >= $2::timestamptz
+        AND s.seen_at < $3::timestamptz
       WHERE c.user_id = $1
         AND c.is_monitored IS TRUE
       GROUP BY c.jid, c.name
@@ -435,8 +449,13 @@ async function messageBreakdown(db, userId, range) {
     from: range.from,
     to: range.to,
     rangeLabel: range.rangeLabel,
-    total: total.rows[0]?.n || 0,
-    chats: chats.rows
+    total: uniqueCount,
+    unique: uniqueCount,
+    actual: actualCount,
+    chats: chats.rows.map((chat) => ({
+      ...chat,
+      actual_count: (chat.message_count || 0) + (chat.duplicate_count || 0)
+    }))
   };
 }
 
